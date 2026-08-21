@@ -3,8 +3,10 @@ import {
   addMonths,
   daysBetween,
   listMonths,
+  monthEnd,
   monthKey,
   monthLabel,
+  monthStart,
   parseCalendarDate,
 } from "@/lib/finance/dates";
 
@@ -72,5 +74,37 @@ describe("listMonths", () => {
 
   it("returns a single month when from === to", () => {
     expect(listMonths("2026-08", "2026-08")).toEqual(["2026-08"]);
+  });
+});
+
+describe("monthStart", () => {
+  it("returns the first day of the month", () => {
+    expect(monthStart("2026-08")).toBe("2026-08-01");
+  });
+
+  it("zero-pads a single-digit month", () => {
+    expect(monthStart("2026-03")).toBe("2026-03-01");
+  });
+});
+
+describe("monthEnd", () => {
+  it("returns the 31st for a 31-day month", () => {
+    expect(monthEnd("2026-08")).toBe("2026-08-31");
+  });
+
+  it("returns the 30th for a 30-day month", () => {
+    expect(monthEnd("2026-04")).toBe("2026-04-30");
+  });
+
+  it("returns Feb 28 in a non-leap year", () => {
+    expect(monthEnd("2026-02")).toBe("2026-02-28");
+  });
+
+  it("returns Feb 29 in a leap year", () => {
+    expect(monthEnd("2024-02")).toBe("2024-02-29");
+  });
+
+  it("handles the December year-end correctly", () => {
+    expect(monthEnd("2026-12")).toBe("2026-12-31");
   });
 });

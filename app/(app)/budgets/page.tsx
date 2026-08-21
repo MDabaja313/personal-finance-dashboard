@@ -21,6 +21,15 @@ export default async function BudgetsPage() {
   ]);
   const categoryName = new Map(categories.map((c) => [c.id, c.name]));
 
+  // getBudgets() only guarantees a deterministic technical order
+  // (category_id ASC) — the visible list is ordered by category name here,
+  // so a UUID never becomes the order a user sees.
+  const sortedBudgets = [...budgets].sort((a, b) => {
+    const nameA = categoryName.get(a.categoryId) ?? a.categoryId;
+    const nameB = categoryName.get(b.categoryId) ?? b.categoryId;
+    return nameA.localeCompare(nameB);
+  });
+
   return (
     <div className="flex flex-col gap-6">
       <PageHeader title="Budgets" description={`Category budgets for ${monthLabel(period)}.`} />
@@ -29,7 +38,7 @@ export default async function BudgetsPage() {
         <EmptyState title="No budgets set for this month" icon={PiggyBank} />
       ) : (
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          {budgets.map((budget) => (
+          {sortedBudgets.map((budget) => (
             <BudgetCard
               key={budget.id}
               status={budgetStatus(budget, transactions)}

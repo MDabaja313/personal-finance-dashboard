@@ -95,27 +95,58 @@ the derived balance without counting as spending or income, preserves history, a
 prior transactions merely to force a balance match. Not designed in Phase 2 — a stated
 prerequisite for that future work, tracked here so it isn't forgotten.
 
-## Phase 3 — Pre-persistence hardening
+## Phase 3 — Pre-persistence hardening ✅ complete
 
-Not yet started. Blocking technical debt identified during the Phase 2 review, to close before
-the DAL swap:
+Pre-persistence hardening identified during the Phase 2 review, closed before the DAL swap.
+Marked complete only after `lint`, `typecheck`, `test` (108 tests, up from the Phase 2 baseline
+of 66), and `build` all passed against the changes below.
 
-- `error.tsx` / `loading.tsx` / `not-found.tsx` for `app/**` — fixtures can't fail or be slow; a
-  network round-trip to Supabase can do both, and today there is no boundary for either.
-- **DAL error taxonomy** (typed thrown errors, not a `Result<T, E>` type — pages already rely on
-  Next.js error boundaries): `unauthorized`, `forbidden`, `not_found`, `data_integrity`,
-  `unavailable`. Raw database errors and financial values never reach user-facing messages.
-- **Bounded transaction queries** — extend the existing `TransactionFilters`
-  (`lib/data/transactions.ts`) with optional `from`/`to` `CalendarDate` bounds. Dashboard and
-  Analytics currently fetch transactions unbounded and window them in JavaScript after the DAL
-  read — both are Server Components, so this computation runs server-side today, but it's still a
-  full result set fetched and filtered in-process rather than a bounded query, which becomes a
-  full-table scan against SQL.
-- Resolve the three currently-unused DAL functions (`getAccountById`, `getUpcomingBills`,
-  `getTransactionsForMonth`) deliberately — drop or keep, not silently port.
-- Explicit `ORDER BY` contracts for every list-returning DAL function (several rely on incidental
-  fixture-array order today, which SQL will not preserve).
-- Replace `README.md` boilerplate.
+- **`error.tsx` / `loading.tsx` for `app/(app)/`, `not-found.tsx` at the app root.** One shared
+  boundary per convention (not one per route) — `error.js`/`loading.js` wrap a segment's pages and
+  nested layouts but not that segment's own `layout.js`, so `app/(app)/layout.tsx`'s sidebar and
+  header stay mounted through both. No `global-error.tsx` (the root layout is a static shell and
+  `global-error` replaces it, losing global styles/theme) and no `app/(app)/not-found.tsx` (no
+  route calls `notFound()` — there are no dynamic routes yet).
+- **DAL error taxonomy** (`lib/errors.ts`) — typed thrown errors, not a `Result<T, E>` type:
+  `unauthorized`, `forbidden`, `not_found`, `data_integrity`, `unavailable`. A Server Component
+  error reaches the client as a generic message + `digest` only (custom properties are stripped in
+  production), so `error.tsx` cannot and does not branch on `code` — the taxonomy is for
+  server-side translation (e.g. `not_found` → `notFound()`) once real failure sites exist. Phase 3
+  ships the contract only; no route-level `try`/`catch` was added around today's fixture-backed
+  calls, since there is nothing yet for them to catch.
+- **Bounded transaction queries** — `TransactionFilters` (`lib/data/transactions.ts`) gained
+  `from`/`to` (`CalendarDate`, both inclusive); `month` is now sugar for the equivalent
+  `monthStart`/`monthEnd` range (new helpers in `lib/finance/dates.ts`), so there is one definition
+  of "date range." Dashboard now requests only the current month; Analytics only its 6-month
+  window; `getNetWorthHistory(6)` replaces the unbounded call in both.
+- **Resolved the three previously-unused DAL functions**: deleted `getAccountById` and
+  `getTransactionsForMonth` (superseded by `getTransactions({ from, to })`); kept `getUpcomingBills`
+  and wired it into the Dashboard, replacing an unbounded `getBills()` + sort + slice.
+- **Explicit ordering contracts** for every list-returning `lib/data/**` function — see
+  `docs/database-schema.md §17`. Notably `getBudgets()` only guarantees a *technical* order
+  (`category_id ASC`); the two visible consumers apply their own semantic order using category
+  names they already fetch, not a UUID: `/budgets` sorts its list by `categoryName ASC` outright,
+  while the Dashboard's budget section sorts by `utilization DESC` first and uses `categoryName
+  ASC` only as the tie-break when utilization is equal — the Dashboard is not alphabetically
+  ordered overall. `transactions.created_at` was added to the schema (§4/§17 of
+  `docs/database-schema.md`) to give the transaction ordering contract
+  (`date DESC, created_at DESC, id ASC`) a real tie-break — amending a doc that was already merged
+  as part of Phase 2.
+- `README.md` rewritten — orientation only, linking to `docs/**` rather than duplicating it.
+
+### Deferred risks carried forward from Phase 3
+
+- **`/transactions` remains intentionally unbounded** — a full-history browser with no pagination.
+  Cheap against ~100 fixture rows; against real SQL it's an unbounded full-history read of the
+  user's entire transaction history on every page load. **This is an explicit prerequisite for
+  Phase 6**: bounded/paginated full-history browsing must be designed and built *before* the
+  Supabase-backed `/transactions` route is considered production-ready for a large transaction
+  history — see Phase 6 below.
+- **Phase 5's auth guard will interact with `loading.tsx`.** Per the installed Next.js docs, if a
+  layout reads runtime/uncached data (`cookies()`/`headers()`), `loading.tsx`'s Suspense fallback
+  does not cover it and navigation blocks until the layout resolves. `app/(app)/layout.tsx` gains a
+  `getClaims()` cookie read in Phase 5 — that check must stay fast, or move into its own nested
+  `<Suspense>`, or the shared loading boundary added in Phase 3 will not show while auth resolves.
 
 ## Phase 4 — Supabase provisioning & migrations
 
@@ -139,6 +170,12 @@ signup route — the one user is provisioned manually.
 Not yet started. `lib/data/**` function bodies swap from fixtures to Supabase queries; existing
 signatures, `lib/finance/**`, and all components are unchanged. Real `getToday()` reading
 `profiles.timezone`.
+
+**Prerequisite carried forward from Phase 3:** `/transactions` is a full-history browser with no
+pagination or windowing. Before the Supabase-backed `/transactions` route is considered
+production-ready for a large transaction history, this phase must design and build bounded/paginated
+browsing for it — the unbounded `getTransactions()` call that page still makes fetches the user's
+entire transaction history on every load, unlike every other route, which was bounded in Phase 3.
 
 ## Phase 7 — Mutations
 

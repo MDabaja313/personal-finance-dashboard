@@ -57,3 +57,23 @@ export function listMonths(fromMonth: MonthKey, toMonth: MonthKey): MonthKey[] {
   }
   return months;
 }
+
+/** First calendar day of a 'YYYY-MM' month, e.g. '2026-08' -> '2026-08-01'. */
+export function monthStart(month: MonthKey): CalendarDate {
+  const [year, m] = month.split("-").map(Number);
+  return `${year}-${String(m).padStart(2, "0")}-01`;
+}
+
+/**
+ * Last calendar day of a 'YYYY-MM' month, e.g. '2026-08' -> '2026-08-31',
+ * '2026-02' -> '2026-02-28', '2024-02' -> '2024-02-29' (leap year). Day 0 of
+ * the following month (via Date.UTC) rolls back to the last day of this
+ * month, which correctly accounts for variable month length and leap years
+ * without hardcoding either. `new Date(Date.UTC(...))` takes one argument,
+ * so it doesn't trip the zero-arg `new Date()` clock-read restriction.
+ */
+export function monthEnd(month: MonthKey): CalendarDate {
+  const [year, m] = month.split("-").map(Number);
+  const lastDay = new Date(Date.UTC(year, m, 0)).getUTCDate();
+  return `${year}-${String(m).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`;
+}

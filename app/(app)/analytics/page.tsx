@@ -13,7 +13,7 @@ import { getToday } from "@/lib/data/clock";
 import { getNetWorthHistory } from "@/lib/data/net-worth";
 import { getTransactions } from "@/lib/data/transactions";
 import { accountKind } from "@/lib/finance/accounts";
-import { addMonths, monthKey } from "@/lib/finance/dates";
+import { addMonths, monthEnd, monthKey, monthStart } from "@/lib/finance/dates";
 import { monthlyTotals } from "@/lib/finance/trends";
 import { spendingByCategory } from "@/lib/finance/transactions";
 import { formatCents } from "@/lib/format/currency";
@@ -22,16 +22,17 @@ import { formatPercent } from "@/lib/format/percent";
 import { toCents } from "@/lib/types";
 
 export default async function AnalyticsPage() {
-  const [transactions, accounts, categories, netWorthHistory, today] = await Promise.all([
-    getTransactions(),
-    getAccounts(),
-    getCategories(),
-    getNetWorthHistory(),
-    getToday(),
-  ]);
-
+  const today = await getToday();
   const currentMonth = monthKey(today);
   const months = Array.from({ length: 6 }, (_, i) => addMonths(currentMonth, i - 5));
+
+  const [transactions, accounts, categories, netWorthHistory] = await Promise.all([
+    getTransactions({ from: monthStart(months[0]), to: monthEnd(currentMonth) }),
+    getAccounts(),
+    getCategories(),
+    getNetWorthHistory(6),
+  ]);
+
   const totals = monthlyTotals(transactions, months);
   const netWorthByMonth = new Map(netWorthHistory.map((s) => [s.month, s.netWorthCents]));
 
