@@ -1,0 +1,58 @@
+import { Badge } from "@/components/ui/badge";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { availableCredit } from "@/lib/finance/accounts";
+import { formatCents } from "@/lib/format/currency";
+import type { Account, AccountType } from "@/lib/types";
+import { cn } from "@/lib/utils";
+
+const ACCOUNT_TYPE_LABEL: Record<AccountType, string> = {
+  checking: "Checking",
+  savings: "Savings",
+  cash: "Cash",
+  credit: "Credit Card",
+  investment: "Investment",
+  loan: "Loan",
+};
+
+function formatInterestRate(bps: number): string {
+  return `${(bps / 100).toFixed(2)}% APR`;
+}
+
+export function AccountCard({ account }: { account: Account }) {
+  const credit = availableCredit(account);
+
+  return (
+    <Card className={cn(account.isArchived && "opacity-60")}>
+      <CardHeader>
+        <CardTitle className="flex items-center justify-between gap-2">
+          <span className="truncate">{account.name}</span>
+          <Badge variant="outline" className="shrink-0">
+            {ACCOUNT_TYPE_LABEL[account.type]}
+          </Badge>
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-1">
+        <p className="text-xs text-muted-foreground">{account.institution}</p>
+        <p
+          className={cn(
+            "text-xl font-semibold",
+            account.balanceCents < 0 && "text-destructive"
+          )}
+        >
+          {formatCents(account.balanceCents)}
+        </p>
+        {account.creditLimitCents !== undefined && (
+          <p className="text-xs text-muted-foreground">
+            Limit {formatCents(account.creditLimitCents)}
+            {credit !== null && <> · {formatCents(credit)} available</>}
+          </p>
+        )}
+        {account.interestRateBps !== undefined && (
+          <p className="text-xs text-muted-foreground">
+            {formatInterestRate(account.interestRateBps)}
+          </p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}

@@ -74,6 +74,54 @@ const eslintConfig = defineConfig([
     files: ["lib/data/**/*.{ts,tsx}"],
     rules: noProcessEnv,
   },
+  {
+    files: ["lib/finance/**/*.{ts,tsx}"],
+    rules: {
+      ...noProcessEnv,
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            {
+              group: ["@/lib/data", "@/lib/data/*"],
+              message:
+                "lib/finance/** must stay pure — no DAL access. Take the data it needs as parameters instead.",
+            },
+            {
+              group: ["@/lib/mock", "@/lib/mock/*"],
+              message:
+                "lib/finance/** must stay pure — no fixture access. Take the data it needs as parameters instead.",
+            },
+            {
+              group: ["@/lib/supabase", "@/lib/supabase/*"],
+              message: "lib/finance/** must stay pure — no Supabase access.",
+            },
+            {
+              group: ["react", "react-dom"],
+              message: "lib/finance/** must stay pure — no React. These are plain calculation functions.",
+            },
+          ],
+        },
+      ],
+      "no-restricted-properties": [
+        ...noProcessEnv["no-restricted-properties"],
+        {
+          object: "Date",
+          property: "now",
+          message:
+            "lib/finance/** must not read the clock — accept `today` as an explicit parameter instead.",
+        },
+      ],
+      "no-restricted-syntax": [
+        "error",
+        {
+          selector: "NewExpression[callee.name='Date'][arguments.length=0]",
+          message:
+            "lib/finance/** must not read the clock — accept `today` as an explicit parameter instead of `new Date()`.",
+        },
+      ],
+    },
+  },
   // Override default ignores of eslint-config-next.
   globalIgnores([
     // Default ignores of eslint-config-next:

@@ -1,6 +1,6 @@
 import "server-only";
 
-import { mockAccounts } from "@/lib/mock/fixtures";
+import { mockAccounts } from "@/lib/mock";
 import type { Account } from "@/lib/types";
 
 /**
