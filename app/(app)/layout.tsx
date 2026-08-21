@@ -3,7 +3,7 @@ import { Header } from "@/components/layout/header";
 
 /**
  * Application shell only — presentation, no data access, no business logic.
- * NOTE: no authentication in Phase 0. This layout is modified in Phase 3
+ * NOTE: no authentication yet. This layout is modified in Phase 5
  * to enforce authentication once Supabase Auth exists.
  */
 export default function AppLayout({ children }: { children: React.ReactNode }) {

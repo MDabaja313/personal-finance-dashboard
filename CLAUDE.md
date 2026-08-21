@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 @AGENTS.md
 
-**Current phase:** Phase 1 (read-only UI) complete — all 8 routes are mock-backed and fully implemented, `lib/finance/**` is tested, theme (light/dark/system) works. Still no Supabase, no auth, no persistence, no Server Actions.
+**Current phase:** Phase 2 (data architecture & security design) complete — see `DEVELOPMENT_PLAN.md` for the authoritative phase roadmap and `docs/database-schema.md`, `docs/rls-policies.md`, `docs/auth-design.md` for the design it produced. Phase 1 (read-only UI + calculations + charts + theme) is complete: all 8 routes are mock-backed, `lib/finance/**` is tested. Still no Supabase, no auth, no persistence, no Server Actions.
 
 ## Commands
 
@@ -36,5 +36,5 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - `lib/supabase/**` — the only layer that reads Supabase env vars / constructs clients (doesn't exist yet).
   - `lib/finance/**` — pure calculations: no `lib/data`, `lib/mock`, `lib/supabase`, React, or clock access.
   - `components/**` — UI + local state/interactivity only. No DB/DAL/fixture access, no `process.env`, no derived financial arithmetic (call the tested `lib/finance` function instead).
-- **Auth:** use `getUser()`, never `getSession()`, for server-side authorization. RLS is enabled on every table even though this is single-user — the anon key is public. `service_role` never runs in application code.
+- **Auth:** use verified claims/user identity (`getClaims()` for page/proxy protection, `getUser()` when an up-to-date Auth record is specifically needed) for server-side authorization — never `getSession()`, since cookie-backed session data isn't itself verified. See `docs/auth-design.md`. RLS is enabled on every table even though this is single-user — the publishable key is public. `service_role` never runs in application code.
 - **Server Actions are independently reachable endpoints** — re-verify auth and row ownership inside the DAL, not just at the page level.

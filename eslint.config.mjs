@@ -4,7 +4,7 @@ import nextTs from "eslint-config-next/typescript";
 
 // Architectural boundaries (see CLAUDE.md). `no-restricted-imports` targets
 // `@/lib/supabase/**` even though that directory doesn't exist yet — the
-// rule is a no-op today and starts enforcing the moment Phase 3 adds it.
+// rule is a no-op today and starts enforcing the moment Phase 5 adds it.
 const noProcessEnv = {
   "no-restricted-properties": [
     "error",

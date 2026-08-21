@@ -17,7 +17,7 @@ export interface TransactionFilters {
  * Filtering happens here, server-side — the simplest correct approach for
  * a page reading URL searchParams: no client fetching, no API route,
  * shareable/bookmarkable URLs, and it maps directly onto a SQL WHERE
- * clause in Phase 4.
+ * clause in Phase 6.
  */
 export async function getTransactions(filters: TransactionFilters = {}): Promise<Transaction[]> {
   let results: Transaction[] = [...mockTransactions];
