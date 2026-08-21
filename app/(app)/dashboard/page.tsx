@@ -9,7 +9,7 @@ import { UpcomingBills } from "@/components/dashboard/upcoming-bills";
 import { PageHeader } from "@/components/shared/page-header";
 import type { TransactionRow } from "@/components/transactions/types";
 import { getAccounts } from "@/lib/data/accounts";
-import { getBills } from "@/lib/data/bills";
+import { getUpcomingBills } from "@/lib/data/bills";
 import { getBudgets } from "@/lib/data/budgets";
 import { getCategories } from "@/lib/data/categories";
 import { getToday } from "@/lib/data/clock";
@@ -34,16 +34,16 @@ export default async function DashboardPage() {
   const today = await getToday();
   const currentMonth = monthKey(today);
 
-  const [accounts, allTransactions, recentTransactionsRaw, categories, budgets, bills, goals, netWorthHistory] =
+  const [accounts, allTransactions, recentTransactionsRaw, categories, budgets, upcomingBills, goals, netWorthHistory] =
     await Promise.all([
       getAccounts(),
-      getTransactions(),
+      getTransactions({ month: currentMonth }),
       getRecentTransactions(5),
       getCategories(),
       getBudgets(currentMonth),
-      getBills(),
+      getUpcomingBills(3),
       getGoals(),
-      getNetWorthHistory(),
+      getNetWorthHistory(6),
     ]);
 
   const accountName = new Map(accounts.map((a) => [a.id, a.name]));
@@ -68,17 +68,23 @@ export default async function DashboardPage() {
       amountCents: c.amountCents,
     }));
 
-  // Most-utilized budgets first — that's what a user opening the dashboard needs to see.
+  // Most-utilized budgets first — that's what a user opening the dashboard
+  // needs to see. `getBudgets()` only guarantees a deterministic technical
+  // order (category_id ASC), so ties in utilization are broken here by
+  // category name — a UUID must never become the tie-break a user sees.
   const budgetStatuses = budgets
     .map((b) => ({ status: budgetStatus(b, allTransactions), categoryName: categoryName.get(b.categoryId) ?? b.categoryId }))
-    .sort((a, b) => (b.status.utilization ?? -Infinity) - (a.status.utilization ?? -Infinity))
+    .sort((a, b) => {
+      const utilizationDiff = (b.status.utilization ?? -Infinity) - (a.status.utilization ?? -Infinity);
+      return utilizationDiff !== 0 ? utilizationDiff : a.categoryName.localeCompare(b.categoryName);
+    })
     .slice(0, 4);
 
-  const upcomingBillStatuses = bills
-    .map((b) => billStatus(b, today))
-    .sort((a, b) => a.daysUntilDue - b.daysUntilDue)
-    .slice(0, 3);
+  // getUpcomingBills already returns due_date ASC (name/id tie-broken), so
+  // no further sort is needed here.
+  const upcomingBillStatuses = upcomingBills.map((b) => billStatus(b, today));
 
+  // getGoals already returns the display order (soonest target date first).
   const goalProgresses = goals.slice(0, 3).map((g) => goalProgress(g, today));
 
   const months = Array.from({ length: 6 }, (_, i) => addMonths(currentMonth, i - 5));

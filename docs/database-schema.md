@@ -175,6 +175,7 @@ No amounts or dates live here — those belong to the two `transactions` legs (�
 | `category_id` | `UUID` | **nullable** | Composite FK → `categories(id, user_id)`. Null on movement legs *and* legally on some ordinary rows — see `txn-094`, §17 |
 | `movement_id` | `UUID` | **nullable** | Composite FK → `movements(id, user_id)`. Non-null iff `kind` is a movement kind (§6) |
 | `amount_cents` | `BIGINT` | NOT NULL | Signed. Zero is legal for ordinary rows, illegal for movement legs (§6) |
+| `created_at` | `TIMESTAMPTZ` | NOT NULL, default `now()` | **Phase 3 amendment.** Query-ordering only — never surfaced on the `Transaction` DTO. Added specifically because deterministic same-day transaction ordering required an entry-recency tie-break: without it, `ORDER BY date DESC, id ASC` alone would order tied rows by UUID, which carries no meaning a user could read. Exists so `ORDER BY date DESC, created_at DESC, id ASC` has a real entry-recency tie-break instead (§8, §17). |
 | — | | | `UNIQUE (id, user_id)` — the composite target `bill_occurrences.transaction_id` references (§13) |
 
 ### `budgets`
@@ -408,7 +409,7 @@ see the error taxonomy in [DEVELOPMENT_PLAN.md](../DEVELOPMENT_PLAN.md) (Phase 3
 
 | Table | Index | Serves |
 |---|---|---|
-| `transactions` | `(user_id, date DESC)` | **Primary.** Every current query sorts by date desc; the future bounded `from`/`to` window is a range scan on this. |
+| `transactions` | `(user_id, date DESC, created_at DESC, id ASC)` | **Primary.** Matches the Phase 3 ordering contract `date DESC, created_at DESC, id ASC` (§17) in full — the complete ordering sequence after `user_id`; the bounded `from`/`to` window (finalized in Phase 3) is a range scan on this. |
 | `transactions` | `(user_id, account_id, date DESC)` | `TransactionFilters.accountId` |
 | `transactions` | `(user_id, category_id, date DESC)` | `spendingByCategory`, budget rollups |
 | `transactions` | `(movement_id)` WHERE `movement_id IS NOT NULL` | Partial index — the movement trigger's leg lookup |
@@ -900,6 +901,25 @@ expense. Walked against §6's constraints:
 Every fixture movement pair (e.g. `mov-transfer-2026-03`, `mov-ccpay-2026-03`) — two legs, same
 `movement_kind`, opposite nonzero signs summing to zero, no category — satisfies every §6/§7
 constraint directly, since those constraints were derived from this exact fixture shape.
+
+### Phase 3 — the finalized transaction ordering contract
+
+**The Phase 2 schema omitted `transactions.created_at`.** **Phase 3's deterministic-ordering
+review exposed that `transactions` needed an entry-recency tie-break for same-day rows**: without
+it, same-day transactions had no real tie-break and `ORDER BY date DESC, id ASC` alone would have
+ordered tied rows by UUID. Phase 3 amended the schema to add `transactions.created_at` (see the
+table in §4), and `lib/data/transactions.ts` was updated to sort `date DESC, created_at DESC, id
+ASC` (the mock
+DAL's `created_at` stand-in is the fixture array's own insertion index — a later fixture entry is
+treated as a later `created_at`). This is what makes same-day rows (three transactions each on
+`2026-08-16` and `2026-08-18` in the fixtures) deterministic instead of depending on
+`Array.prototype.sort`'s stability, which SQL does not provide.
+
+**Phase 4 requirement, recorded here so it isn't rediscovered:** `seed.sql` must assign explicit
+`created_at` values to seeded transaction rows that reproduce this same fixture-insertion order
+(e.g. strictly increasing timestamps following `mockTransactions` array order), or the
+seeded/database-backed application will silently reorder same-day transactions relative to the
+order this phase established and tested.
 
 ---
 

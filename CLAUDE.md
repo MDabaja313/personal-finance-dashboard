@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 @AGENTS.md
 
-**Current phase:** Phase 2 (data architecture & security design) complete — see `DEVELOPMENT_PLAN.md` for the authoritative phase roadmap and `docs/database-schema.md`, `docs/rls-policies.md`, `docs/auth-design.md` for the design it produced. Phase 1 (read-only UI + calculations + charts + theme) is complete: all 8 routes are mock-backed, `lib/finance/**` is tested. Still no Supabase, no auth, no persistence, no Server Actions.
+**Current phase:** Phase 3 (pre-persistence hardening) complete — see `DEVELOPMENT_PLAN.md` for the authoritative phase roadmap. `error.tsx`/`loading.tsx`/`not-found.tsx` boundaries exist, `lib/errors.ts` defines the typed DAL error taxonomy (no live throw sites yet), `TransactionFilters` supports `from`/`to`, and `lib/data/**` has explicit ordering contracts. Phase 2 (data architecture & security design) is complete — see `docs/database-schema.md`, `docs/rls-policies.md`, `docs/auth-design.md`. Still no Supabase, no auth, no persistence, no Server Actions.
 
 ## Commands
 
@@ -30,6 +30,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Transaction meaning is `kind` + sign together, never sign alone.** `income` +, `expense` −, `refund` +, `transfer`/`credit_card_payment` source − / destination +. The latter two are paired legs sharing one `movementId` (exactly two, summing to zero), excluded from income/spending/cash-flow but still visible in each account's own history. See `lib/types/index.ts` and `lib/finance/transactions.ts`.
 - **Account balances are signed** (assets +, liabilities −). Display splits it: `totalAssets`/`totalLiabilities` (positive magnitude) and `netWorth` (signed sum), such that `netWorth === totalAssets - totalLiabilities`. `NetWorthSnapshot` commits to the same convention explicitly (`netWorthCents` stored, not implied) — never compare it against raw signed balances.
 - **`today` is always an explicit parameter**, supplied by `lib/data/clock.ts` (`getToday()`, fixed at `MOCK_TODAY` during the mock phase). `lib/finance/**` never reads the clock — ESLint blocks `Date.now()`/`new Date()` there.
+- **Every list-returning `lib/data/**` function has an explicit `ORDER BY`-equivalent sort** — see `docs/database-schema.md §17` for the full contract per function. Never rely on fixture array order. When a DAL function only guarantees a *technical* order (e.g. `getBudgets()`'s `category_id ASC`, since it has no join to `categories`), the calling page applies its own semantic display order using data it already fetched — a UUID must never become a visible sort order. `getTransactions()` orders `date DESC, created_at DESC, id ASC`; `created_at` never appears on the `Transaction` DTO.
 - **Layer boundaries** (enforced by `eslint.config.mjs` where the layer exists):
   - `lib/data/**` — the only layer that queries the database (or reads mock fixtures now). `'server-only'`, returns DTOs.
   - `lib/mock/**` — fixtures. Only `lib/data/**` may import them; `app/**` and `components/**` are blocked.
