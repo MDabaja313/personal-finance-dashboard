@@ -129,6 +129,13 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Generated, gitignored Supabase CLI local state (containers write
+    // vendored/bundled code here, e.g. an edge-runtime Deno bundle) —
+    // not project source, never committed. Scoped narrowly so committed
+    // files under supabase/** (migrations, config.toml, tests) stay
+    // visible to normal tooling and review.
+    "supabase/.temp/**",
+    "supabase/.branches/**",
   ]),
 ]);
 
