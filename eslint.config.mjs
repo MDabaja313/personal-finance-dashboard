@@ -58,7 +58,7 @@ const eslintConfig = defineConfig([
             {
               group: ["@/lib/supabase", "@/lib/supabase/*"],
               message:
-                "app/** must not import Supabase clients directly. Go through lib/data/**.",
+                "app/** must not import Supabase clients directly. Go through lib/data/** for data, or lib/auth/** for identity and the auth Server Actions.",
             },
             {
               group: ["@/lib/mock", "@/lib/mock/*"],

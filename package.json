@@ -11,6 +11,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "seed:generate": "tsx scripts/generate-seed.ts",
+    "auth:reset-local": "tsx scripts/provision-owner.ts",
     "db:reset": "supabase db reset",
     "db:test": "supabase test db"
   },
