@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 @AGENTS.md
 
-**Current phase:** Phase 3 (pre-persistence hardening) complete — see `DEVELOPMENT_PLAN.md` for the authoritative phase roadmap. `error.tsx`/`loading.tsx`/`not-found.tsx` boundaries exist, `lib/errors.ts` defines the typed DAL error taxonomy (no live throw sites yet), `TransactionFilters` supports `from`/`to`, and `lib/data/**` has explicit ordering contracts. Phase 2 (data architecture & security design) is complete — see `docs/database-schema.md`, `docs/rls-policies.md`, `docs/auth-design.md`. Still no Supabase, no auth, no persistence, no Server Actions.
+**Current phase:** Phase 4 (Supabase provisioning & migrations) complete — see `DEVELOPMENT_PLAN.md` for the authoritative phase roadmap. The Supabase schema, RLS/grants, triggers, views, seed data, and the hardened snapshot-writer are implemented and verified both locally and hosted (`supabase/migrations/**`, `supabase/tests/database/**`). Phase 5 (Authentication) is next. `error.tsx`/`loading.tsx`/`not-found.tsx` boundaries exist, `lib/errors.ts` defines the typed DAL error taxonomy (no live throw sites yet), `TransactionFilters` supports `from`/`to`, and `lib/data/**` has explicit ordering contracts. Phase 2 (data architecture & security design) is complete — see `docs/database-schema.md`, `docs/rls-policies.md`, `docs/auth-design.md`. **The application itself still has no Supabase client, no auth, no persistence, no Server Actions** — `lib/data/**` remains mock-fixture-backed until the Phase 6 DAL swap.
 
 ## Commands
 

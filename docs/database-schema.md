@@ -1,10 +1,15 @@
 # Database Schema Design
 
-Documentation only. No executable migration SQL — small illustrative snippets appear where they
-clarify a shape or a constraint's intent, but nothing here is meant to be run as-is. See
+This design is now **implemented** — see `supabase/migrations/20260822150001`–`...150008` for the
+executable SQL and [DEVELOPMENT_PLAN.md §Phase 4](../DEVELOPMENT_PLAN.md#phase-4--supabase-provisioning--migrations--complete)
+for the verified completion facts (migration counts, hosted verification, test results). This
+document remains the authoritative *design* narrative — the reasoning behind each decision — while
+the migrations are the authoritative *executable* source; small illustrative SQL snippets below
+predate the migrations and are kept only where they still clarify a shape or a constraint's intent,
+not as a claim that they're what actually shipped. See
 [DEVELOPMENT_PLAN.md](../DEVELOPMENT_PLAN.md) for phase sequencing and
-[docs/rls-policies.md](rls-policies.md) for security. Written against the current baseline —
-`lint`/`typecheck`/`test` all clean, 66 tests passing, at commit `b48b456`.
+[docs/rls-policies.md](rls-policies.md) for security. The application (`lib/data/**`) is still
+mock-fixture-backed — the DAL swap to these tables is Phase 6, not done yet.
 
 ## Contents
 
@@ -51,13 +56,15 @@ auth.users (Supabase)
 **Eleven tables:** `profiles`, `accounts`, `categories`, `movements`, `transactions`, `budgets`,
 `bills`, `bill_occurrences`, `goals`, `goal_contributions`, `net_worth_snapshots`.
 
-**Two views** (plus one conditional), all requiring `security_invoker = on`
+**Two views**, both `security_invoker = on`, both implemented in
+`20260822150005_views.sql`
 (see [rls-policies.md](rls-policies.md#security_invoker-views)):
 
 - `account_balances` — derived current balance per account.
-- goal saved-balance rollup — derived `saved_cents` per goal.
-- *(conditional)* a bill next-unpaid-occurrence projection, only if that projection is
-  implemented as a view rather than in the DAL (§13, §16).
+- `goal_balances` — derived `saved_cents` per goal.
+
+**Decided in Phase 4:** the bill next-unpaid-occurrence projection is **not** a view — it remains
+a Phase 6 DAL query, per §13/§16.
 
 No table list changed across the review rounds that produced this document — the balance-
 reconciliation limitation (§18) is recorded as a *future* prerequisite, not a table added now.
@@ -465,11 +472,15 @@ truncated balance is a worse failure mode than a visible error. Null values are 
 `undefined` (or the documented inherited value) *before* the safe-integer check runs — never
 coerced to `0`.
 
-**Verification item for Phase 4 provisioning, not an assumption made here:** PostgREST/
-supabase-js may return a `bigint` column as a JSON number or as a string, depending on
-configuration. The mapper must handle both. A string value reaching `toCents()` produces `NaN`,
-which fails `Number.isSafeInteger` and throws — so the default failure mode, even for an
-unverified assumption, is already safe and loud rather than silently wrong.
+**Verified empirically in Phase 4, not merely assumed:** local PostgREST serializes a `BIGINT`
+column — including the view-computed `account_balances.balance_cents` and
+`goal_balances.saved_cents` — as an **unquoted JSON number**. PostgreSQL/PostgREST itself
+preserved `9007199254740993` exactly in the payload; it was JavaScript's `JSON.parse` that rounded
+it, because that value exceeds `Number.MAX_SAFE_INTEGER`. The existing `Number.isSafeInteger`/
+`toCents()` boundary already rejects the resulting unsafe value rather than silently coercing it —
+no mapper change was needed. This was one empirical boundary test, not a proof for every
+out-of-range value or for every possible PostgREST/supabase-js configuration; the mapper contract
+below (reject, never coerce) is what makes that gap safe regardless.
 
 Floating point stays confined to `lib/format/**` and to `percentage()`'s divide-first display
 output (`lib/finance/money.ts`) — a display value, never re-stored.
@@ -517,10 +528,12 @@ output (`lib/finance/money.ts`) — a display value, never re-stored.
 accounts.opening_balance_cents BIGINT NOT NULL
 ```
 
-A view, `account_balances`:
+A view, `account_balances` — implemented in `20260822150005_views.sql`; the shape below is the
+original design sketch, kept for narrative purposes (the shipped SQL additionally scopes the join
+on `user_id` and casts the sum back to `::bigint`, since `SUM(bigint)` returns `numeric`):
 
 ```sql
--- illustrative only, not migration-ready
+-- design sketch — see supabase/migrations/20260822150005_views.sql for the actual SQL
 SELECT a.id, a.user_id,
        a.opening_balance_cents
          + COALESCE(SUM(t.amount_cents), 0) AS balance_cents
@@ -541,11 +554,11 @@ silently bypass RLS.
 by the DAL, so `lib/finance/accounts.ts`, every consuming component, and all 66 existing tests
 are untouched by this design.
 
-**Seeding arithmetic — the important consequence.** The current mock fixtures store each
-account's balance as an independent scalar (`lib/mock/accounts.ts`) that is **not** the sum of
-that account's fixture transactions (`lib/mock/transactions.ts`, Mar–Aug 2026). To reproduce the
-existing fixture balances exactly under the derived model, `seed.sql` (Phase 4) must
-back-compute, per account:
+**Seeding arithmetic — the important consequence.** The mock fixtures store each account's
+balance as an independent scalar (`lib/mock/accounts.ts`) that is **not** the sum of that
+account's fixture transactions (`lib/mock/transactions.ts`, Mar–Aug 2026). To reproduce the
+existing fixture balances exactly under the derived model, `supabase/seed.sql` (generated by
+`scripts/generate-seed.ts`, Phase 4) back-computes, per account:
 
 ```
 opening_balance_cents = fixture_balance_cents − SUM(that account's fixture transaction amounts)
@@ -553,7 +566,8 @@ opening_balance_cents = fixture_balance_cents − SUM(that account's fixture tra
 
 This is what keeps the net-worth coherence assertion in `lib/mock/index.test.ts` — "the latest
 net-worth snapshot matches current account totals" — passing once the DB-backed values replace
-the fixture-backed ones. Not computed in this phase; the arithmetic is recorded here for Phase 4.
+the fixture-backed ones, and is verified directly by the seed-parity pgTAP suite
+(`supabase/tests/database/010-seed-parity.sql`).
 
 A consequence worth noting: under this model, `netWorth === totalAssets − totalLiabilities`
 becomes an **emergent property of the ledger**, rather than a stored coincidence that could drift
@@ -714,9 +728,10 @@ model would ripple through `lib/types`, `lib/finance/bills.ts` and its tests,
 **Resolution:** the schema satisfies the "no mutable pointer, full history retained" requirement
 completely at the storage layer. The **Phase 6 DAL** then projects the next unpaid occurrence
 into the existing `Bill` DTO shape — `dueDate` becomes "the earliest `scheduled` occurrence's
-`due_date` for this bill," computed at query time, either via a `security_invoker` view or
-directly in `lib/data/bills.ts`. `BillOccurrence` does not enter the UI, and no component changes,
-until Phase 7 actually needs occurrence history or a mark-as-paid action.
+`due_date` for this bill," computed at query time. **Decided in Phase 4: this projection is a
+Phase 6 DAL query, not a third view** — `20260822150005_views.sql` creates exactly the two views
+in §1 (`account_balances`, `goal_balances`). `BillOccurrence` does not enter the UI, and no
+component changes, until Phase 7 actually needs occurrence history or a mark-as-paid action.
 
 ---
 
@@ -773,10 +788,11 @@ a retried run, the documented on-demand fallback, and any intentional backfill/r
 past month — all of them compute the *same* as-of query for the *same* target month and must
 produce the *same* result, which is exactly what makes the fallback and retries safe to rerun.
 
-This is naturally implemented as a dedicated as-of query or function — parameterized by
-`(user_id, month)` — rather than the plain `account_balances` view, since the view has no month
-parameter to bound its `SUM` by. **Not designed as executable SQL in this phase** — recorded as
-the required shape for Phase 4.
+This is implemented as a dedicated function, `private.write_net_worth_snapshot(p_user_id, p_month)`
+(`20260822150008_snapshot_writer.sql`), parameterized by `(user_id, month)` — never the plain
+`account_balances` view, since that view has no month parameter to bound its `SUM` by.
+`private.write_net_worth_snapshots_for_range(p_user_id, p_from_month, p_to_month)` backfills a
+range by calling the single-month function once per month — never a divergent calculation.
 
 ### Classification — the exact existing convention, not a guess
 
@@ -802,12 +818,16 @@ The snapshot writer must apply this same classification to the as-of balances ab
 live `account_balances` view, when computing `assets_cents`/`liabilities_cents`/`net_worth_cents`
 for a historical or backfilled month.
 
-**Intended writer: `pg_cron`, running monthly, provisioned in Phase 4.** The database role and
-privilege model for that writer is **explicitly a Phase 4 provisioning decision, not settled
-here** — see [rls-policies.md](rls-policies.md#9-security-definer-bypassrls-and-the-snapshot-writer)
-for the hardening requirements that decision must satisfy regardless of which role is ultimately
-chosen. That document must describe the writer using the as-of design above — it must not say the
-writer "simply reads current `account_balances` across every user."
+**Intended writer: `pg_cron`, running monthly.** **Decided in Phase 4 (Option B, approved at
+Gate 3):** a dedicated `NOLOGIN`/`NOSUPERUSER`/`NOBYPASSRLS` role, `finance_snapshot_writer`, owns
+the snapshot-writer functions as `SECURITY DEFINER` and receives narrowly-scoped object grants
+plus matching role-targeted RLS policies — see
+[rls-policies.md](rls-policies.md#9-security-definer-bypassrls-and-the-snapshot-writer) for the
+hardening requirements this satisfies, and
+[DEVELOPMENT_PLAN.md](../DEVELOPMENT_PLAN.md#phase-4--supabase-provisioning--migrations--complete)
+for the full verified writer-design facts. No `cron.schedule()` call exists yet — Phase 4 settles
+and proves the privilege model only; actual scheduling remains future work. The writer uses the
+as-of design above, never "simply reads current `account_balances` across every user."
 
 **Documented fallback if `pg_cron` is unavailable on the target Supabase plan: idempotent
 on-demand snapshot generation** — safe to call repeatedly, `UPSERT`ing on the
@@ -849,25 +869,23 @@ into the same shape rather than exposing normalized rows to the UI — and it's 
 |---|---|---|
 | `getToday()` | `profiles.timezone` + `Intl.DateTimeFormat('en-CA', …)` | The single clock seam — unchanged signature |
 | `getAccounts()` | `SELECT * FROM account_balances WHERE user_id = auth.uid() ORDER BY name` | Ordering is currently implicit in fixture array order — must become an explicit contract |
-| `getAccountById(id)` | same, `WHERE id = $1` | **Currently unused by any route.** Keep only if an account-detail route is planned before Phase 6; otherwise drop rather than port silently |
 | `getCategories()` | `WHERE user_id = auth.uid() ORDER BY name` | Same explicit-ordering requirement |
-| `getTransactions(filters)` | `WHERE` clause + `ORDER BY date DESC` | Maps 1:1 today; gains optional `from`/`to` bounds per the Phase 3 decision recorded in `DEVELOPMENT_PLAN.md`; `search` needs `pg_trgm` (§8) |
+| `getTransactions(filters)` | `WHERE` clause + `ORDER BY date DESC, created_at DESC, id ASC` | Maps 1:1 today, including the Phase 3 `from`/`to` bounds; `search` needs `pg_trgm` (§8) |
 | `getRecentTransactions(limit)` | `ORDER BY date DESC LIMIT n` | Currently fetches the full unbounded list and slices client-side — becomes a real `LIMIT` |
-| `getTransactionsForMonth(month)` | superseded by `getTransactions({from, to})` | **Currently unused by any route** — do not port as-is; supersede with the bounded form |
 | `getBudgets(period)` | `WHERE period = $1` | 1:1 |
-| `getBills()` | `bills` joined to each bill's next unpaid occurrence (§13) | The one non-trivial rewrite in this table |
-| `getUpcomingBills(limit)` | `bill_occurrences ORDER BY due_date LIMIT n` | **Currently unused by any route.** The occurrence model makes this a natural query — reintroduce deliberately if a route needs it, or drop |
-| `getGoals()` | `goals` + contribution rollup, `WHERE archived_at IS NULL` | The soft-delete filter is new; everything else maps directly |
+| `getBills()` | `bills` joined to each bill's next unpaid occurrence (§13) | The one non-trivial rewrite in this table — a Phase 6 DAL query, not a view (§13, §1) |
+| `getUpcomingBills(limit)` | `bill_occurrences ORDER BY due_date LIMIT n` | Wired into the Dashboard as of Phase 3, replacing an unbounded `getBills()` + sort + slice |
+| `getGoals()` | `goals` + `goal_balances` rollup, `WHERE archived_at IS NULL` | The soft-delete filter is new; everything else maps directly |
 | `getNetWorthHistory(months?)` | `ORDER BY month DESC LIMIT n`, reversed for chronological display | Currently implemented as `.slice(-months)` over the full fixture array |
 
-**Two systemic notes:**
+**`getAccountById` and `getTransactionsForMonth` were deleted in Phase 3** (superseded by
+`getTransactions({ from, to })`) and are not part of this mapping — the table above reflects the
+current `lib/data/**` surface, not the Phase 2 draft that preceded that cleanup.
 
-- **Implicit ordering is a latent bug, not a feature.** Several fixture-backed functions today
-  return arrays whose order is an accident of fixture-file layout. SQL guarantees no ordering
-  without an explicit `ORDER BY`; every list-returning function needs one, or the UI will reorder
-  unpredictably the moment the DAL swap lands.
-- **The three currently-unused functions are resolved here, on paper**, rather than silently
-  ported and left dead in the Supabase-backed DAL.
+**Implicit ordering is a latent bug, not a feature.** Several fixture-backed functions today
+return arrays whose order is an accident of fixture-file layout. SQL guarantees no ordering
+without an explicit `ORDER BY`; every list-returning function needs one, or the UI will reorder
+unpredictably the moment the DAL swap lands.
 
 ---
 
@@ -915,11 +933,10 @@ treated as a later `created_at`). This is what makes same-day rows (three transa
 `2026-08-16` and `2026-08-18` in the fixtures) deterministic instead of depending on
 `Array.prototype.sort`'s stability, which SQL does not provide.
 
-**Phase 4 requirement, recorded here so it isn't rediscovered:** `seed.sql` must assign explicit
-`created_at` values to seeded transaction rows that reproduce this same fixture-insertion order
-(e.g. strictly increasing timestamps following `mockTransactions` array order), or the
-seeded/database-backed application will silently reorder same-day transactions relative to the
-order this phase established and tested.
+**Implemented in Phase 4:** `supabase/seed.sql` assigns explicit, strictly increasing `created_at`
+timestamps to seeded transaction rows, following `mockTransactions` array order exactly — so the
+seeded/database-backed application reproduces the same same-day transaction order this phase
+established and tested, rather than silently reordering it.
 
 ---
 
