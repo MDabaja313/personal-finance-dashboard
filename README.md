@@ -3,9 +3,11 @@
 A private, single-user personal finance dashboard — accounts, transactions, budgets, bills,
 goals, and analytics.
 
-**Status:** mock-backed (Phase 3 complete). No database, authentication, or persistence yet
-— every page reads deterministic fixture data through a data-access layer shaped like the
-eventual database queries. See [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md) for the full roadmap.
+**Status:** mock-backed (Phase 4 complete). The Supabase database schema, RLS, and migrations are
+provisioned and verified both locally and hosted, but the application itself has no Supabase
+client yet — every page still reads deterministic fixture data through a data-access layer shaped
+like the eventual database queries. Authentication (Phase 5) is next. See
+[DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md) for the full roadmap.
 
 ## Stack
 

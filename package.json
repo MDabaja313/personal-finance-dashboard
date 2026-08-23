@@ -9,7 +9,10 @@
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "seed:generate": "tsx scripts/generate-seed.ts",
+    "db:reset": "supabase db reset",
+    "db:test": "supabase test db"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",
@@ -33,7 +36,9 @@
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "16.3.1",
+    "supabase": "2.115.0",
     "tailwindcss": "^4",
+    "tsx": "4.23.12",
     "typescript": "^5",
     "vitest": "^4.1.11"
   }
