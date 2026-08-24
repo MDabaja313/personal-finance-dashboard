@@ -34,7 +34,8 @@ create role finance_snapshot_writer with
 -- TO, etc.) objects owned by that role in this and future migrations.
 -- Membership grants the ability to SET ROLE / act as the role and to
 -- administer its owned objects — it does NOT give finance_snapshot_writer
--- postgres's own BYPASSRLS or superuser attributes, and it does not
+-- postgres's own BYPASSRLS attribute (postgres itself is NOSUPERUSER
+-- here; BYPASSRLS is the attribute it actually holds), and it does not
 -- change what finance_snapshot_writer itself can do when a SECURITY
 -- DEFINER function runs as it.
 grant finance_snapshot_writer to postgres;

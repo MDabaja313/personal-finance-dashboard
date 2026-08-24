@@ -197,7 +197,8 @@ Server Actions. Phase 5 (Authentication) is next.
   system functions.
 - `postgres` (the migration/reset role) is a **member** of `finance_snapshot_writer` — enough to
   manage (`ALTER FUNCTION ... OWNER TO`, etc.) writer-owned objects across migrations, without
-  granting `postgres`'s own superuser/`BYPASSRLS` attributes to the writer role.
+  granting `postgres`'s own `BYPASSRLS` attribute to the writer role — measured directly against
+  the local database, `postgres` itself is `NOSUPERUSER`/`BYPASSRLS`, not a superuser.
 - No `cron.schedule()` call anywhere in Phase 4 — these migrations settle and prove the privilege
   model only; scheduling is out of scope until it's actually needed.
 
@@ -279,11 +280,54 @@ behavior:
 - Public signup is disabled at the project level.
 - Hosted security checks are clear.
 
-## Phase 5 — Authentication
+## Phase 5 — Authentication ✅ complete
 
-Not yet started. `lib/supabase/**` clients (browser/server/proxy), `proxy.ts` session refresh via
-`getClaims()`, `(auth)/login` route, a verified-identity guard in `app/(app)/layout.tsx`. No
-signup route — the one user is provisioned manually.
+`lib/supabase/**` clients (browser/server/proxy), `proxy.ts` session refresh via `getClaims()`,
+`lib/auth/**` as the app-facing identity/Server Action facade, `(auth)/login`, and a
+verified-identity guard in `app/(app)/layout.tsx`. No signup route — the one user is provisioned
+manually, both locally and hosted. **UI remains mock-backed** — `lib/data/**`, `lib/mock/**`, and
+`lib/finance/**` are untouched by this phase; Phase 6 is next.
+
+Delivered across four checkpoints:
+
+- **A1 — Supabase auth foundation.** `lib/supabase/env.ts` (the sole reader of
+  `NEXT_PUBLIC_SUPABASE_URL`/`NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`), `lib/supabase/client.ts`
+  (browser), `lib/supabase/server.ts` (Server Components/Actions, async `cookies()`),
+  `lib/supabase/proxy.ts` + root `proxy.ts` (session-cookie refresh via `getClaims()` on every
+  navigation — not an authorization boundary, see `docs/auth-design.md §6`).
+- **A2 — Owner authentication and provisioning.** `lib/auth/types.ts`, `lib/auth/actions.ts`
+  (`signIn`/`signOut` Server Actions — no `signUp`, ever), `lib/auth/session.ts`
+  (`getVerifiedClaims()`/`requireUser()`, both `getClaims()`-based, never `getSession()`),
+  `app/(auth)/login`, `components/auth/login-form.tsx`. Provisioning tooling:
+  `scripts/seed-identity.ts` (the one shared deterministic owner UUID),
+  `scripts/provision-owner.ts` (`npm run auth:reset-local` — Auth Admin API creates the real local
+  owner at that UUID, then the fixture seed attaches to it), `supabase/provisioning/owner.sql`
+  (hand-run, hosted-only, idempotent).
+- **A3 — Route protection.** `app/(app)/layout.tsx` calls `requireUser()` as the single guard
+  point for every route under `app/(app)/`; `components/layout/header.tsx` renders the signed-in
+  email and a `signOut` form.
+- **A4 (this checkpoint) — Tests, runtime verification, documentation.**
+  `lib/auth/actions.test.ts` (generic-login-error-mapping unit tests — a raw Supabase/Auth error
+  never reaches the caller, only the fixed message);
+  `lib/auth/posture.test.ts` (static regression test: no executable `getSession()`/`signUp()`
+  call site, no signup route, `app/**`/`components/**` never import `lib/supabase/**`,
+  `components/**` never imports `lib/auth/**` at the value level, only `lib/auth/**`/
+  `lib/supabase/**`/root `proxy.ts` import `lib/supabase/**`, no service-role/admin secret in
+  application source, signup disabled in `supabase/config.toml`); `scripts/verify-auth.ts`
+  (`npm run auth:verify` — proves the full flow over real HTTP against a running dev server:
+  logged-out redirect, login-page rendering, generic-error-only rejection, successful sign-in,
+  session-cookie issuance, authenticated access across two different routes, authenticated
+  `/login` redirect, logout cookie clearing, and post-logout inaccessibility — using the same
+  progressively-enhanced `<form>` POST a JS-disabled browser would send, not a shortcut around
+  Next.js Server Actions). Expired-access-token refresh is **not** runtime-proven by that script —
+  documented as an explicit gap, resting on the proxy's use of the official Supabase SSR
+  `getClaims()`-refresh pattern rather than an independent runtime check.
+
+**Phase 6 prerequisite, resolved:** `npm run auth:reset-local` produces a real, login-capable local
+owner at the exact same deterministic UUID (`scripts/seed-identity.ts`'s `SEED_USER_ID`) that
+`supabase/seed.sql` attaches every fixture-derived financial row to — so the Phase 6 DAL swap has a
+real authenticated session and real seeded data addressing the same user from day one, with no
+separate reconciliation step.
 
 ## Phase 6 — DAL swap
 

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 @AGENTS.md
 
-**Current phase:** Phase 4 (Supabase provisioning & migrations) complete — see `DEVELOPMENT_PLAN.md` for the authoritative phase roadmap. The Supabase schema, RLS/grants, triggers, views, seed data, and the hardened snapshot-writer are implemented and verified both locally and hosted (`supabase/migrations/**`, `supabase/tests/database/**`). Phase 5 (Authentication) is next. `error.tsx`/`loading.tsx`/`not-found.tsx` boundaries exist, `lib/errors.ts` defines the typed DAL error taxonomy (no live throw sites yet), `TransactionFilters` supports `from`/`to`, and `lib/data/**` has explicit ordering contracts. Phase 2 (data architecture & security design) is complete — see `docs/database-schema.md`, `docs/rls-policies.md`, `docs/auth-design.md`. **The application itself still has no Supabase client, no auth, no persistence, no Server Actions** — `lib/data/**` remains mock-fixture-backed until the Phase 6 DAL swap.
+**Current phase:** Phase 5 (Authentication) complete — see `DEVELOPMENT_PLAN.md` for the authoritative phase roadmap. `lib/supabase/**` (browser/server/proxy Supabase clients), `lib/auth/**` (the app-facing identity facade and `signIn`/`signOut` Server Actions), `proxy.ts` (session-cookie refresh via `getClaims()`), `app/(auth)/login`, and the `requireUser()` guard in `app/(app)/layout.tsx` are implemented and verified both statically (`lib/auth/posture.test.ts`) and at runtime (`npm run auth:verify`, `scripts/verify-auth.ts`). No signup route exists, or ever will. Phase 6 (DAL swap) is next. Locally, `npm run auth:reset-local` rebuilds the database around one real, login-capable owner at the same deterministic UUID the fixture seed targets — plain `npm run db:reset` alone is not login-capable; rerun `auth:reset-local` after it if you need to sign in. The Supabase schema, RLS/grants, triggers, views, seed data, and the hardened snapshot-writer (Phase 4) are implemented and verified both locally and hosted (`supabase/migrations/**`, `supabase/tests/database/**`). `error.tsx`/`loading.tsx`/`not-found.tsx` boundaries exist, `lib/errors.ts` defines the typed DAL error taxonomy (no live throw sites yet), `TransactionFilters` supports `from`/`to`, and `lib/data/**` has explicit ordering contracts. Phase 2 (data architecture & security design) is complete — see `docs/database-schema.md`, `docs/rls-policies.md`, `docs/auth-design.md`. **The application itself still has no persistence, no mutating Server Actions** — `lib/data/**` remains mock-fixture-backed until the Phase 6 DAL swap.
 
 ## Commands
 
@@ -13,7 +13,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `npm run start` — run the production build
 - `npm run lint` — run ESLint
 - `npm run typecheck` — `tsc --noEmit`
-- `npm test` — run Vitest once; `npm run test:watch` for watch mode. Scoped to `lib/**/*.test.ts` (`lib/finance/**` and fixture coherence) — no component tests.
+- `npm test` — run Vitest once; `npm run test:watch` for watch mode. Scoped to `lib/**/*.test.ts` (`lib/finance/**` and fixture coherence, `lib/auth/**` unit + static posture tests) — no component tests.
+- `npm run auth:reset-local` — rebuild the local database around one real, login-capable owner (`scripts/provision-owner.ts`). Plain `npm run db:reset` alone is not login-capable.
+- `npm run auth:verify` — runtime-verify the auth flow against a running `npm run dev` (`scripts/verify-auth.ts`).
 
 ## Stack notes
 
@@ -34,8 +36,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Layer boundaries** (enforced by `eslint.config.mjs` where the layer exists):
   - `lib/data/**` — the only layer that queries the database (or reads mock fixtures now). `'server-only'`, returns DTOs.
   - `lib/mock/**` — fixtures. Only `lib/data/**` may import them; `app/**` and `components/**` are blocked.
-  - `lib/supabase/**` — the only layer that reads Supabase env vars / constructs clients (doesn't exist yet).
+  - `lib/supabase/**` — the only layer that reads Supabase env vars / constructs clients. Reachable only from `lib/auth/**` and the root `proxy.ts`; `app/**` and `components/**` are blocked from importing it directly.
+  - `lib/auth/**` — the app-facing identity seam: `getVerifiedClaims()`/`requireUser()` (`lib/auth/session.ts`) and the `signIn`/`signOut` Server Actions (`lib/auth/actions.ts`). `app/**` and `components/**` call into this, never into `lib/supabase/**` directly. No `signUp` — public signup is disabled, permanently.
   - `lib/finance/**` — pure calculations: no `lib/data`, `lib/mock`, `lib/supabase`, React, or clock access.
-  - `components/**` — UI + local state/interactivity only. No DB/DAL/fixture access, no `process.env`, no derived financial arithmetic (call the tested `lib/finance` function instead).
-- **Auth:** use verified claims/user identity (`getClaims()` for page/proxy protection, `getUser()` when an up-to-date Auth record is specifically needed) for server-side authorization — never `getSession()`, since cookie-backed session data isn't itself verified. See `docs/auth-design.md`. RLS is enabled on every table even though this is single-user — the publishable key is public. `service_role` never runs in application code.
+  - `components/**` — UI + local state/interactivity only. No DB/DAL/fixture access, no `process.env`, no derived financial arithmetic (call the tested `lib/finance` function instead), no `lib/supabase/**` or `lib/auth/**` value imports (the action/session helpers arrive as props; a type-only `lib/auth/types` import is fine, since it carries no runtime access).
+- **Auth:** use verified claims/user identity (`getClaims()` for page/proxy protection, `getUser()` when an up-to-date Auth record is specifically needed) for server-side authorization — never `getSession()`, since cookie-backed session data isn't itself verified. See `docs/auth-design.md`. RLS is enabled on every table even though this is single-user — the publishable key is public. `service_role` never runs in application code. This posture (no `getSession()` authorization, no `signUp()`, the import boundaries above) is a static regression test, not just documented convention — see `lib/auth/posture.test.ts`.
 - **Server Actions are independently reachable endpoints** — re-verify auth and row ownership inside the DAL, not just at the page level.

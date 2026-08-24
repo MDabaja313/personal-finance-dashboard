@@ -1,14 +1,14 @@
 -- Row Level Security: ownership isolation on the 10 grant-bearing
 -- tables, movements' deliberate GRANT-layer exclusion, anon's total
 -- exclusion, write-denial for authenticated, and both security_invoker
--- views. All fixture setup runs as the migration owner (postgres is
--- superuser, so it bypasses FORCE ROW LEVEL SECURITY entirely -- the
+-- views. All fixture setup runs as the migration owner (postgres has
+-- BYPASSRLS, so it bypasses FORCE ROW LEVEL SECURITY entirely -- the
 -- same reason 020/030/040/050 could seed rows directly). Role/claim
 -- switches use the verified local auth.uid() form:
 --   SET LOCAL ROLE authenticated;
 --   SET LOCAL request.jwt.claim.sub = '<uuid>';
--- `RESET ROLE` returns to the session role (postgres, superuser) before
--- every switch, since a non-superuser role cannot SET ROLE onward to an
+-- `RESET ROLE` returns to the session role (postgres) before every
+-- switch, since a non-superuser role cannot SET ROLE onward to an
 -- unrelated role.
 --
 -- Permission denial (GRANT layer, e.g. movements/anon) and RLS row

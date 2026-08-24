@@ -6,8 +6,9 @@
 --
 -- Both functions are SECURITY DEFINER, owned by finance_snapshot_writer,
 -- with EXECUTE revoked from PUBLIC/anon/authenticated -- called here as
--- the migration owner (postgres), a superuser, which bypasses privilege
--- checks entirely.
+-- the migration owner (postgres), which is a member of
+-- finance_snapshot_writer (see migration 7) and so is not blocked by the
+-- REVOKE'd EXECUTE grants.
 begin;
 select plan(13);
 
