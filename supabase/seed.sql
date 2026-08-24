@@ -5,7 +5,8 @@
 begin;
 
 -- Placeholder local user (no password, no auth.identities row — not login-capable).
-insert into auth.users (id, aud, role, email) values ('c9152b5e-a931-4fe5-907a-64325a1a47ff' /* seed-user */, 'authenticated', 'authenticated', 'seed-user@local.test');
+-- Left untouched when a real owner already exists at this id (npm run auth:reset-local).
+insert into auth.users (id, aud, role, email) values ('c9152b5e-a931-4fe5-907a-64325a1a47ff' /* seed-user */, 'authenticated', 'authenticated', 'seed-user@local.test') on conflict (id) do nothing;
 insert into public.profiles (id, timezone) values ('c9152b5e-a931-4fe5-907a-64325a1a47ff' /* seed-user */, 'UTC');
 
 -- categories

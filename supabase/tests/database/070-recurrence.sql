@@ -4,9 +4,9 @@
 -- idempotency, amount-copy-at-generation-time, and paid/skipped
 -- row-preservation behavior. Both functions live in `private` and have
 -- EXECUTE revoked from PUBLIC/anon/authenticated -- called here as the
--- migration owner (postgres), a superuser, which bypasses privilege
--- checks entirely, same as every other privileged setup step in this
--- suite.
+-- migration owner (postgres), which is a member of finance_snapshot_writer
+-- (see migration 7) and so is not blocked by the REVOKE'd EXECUTE grants,
+-- same as every other privileged setup step in this suite.
 begin;
 select plan(25);
 

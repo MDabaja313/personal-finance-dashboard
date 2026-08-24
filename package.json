@@ -11,11 +11,15 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "seed:generate": "tsx scripts/generate-seed.ts",
+    "auth:reset-local": "tsx scripts/provision-owner.ts",
+    "auth:verify": "tsx scripts/verify-auth.ts",
     "db:reset": "supabase db reset",
     "db:test": "supabase test db"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",
+    "@supabase/ssr": "^0.12.4",
+    "@supabase/supabase-js": "^2.112.3",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-react": "^1.33.0",

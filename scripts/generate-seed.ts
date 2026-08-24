@@ -15,7 +15,6 @@
  *
  * Run: npm run seed:generate
  */
-import { createHash } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
@@ -28,32 +27,7 @@ import {
   mockTransactions,
 } from "@/lib/mock";
 import type { Transaction } from "@/lib/types";
-
-// ============================================================
-// Deterministic UUID mapping — fixed per fixture slug, stable across
-// regenerations. Not a real UUIDv5 implementation, just a stable hash
-// formatted with valid version/variant nibbles.
-// ============================================================
-
-function deterministicUuid(seed: string): string {
-  const hash = createHash("sha256").update(`personal-finance-dashboard-seed:${seed}`).digest("hex");
-  const hex = hash.slice(0, 32).split("");
-  hex[12] = "4"; // version 4 nibble
-  const variantChars = "89ab";
-  hex[16] = variantChars[parseInt(hash[16], 16) % 4];
-  const joined = hex.join("");
-  return `${joined.slice(0, 8)}-${joined.slice(8, 12)}-${joined.slice(12, 16)}-${joined.slice(16, 20)}-${joined.slice(20, 32)}`;
-}
-
-const idCache = new Map<string, string>();
-function uuidFor(slug: string): string {
-  let id = idCache.get(slug);
-  if (!id) {
-    id = deterministicUuid(slug);
-    idCache.set(slug, id);
-  }
-  return id;
-}
+import { SEED_USER_SLUG, uuidFor } from "./seed-identity";
 
 // UUID literal followed by a trailing comment naming the fixture slug it
 // came from. A SQL block comment is required here, not a "--" line
@@ -87,12 +61,30 @@ function nullable(inner: string | null): string {
 // ============================================================
 // Fixed local user — placeholder only. No password, no auth.identities,
 // no login internals. Exists solely so profiles.id has a satisfiable
-// auth.users(id) FK for local seed/pgTAP ownership testing. Not
-// intended to log in — Phase 5 creates a real login-capable local user
-// via a supported Auth path when login is actually implemented.
+// auth.users(id) FK for local seed/pgTAP ownership testing.
+//
+// The insert carries ON CONFLICT (id) DO NOTHING because two workflows
+// apply this seed against the same fixed id:
+//
+//   npm run db:reset          no auth.users row exists yet, so this
+//                             placeholder is inserted as before — still
+//                             not login-capable.
+//   npm run auth:reset-local  scripts/provision-owner.ts has already
+//                             created a REAL, login-capable GoTrue user
+//                             at this id through the Auth Admin API. The
+//                             conflict clause preserves that user — its
+//                             password, its auth.identities row, all of
+//                             its GoTrue internals — and the rest of the
+//                             seed simply attaches the fixture data to it.
+//
+// A plain insert would abort the second workflow; an ON CONFLICT DO
+// UPDATE would corrupt a real user. Never add instance_id,
+// encrypted_password, token columns, or an auth.identities row here —
+// creating a login-capable user is the Auth Admin API's job, not this
+// generator's.
 // ============================================================
 
-const USER_SLUG = "seed-user";
+const USER_SLUG = SEED_USER_SLUG;
 const USER_ID = uuidFor(USER_SLUG);
 
 const lines: string[] = [];
@@ -112,8 +104,9 @@ emit("");
 // ============================================================
 
 emit("-- Placeholder local user (no password, no auth.identities row — not login-capable).");
+emit("-- Left untouched when a real owner already exists at this id (npm run auth:reset-local).");
 emit(
-  `insert into auth.users (id, aud, role, email) values (${idLit(USER_SLUG)}, 'authenticated', 'authenticated', 'seed-user@local.test');`
+  `insert into auth.users (id, aud, role, email) values (${idLit(USER_SLUG)}, 'authenticated', 'authenticated', 'seed-user@local.test') on conflict (id) do nothing;`
 );
 emit(`insert into public.profiles (id, timezone) values (${idLit(USER_SLUG)}, 'UTC');`);
 emit("");

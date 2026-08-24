@@ -1,9 +1,15 @@
 # Authentication Design
 
-Documentation only — no `lib/supabase/**`, no `proxy.ts`, no auth implementation exists yet. See
-[docs/rls-policies.md](rls-policies.md) for the object-privilege/RLS layer this design sits above,
-and [DEVELOPMENT_PLAN.md](../DEVELOPMENT_PLAN.md) for phase sequencing (auth lands in Phase 5,
-after schema/RLS in Phase 4).
+**Implemented as of Phase 5** — `lib/supabase/**`, `proxy.ts`, `lib/auth/**`, `app/(auth)/login`,
+and the `app/(app)/layout.tsx` guard all exist and are verified both statically
+(`lib/auth/posture.test.ts`) and at runtime (`scripts/verify-auth.ts`, `npm run auth:verify`). This
+document remains the authoritative *design* narrative — the reasoning behind each decision —
+while the code under `lib/auth/**`/`lib/supabase/**` is the authoritative *executable* source; see
+[DEVELOPMENT_PLAN.md §Phase 5](../DEVELOPMENT_PLAN.md#phase-5--authentication--complete) for the
+verified completion facts (checkpoints, tests, runtime-verified behaviors). See
+[docs/rls-policies.md](rls-policies.md) for the object-privilege/RLS layer this design sits above.
+**The finance DAL (`lib/data/**`) remains mock-fixture-backed through all of Phase 5** — nothing in
+this document changes that; the swap to real Supabase queries is Phase 6, not done yet.
 
 ## Contents
 
@@ -26,11 +32,26 @@ after schema/RLS in Phase 4).
 ## 1. Provider and provisioning model
 
 - **Supabase Auth, email + password only.** No OAuth, no magic links, no other providers.
-- **One user, provisioned manually** in the Supabase dashboard (or via the Supabase CLI at setup
-  time) — not through the application.
-- **Public signup is disabled** at the project level. There is no self-service account creation
-  for this application.
-- **No signup route exists in the application.** The `(auth)` route group contains `/login` only.
+- **One user, provisioned by an administrator — never through the application.** The exact
+  mechanism differs by environment, but neither one is the application's own code path:
+  - **Hosted:** created by hand in the Supabase Dashboard (Authentication → Users → Add user),
+    then attached to `public.profiles` and the default categories by running
+    `supabase/provisioning/owner.sql` once in the Dashboard's SQL Editor — see
+    [database-schema.md §3](database-schema.md#3-ownership-model) and §3 below. Idempotent; safe to
+    re-run.
+  - **Local:** `npm run auth:reset-local` (`scripts/provision-owner.ts`) creates the owner through
+    the Supabase **Auth Admin API** at a fixed deterministic UUID
+    (`scripts/seed-identity.ts`'s `SEED_USER_ID`), *before* replaying `supabase/seed.sql` — see §3
+    below for why the ordering matters and why a plain `supabase db reset` cannot produce a
+    login-capable local owner on its own.
+- **Public signup is disabled at the project level, locally and hosted** — `enable_signup = false`
+  for every provider in `supabase/config.toml` (verified by `lib/auth/posture.test.ts`), and
+  disabled the same way on the hosted project. There is no self-service account creation for this
+  application.
+- **No signup route or Server Action exists in the application, and there never will be** — the
+  `(auth)` route group contains `/login` only; `lib/auth/actions.ts` exports `signIn`/`signOut`
+  only. Enforced as a static regression, not just a convention — see
+  [lib/auth/posture.test.ts](../lib/auth/posture.test.ts).
 
 This matches the locked architectural decision: the application is single-user in practice, but
 the schema underneath (`user_id` + RLS on every table, per
@@ -48,7 +69,10 @@ seam needs (`database-schema.md §10`).
 
 **The `profiles` row is created during provisioning, not by the application.** No `authenticated`
 INSERT policy exists on `profiles` (`rls-policies.md §4`) — the single provisioned user's profile
-row is created once, by an administrator, alongside the `auth.users` row itself.
+row is created once, by an administrator or provisioning script, alongside (or immediately after)
+the `auth.users` row itself. Hosted: `supabase/provisioning/owner.sql`'s `insert into
+public.profiles`. Local: `scripts/provision-owner.ts` applies `supabase/seed.sql`, whose
+`public.profiles` row targets the same fixed UUID the Admin API just created.
 
 ---
 
@@ -59,22 +83,39 @@ provisioned user, **default categories are seeded once, at provisioning time**, 
 currently hardcoded in `lib/mock/categories.ts` (Salary, Interest, Housing, Groceries, Dining,
 Transportation, Entertainment, Shopping, Utilities, Healthcare, Subscriptions, Insurance).
 
-This is a provisioning-time data-loading step (part of Phase 4's `seed.sql`, tied to the one
-known user id), not an application code path — there is no "new user" signup flow in this design
-that would need an automatic seeding trigger. If the application ever supports self-service
-signup in the future, a category-seeding trigger on `auth.users` insert would need to be added at
-that time; it is out of scope here because signup itself is out of scope here.
+**Correction to an earlier draft of this document, which anticipated this landing as Phase 4's
+hosted seed behavior.** That's not what actually shipped: `supabase/seed.sql` is **local-only**
+fixture data (Phase 4, replayed only by `db:reset`/`auth:reset-local`, never by `supabase db
+push`) — it happens to include the 12 categories as part of the full local fixture set, but it
+never runs against the hosted project. The hosted default categories are **Phase 5 provisioning**,
+inserted by `supabase/provisioning/owner.sql`'s `insert into public.categories ... where not
+exists (...)` — matched case-insensitively against the same
+`(user_id, lower(name))` uniqueness the schema enforces, and safe to re-run. Locally, the same 12
+categories arrive as part of `auth:reset-local`'s seed replay instead (§1), not through
+`owner.sql` — `owner.sql` is a hosted-only, hand-run script and is never executed against the
+local stack.
+
+This is a provisioning-time data-loading step tied to the one known/looked-up user id, not an
+application code path — there is no "new user" signup flow in this design that would need an
+automatic seeding trigger. If the application ever supports self-service signup in the future, a
+category-seeding trigger on `auth.users` insert would need to be added at that time; it is out of
+scope here because signup itself is out of scope here.
 
 ---
 
 ## 4. Client responsibilities: browser, server, proxy
 
-`lib/supabase/**` (Phase 5) is the **only** layer permitted to read Supabase environment
-variables or construct a Supabase client — the `no-restricted-properties` ESLint rule blocking
-`process.env` outside `lib/data/**` at
-[eslint.config.mjs](../eslint.config.mjs) is already pre-armed for this, and a parallel
-`no-restricted-imports` rule already blocks `app/**` and `components/**` from importing
-`@/lib/supabase` directly (it is currently a no-op only because the directory doesn't exist yet).
+`lib/supabase/**` is the **only** layer permitted to read Supabase environment variables or
+construct a Supabase client — the `no-restricted-properties` ESLint rule blocking `process.env`
+outside `lib/data/**` at [eslint.config.mjs](../eslint.config.mjs) enforces the env-var half of
+this, and a `no-restricted-imports` rule blocks `app/**` and `components/**` from importing
+`@/lib/supabase` directly. `lib/auth/**` is the sanctioned way across that boundary: it is the
+**app-facing auth seam** — `app/**` and `components/**` talk to `lib/auth/session.ts`
+(`getVerifiedClaims()`/`requireUser()`) and `lib/auth/actions.ts` (`signIn`/`signOut`), never to a
+Supabase client directly. `lib/auth/**` is itself allowed to import `lib/supabase/**`; nothing else
+outside `lib/supabase/**` and the root `proxy.ts` is. This import posture is a static regression
+test, not just a documented convention — see
+[lib/auth/posture.test.ts](../lib/auth/posture.test.ts).
 
 Three clients, one per execution context:
 
@@ -117,30 +158,56 @@ claim or a verified user record — is trusting exactly the value that can be st
 
 Next.js 16 renames `middleware.ts` to `proxy.ts` (per `AGENTS.md` — read the resolved
 `node_modules/next/dist/docs/` before implementing, since this is a breaking-change area from
-prior training data). In Phase 5, `proxy.ts` uses the proxy Supabase client, calling
-**`getClaims()`** (§5) as current Supabase SSR guidance recommends for this exact position in the
-request lifecycle, to refresh the session cookie on every navigation, so a Server Component later
-in the request has an up-to-date session available.
+prior training data). `proxy.ts` uses the proxy Supabase client, calling **`getClaims()`** (§5) as
+current Supabase SSR guidance recommends for this exact position in the request lifecycle, to
+refresh the session cookie on every navigation, so a Server Component later in the request has an
+up-to-date session available.
 
 **`proxy.ts` is explicitly not an authorization boundary.** It refreshes tokens; it does not
 decide who is allowed to see what. Treating proxy-level presence-of-a-session as sufficient
 authorization would be a mistake — the actual authorization decision is made at the layout guard
 (§7) and re-verified at the DAL (§8), both using verified identity per §5.
 
+**Expired-access-token refresh is not claimed as deterministically runtime-tested.**
+`scripts/verify-auth.ts` (`npm run auth:verify`) proves login cookie issuance, cookie propagation,
+authenticated session continuity, and logout cookie clearing over real HTTP — but it does not force
+a token into an expired state, so it does not exercise this refresh path. What's implemented is the
+official Supabase SSR pattern — call `getClaims()` from `proxy.ts` on every navigation so a session
+nearing expiry is refreshed before a Server Component downstream needs it — and that pattern is
+what this section documents; it is a design/implementation claim, not an independently
+runtime-verified one.
+
 ---
 
 ## 7. The `app/(app)/layout.tsx` guard
 
-[app/(app)/layout.tsx](../app/(app)/layout.tsx) previously carried a comment referencing the old
-"Phase 3" numbering for authentication; that comment was corrected as part of this phase's
-cleanup to point at Phase 5, where the guard is actually implemented (see
-[DEVELOPMENT_PLAN.md](../DEVELOPMENT_PLAN.md)).
+[app/(app)/layout.tsx](../app/(app)/layout.tsx) is the **final page guard** for the entire
+authenticated application surface. It calls `requireUser()` (`lib/auth/session.ts`), which itself
+calls `getClaims()` (§5 — the recommended path for page-level protection) and redirects to
+`/login` if no valid, verified user is present, before rendering any child route. Every one of the
+8 existing routes sits under this layout, so this single guard point covers the whole app without
+touching each page individually. `components/layout/header.tsx` receives the verified user's email
+and the `signOut` Server Action as props from this same guard call — it does not re-derive identity
+itself.
 
-In Phase 5, this layout verifies identity via `getClaims()` (§5 — the recommended path for
-page-level protection) and redirects to `/login` if no valid, verified user is present, before
-rendering any child route. Every one of the 8 existing routes sits under this layout, so this
-single guard point covers the entire authenticated application surface without touching each
-page individually.
+**The reverse direction:** `app/(auth)/login/page.tsx` calls `getVerifiedClaims()` (not
+`requireUser()` — a signed-in visitor should be redirected, not blocked) and redirects an
+already-authenticated visitor straight to `/dashboard`, so a signed-in user can never land back on
+the login form. **Logging out** (`lib/auth/actions.ts`'s `signOut`) calls `supabase.auth.signOut()`
+and redirects to `/login`. Both redirects — authenticated `/login` → `/dashboard`, and logout →
+`/login` — are runtime-proven by `scripts/verify-auth.ts`, not merely asserted here.
+
+**Interaction with `loading.tsx` (carried forward from the Phase 3 risk noted in
+[DEVELOPMENT_PLAN.md](../DEVELOPMENT_PLAN.md)):** this layout reads cookies via `requireUser()` on
+every request, which makes it dynamic — per the installed Next.js docs, `loading.tsx`'s Suspense
+fallback does not cover a layout's own uncached data read, so navigation blocks on this guard
+resolving rather than showing the shared loading boundary during it. `requireUser()`/`getClaims()`
+stays fast (local JWT verification, no required network round-trip) specifically so this is not a
+perceptible delay. **Do not move auth resolution client-side to "fix" this** — that would trade a
+guard that fails closed (no verified identity ⇒ no protected render, ever) for one that renders the
+protected shell first and revokes access after the fact, which is exactly the class of mistake §5
+and §6 exist to prevent. If this guard's cost ever becomes visible, the fix is a narrower
+`<Suspense>` boundary around just the identity check, not moving the check itself off the server.
 
 ---
 
