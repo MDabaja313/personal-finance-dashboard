@@ -217,8 +217,11 @@ web3 = 30
 # secret = ""
 
 [auth.email]
-# Allow/disallow new user signups via email to your project.
-enable_signup = false
+# Allow/disallow new user signups via email to your project. The project-level
+# [auth] enable_signup = false above already blocks all self-service signup;
+# this must stay `true` so the one admin-provisioned owner can still sign in
+# with email + password (signInWithPassword) — see docs/auth-design.md §1.
+enable_signup = true
 # If enabled, a user will be required to confirm any email change on both the old, and new email
 # addresses. If disabled, only the new email is required to confirm.
 double_confirm_changes = true

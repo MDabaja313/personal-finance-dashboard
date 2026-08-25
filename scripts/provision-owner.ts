@@ -33,14 +33,24 @@
  * to `psql` with `-v ON_ERROR_STOP=1` preserves the seed's transaction
  * exactly as written and fails loudly on the first error, same as before.
  *
+ * The verification SELECT and the owner-timezone UPDATE go through the same
+ * `docker exec ... psql` mechanism rather than `supabase db query
+ * --output-format json`: that CLI command's output framing (a human
+ * "Connecting to local database..." line, and on some CLI/OS builds extra
+ * trailing output after the JSON document) is not a stable contract to
+ * parse — it broke on a fresh Windows machine with
+ * "SyntaxError: Unexpected non-whitespace character after JSON ...". psql's
+ * own `-t -A` (tuples-only, unaligned) output for a single `row_to_json(t)`
+ * column is unambiguous: exactly one line of JSON, nothing else on stdout.
+ *
  * Credentials: the owner's email/password come from the gitignored
  * .env.local. The local admin key is read from `supabase status` at
  * runtime and held in memory only — never written to a file, never
  * printed. Nothing here touches the hosted project.
  */
 import { execSync, spawn, spawnSync } from "node:child_process";
-import { createReadStream, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { createReadStream, existsSync, readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import { createClient } from "@supabase/supabase-js";
 import { mockCategories } from "@/lib/mock";
@@ -114,50 +124,49 @@ function run(command: string): void {
 }
 
 /**
- * Runs SQL through the local CLI and returns the result rows.
- * The SQL goes via a temp file rather than an argv string so quoting is
- * never at the mercy of the host shell.
+ * Runs `docker exec -i <container> psql ... -c <sql>` — an argv array the
+ * whole way, never a shell string built from `sql` — and returns stdout.
+ * Fails loudly (including stderr, which never carries secrets: no
+ * credential value is ever interpolated into SQL this script runs) on a
+ * nonzero exit.
  */
-function query(sql: string): Record<string, unknown>[] {
-  const dir = mkdtempSync(join(tmpdir(), "pfd-provision-"));
-  const file = join(dir, "query.sql");
-  try {
-    writeFileSync(file, sql, "utf8");
-    const raw = execSync(`npx supabase db query --local --output-format json --file "${file}"`, {
-      cwd: ROOT,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    // The CLI prints a human "Connecting to local database..." line ahead
-    // of the JSON document.
-    const start = raw.indexOf("{");
-    if (start === -1) fail(`Unexpected output from \`supabase db query\`:\n${raw}`);
-    const parsed = JSON.parse(raw.slice(start)) as { rows?: Record<string, unknown>[] };
-    return parsed.rows ?? [];
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
+function execDockerPsql(containerName: string, args: string[]): string {
+  const result = spawnSync(
+    "docker",
+    ["exec", "-i", containerName, "psql", "-U", "postgres", "-d", "postgres", "-v", "ON_ERROR_STOP=1", ...args],
+    { encoding: "utf8" }
+  );
+  if (result.error) {
+    fail(`Could not run \`docker exec ... psql\` (${result.error.message}). Is Docker installed and on PATH?`);
   }
+  if (result.status !== 0) {
+    fail(`\`docker exec ... psql\` exited with code ${result.status}.\n${result.stderr.trim()}`);
+  }
+  return result.stdout;
 }
 
 /**
- * Runs a non-SELECT statement through the local CLI. Separate from
- * query(): `--output-format json` only shapes SELECT output — an
- * UPDATE/INSERT/DELETE prints a plain command tag (e.g. "UPDATE 1")
- * instead, which query()'s JSON parsing would reject.
+ * Runs a read-only SELECT and returns its single result row, decoded from
+ * one deterministic `row_to_json` line — not the Supabase CLI's own output
+ * framing (see the module comment for why that's brittle).
  */
-function execute(sql: string): void {
-  const dir = mkdtempSync(join(tmpdir(), "pfd-provision-"));
-  const file = join(dir, "execute.sql");
+function queryJsonRow(containerName: string, selectSql: string): Record<string, unknown> {
+  const wrapped = `select row_to_json(t) from (${selectSql}) t;`;
+  const stdout = execDockerPsql(containerName, ["-t", "-A", "-c", wrapped]);
+  const line = stdout.trim();
+  if (!line) fail("Verification query returned no output.");
   try {
-    writeFileSync(file, sql, "utf8");
-    execSync(`npx supabase db query --local --file "${file}"`, {
-      cwd: ROOT,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
+    return JSON.parse(line) as Record<string, unknown>;
+  } catch (err) {
+    fail(
+      `Verification query did not return a single JSON line (${err instanceof Error ? err.message : String(err)}):\n${line}`
+    );
   }
+}
+
+/** Runs a single non-SELECT statement (UPDATE/INSERT/DELETE). */
+function executeStatement(containerName: string, sql: string): void {
+  execDockerPsql(containerName, ["-c", sql]);
 }
 
 const problems: string[] = [];
@@ -366,7 +375,8 @@ async function main(): Promise<void> {
   ok("seed applied");
 
   step("Applying the owner timezone");
-  execute(
+  executeStatement(
+    containerName,
     `update public.profiles set timezone = ${sqlLiteral(owner.timezone)} where id = ${sqlLiteral(SEED_USER_ID)};`
   );
 
@@ -378,6 +388,42 @@ async function main(): Promise<void> {
   check(
     listed.data.users[0]?.id === SEED_USER_ID,
     `the one Auth user is the fixed seed UUID ${SEED_USER_ID}`
+  );
+
+  step("Confirming public signup is still rejected (email/password login is enabled, signup is not)");
+  // A raw request straight at the local Auth API's own signup endpoint —
+  // not anything this application exposes — proving the project-level
+  // `[auth] enable_signup = false` still blocks self-service account
+  // creation even though `[auth.email] enable_signup = true` is required
+  // for the owner's own signInWithPassword() to work (see
+  // docs/auth-design.md §1). Uses a throwaway address under the reserved
+  // example.invalid TLD (RFC 2606) so this can never collide with a real
+  // mailbox; the request is expected to be rejected before any user or
+  // identity is created, and that's re-confirmed below via listUsers().
+  const signupProbeResponse = await fetch(`${apiUrl}/auth/v1/signup`, {
+    method: "POST",
+    headers: { "content-type": "application/json", apikey: publishableKey },
+    body: JSON.stringify({
+      email: `pfd-signup-probe-${randomUUID()}@example.invalid`,
+      password: `not-a-real-password-${randomUUID()}`,
+    }),
+  });
+  const signupProbeBody = await signupProbeResponse.text();
+  check(
+    !signupProbeResponse.ok,
+    `public signup request is rejected (saw HTTP ${signupProbeResponse.status})`
+  );
+  check(
+    /sign.?ups?\s+(are\s+)?(not allowed|disabled)/i.test(signupProbeBody),
+    "rejection message indicates signup is disabled for this instance"
+  );
+  const listedAfterSignupProbe = await admin.auth.admin.listUsers();
+  if (listedAfterSignupProbe.error) {
+    fail(`Auth Admin API listUsers failed after the signup probe: ${listedAfterSignupProbe.error.message}`);
+  }
+  check(
+    listedAfterSignupProbe.data.users.length === 1,
+    "the rejected signup attempt created no new user"
   );
 
   const anon = createClient(apiUrl, publishableKey, {
@@ -407,8 +453,7 @@ async function main(): Promise<void> {
       `(select count(*) from public.${table} where ${ownerColumn(table)} <> ${ownerId})::int as foreign_${table}`,
     ]),
   ];
-  const [row] = query(`select\n  ${selects.join(",\n  ")};`);
-  if (!row) fail("verification query returned no rows");
+  const row = queryJsonRow(containerName, `select\n  ${selects.join(",\n  ")}`);
 
   check(num(row, "auth_users_total") === 1, "auth.users holds exactly one row");
   check(num(row, "email_identities") === 1, "auth.identities holds exactly one email identity for the owner");
