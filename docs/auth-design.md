@@ -44,10 +44,19 @@ this document changes that; the swap to real Supabase queries is Phase 6, not do
     (`scripts/seed-identity.ts`'s `SEED_USER_ID`), *before* replaying `supabase/seed.sql` — see §3
     below for why the ordering matters and why a plain `supabase db reset` cannot produce a
     login-capable local owner on its own.
-- **Public signup is disabled at the project level, locally and hosted** — `enable_signup = false`
-  for every provider in `supabase/config.toml` (verified by `lib/auth/posture.test.ts`), and
-  disabled the same way on the hosted project. There is no self-service account creation for this
-  application.
+- **Public signup is disabled at the project level, locally and hosted** — `[auth] enable_signup =
+  false` in `supabase/config.toml`, and disabled the same way on the hosted project. There is no
+  self-service account creation for this application.
+- **This is a different knob from the email/password *provider's* own `enable_signup` setting**,
+  which stays `true` (`[auth.email] enable_signup = true`). The project-level toggle above already
+  blocks every self-service signup path regardless of what any individual provider allows; the
+  email provider's own toggle only controls whether that provider's signup *endpoint* is reachable
+  at all, and `signInWithPassword()` for the one admin-provisioned owner depends on the email
+  provider being enabled — setting `[auth.email] enable_signup = false` disables email/password
+  logins entirely, not just signups. Both are verified by `lib/auth/posture.test.ts`, and
+  `scripts/provision-owner.ts` additionally proves at runtime, on every `auth:reset-local` run,
+  that a raw signup request against the local Auth API is still rejected despite the email
+  provider being enabled.
 - **No signup route or Server Action exists in the application, and there never will be** — the
   `(auth)` route group contains `/login` only; `lib/auth/actions.ts` exports `signIn`/`signOut`
   only. Enforced as a static regression, not just a convention — see

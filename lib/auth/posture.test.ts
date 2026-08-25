@@ -233,15 +233,35 @@ describe("Phase 5 auth posture", () => {
     expect(SECRET_PATTERNS.some((pattern) => pattern.test(envExample))).toBe(false);
   });
 
-  it("public signup is disabled for every auth provider in supabase/config.toml", () => {
+  it("project-level signup is disabled, with email/password enabled only for the pre-provisioned owner", () => {
+    // supabase/config.toml has two distinct `enable_signup` knobs that are
+    // easy to conflate: the project-level [auth] one gates self-service
+    // signup entirely (must stay false — there is no signup route, ever),
+    // while [auth.email] enable_signup gates the email/password *provider*
+    // itself, which must stay true or the one admin-provisioned owner can
+    // never call signInWithPassword() — see docs/auth-design.md §1.
     const config = readFileSync(join(ROOT, "supabase", "config.toml"), "utf8");
-    const enableSignupLines = config
-      .split(/\r?\n/)
-      .filter((line) => /^\s*enable_signup\s*=/.test(line));
 
-    expect(enableSignupLines.length).toBeGreaterThan(0);
-    for (const line of enableSignupLines) {
-      expect(line.trim()).toBe("enable_signup = false");
+    let section = "";
+    const enableSignupBySection: Record<string, string> = {};
+    for (const rawLine of config.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      const sectionMatch = /^\[([^\]]+)\]$/.exec(line);
+      if (sectionMatch) {
+        section = sectionMatch[1];
+        continue;
+      }
+      const kv = /^enable_signup\s*=\s*(true|false)\s*$/.exec(line);
+      if (kv) enableSignupBySection[section] = kv[1];
     }
+
+    // No other section should introduce its own enable_signup toggle without
+    // this test being updated to judge it explicitly.
+    expect(Object.keys(enableSignupBySection).sort()).toEqual(["auth", "auth.email", "auth.sms"]);
+
+    expect(enableSignupBySection["auth"]).toBe("false");
+    expect(enableSignupBySection["auth.email"]).toBe("true");
+    // SMS is an unused provider here — its signup toggle stays disabled.
+    expect(enableSignupBySection["auth.sms"]).toBe("false");
   });
 });

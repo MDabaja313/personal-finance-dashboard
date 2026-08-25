@@ -119,6 +119,12 @@ things:
 **If you need to log in after an ordinary `npm run db:reset`, rerun `npm run auth:reset-local`** —
 `db:reset` alone leaves the database without a usable owner.
 
+`supabase/config.toml` has two different `enable_signup` settings — don't confuse them: the
+project-level `[auth] enable_signup` stays `false` (no self-service signup, ever), while
+`[auth.email] enable_signup` stays `true` — that one gates the email/password *provider* itself,
+and setting it to `false` breaks `signInWithPassword()` for the owner with "Email logins are
+disabled." See [docs/auth-design.md §1](docs/auth-design.md#1-provider-and-provisioning-model).
+
 Once `auth:reset-local` has run, verify the flow actually works end to end against a running dev
 server:
 
