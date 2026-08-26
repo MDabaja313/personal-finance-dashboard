@@ -17,7 +17,7 @@
  * are plain data, not ids, and pass through untouched.
  */
 import { uuidFor } from "@/scripts/seed-identity";
-import type { Account, Budget, Category, Goal } from "@/lib/types";
+import type { Account, Bill, Budget, Category, Goal, Transaction } from "@/lib/types";
 
 export function translateAccount(account: Account): Account {
   return { ...account, id: uuidFor(account.id) };
@@ -33,4 +33,31 @@ export function translateBudget(budget: Budget): Budget {
 
 export function translateGoal(goal: Goal): Goal {
   return { ...goal, id: uuidFor(goal.id) };
+}
+
+/**
+ * Every id on a `Transaction`: its own, plus the account, category and
+ * movement it points at. `categoryId`/`movementId` are legitimately absent
+ * (an uncategorized ordinary row; any non-movement row) and must stay absent
+ * — translating `undefined` through `uuidFor` would fabricate the UUID of the
+ * string "undefined".
+ */
+export function translateTransaction(transaction: Transaction): Transaction {
+  return {
+    ...transaction,
+    id: uuidFor(transaction.id),
+    accountId: uuidFor(transaction.accountId),
+    ...(transaction.categoryId === undefined ? {} : { categoryId: uuidFor(transaction.categoryId) }),
+    ...(transaction.movementId === undefined ? {} : { movementId: uuidFor(transaction.movementId) }),
+  };
+}
+
+/** Same rule for a `Bill`'s optional `categoryId`/`accountId`. */
+export function translateBill(bill: Bill): Bill {
+  return {
+    ...bill,
+    id: uuidFor(bill.id),
+    ...(bill.categoryId === undefined ? {} : { categoryId: uuidFor(bill.categoryId) }),
+    ...(bill.accountId === undefined ? {} : { accountId: uuidFor(bill.accountId) }),
+  };
 }
