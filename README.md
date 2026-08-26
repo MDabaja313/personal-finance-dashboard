@@ -3,11 +3,14 @@
 A private, single-user personal finance dashboard — accounts, transactions, budgets, bills,
 goals, and analytics.
 
-**Status:** mock-backed (Phase 5 complete). The Supabase database schema, RLS, migrations, and
-authentication are provisioned and verified both locally and hosted — login, logout, and route
-protection all work end to end — but every page still reads deterministic fixture data through a
-data-access layer shaped like the eventual database queries; the Phase 6 DAL swap to real Supabase
-queries is next. See [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md) for the full roadmap.
+**Status:** Supabase-backed (Phase 6 complete). The database schema, RLS, migrations,
+authentication, and the full read-side data-access layer are provisioned and verified both locally
+and hosted — login, logout, route protection, and every page's data all run against real Supabase
+queries end to end. `getToday()` derives "today" from the signed-in owner's own timezone
+(`profiles.timezone`), so seeded data ages naturally against the real date rather than a frozen
+mock clock. Phase 7 (mutations — Server Actions, writes, per-mutation RLS) is next; there is still
+no persistence path in the application. See [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md) for the
+full roadmap.
 
 ## Stack
 
@@ -38,12 +41,29 @@ only when you're intentionally changing dependency resolution.
 | `npm run start` | Run the production build |
 | `npm run lint` | ESLint |
 | `npm run typecheck` | `tsc --noEmit` |
-| `npm test` | Run the Vitest suite once |
+| `npm test` | Run the Vitest suite once — fully **offline**, no local Supabase required |
 | `npm run test:watch` | Vitest in watch mode |
+| `npm run test:parity` | Prove every Supabase-backed `lib/data/**` function agrees with the fixture oracle — **requires local Supabase running and a provisioned owner** (see below) |
 | `npm run auth:reset-local` | Rebuild the local database around one real, login-capable owner (see [Local auth setup](#local-auth-setup)) |
 | `npm run auth:verify` | Runtime-verify the auth flow against a running `npm run dev` (see [Local auth setup](#local-auth-setup)) |
 | `npm run db:reset` | `supabase db reset` — schema + fixture seed, **not** login-capable on its own |
-| `npm run db:test` | Run the pgTAP database test suite |
+| `npm run db:test` | Run the pgTAP database test suite. This resets the local database — rerun `npm run auth:reset-local` afterward if you need to sign in again |
+
+### `npm test` vs. `npm run test:parity`
+
+`npm test` is offline: it exercises `lib/finance/**`, fixture coherence, `lib/auth/**` unit and
+static posture tests, and `lib/data/**` unit tests, with `lib/data/supabase.ts` mocked — no network
+call, no database, runs anywhere including CI with no secrets. `npm run test:parity` is the
+opposite: it drives the real Supabase-backed `lib/data/**` functions against a running local
+Supabase instance and checks their output against `lib/mock/dal.ts`, the fixture oracle. Run
+`supabase start` and `npm run auth:reset-local` first, or `test:parity` fails to connect / finds no
+owner to authenticate as.
+
+`getToday()` (and everything downstream of "today" — dashboard totals, budget periods, overdue
+bills) reads the signed-in owner's `profiles.timezone`, not the server clock or a frozen mock date.
+Locally seeded fixture data therefore ages naturally against the real date: a transaction dated
+relative to when the seed was generated can silently roll out of "this month" as time passes. That
+is expected — every page already has an empty state for it — not a bug to chase.
 
 ## Project structure
 
@@ -52,9 +72,9 @@ app/(app)/**      Routes protected by app/(app)/layout.tsx's requireUser() guard
 app/(auth)/**     Public routes — /login only, no signup
 components/**     UI. components/ui/** is shadcn-generated; don't hand-edit it
 lib/auth/**       App-facing identity facade + signIn/signOut Server Actions
-lib/data/**       The data-access layer — the only code that queries the database (fixtures today)
+lib/data/**       The data-access layer — queries Supabase for every production read
 lib/finance/**    Pure financial calculations — no DB, no fixtures, no React, no clock access
-lib/mock/**       Fixture data, read only by lib/data/**
+lib/mock/**       Fixture data — the test:parity oracle only, not read by production code
 lib/supabase/**   The only layer that reads Supabase env vars or constructs a Supabase client
 lib/format/**     Display formatting — the only place floats appear
 lib/types/**      Shared DTOs, including the branded Cents money type
@@ -63,11 +83,13 @@ docs/**           Database schema, RLS policy, and auth design
 
 Key boundaries, enforced by `eslint.config.mjs`: `app/**` routes may call `lib/data/**`, but
 `components/**` may not — it never imports `lib/data/**` or `lib/mock/**` directly, only the
-props a route passes down. `lib/mock/**` is read only through `lib/data/**`, which is the sole
-layer that queries fixtures today and the database later. `lib/finance/**` stays pure — no data
-layer, no database, no React, no clock access. `lib/supabase/**` is reachable only from
-`lib/auth/**` and the root `proxy.ts` — neither `app/**` nor `components/**` may import it
-directly (`lib/auth/**` and the auth Server Actions are the sanctioned crossing point).
+props a route passes down. `lib/mock/**` is imported only from test files (the `test:parity`
+oracle); no production code reads it. `lib/finance/**` stays pure — no data layer, no database, no
+React, no clock access. `lib/supabase/**` is reachable only from `lib/data/supabase.ts` (the one
+DAL seam permitted to import it), `lib/auth/**`, and the root `proxy.ts` — neither `app/**` nor
+`components/**` may import it directly, and no other `lib/data/**` module may either (`lib/auth/**`
+and the auth Server Actions are the sanctioned crossing point for identity; `lib/data/supabase.ts`
+is the sanctioned crossing point for data).
 
 ## Financial invariants (high level)
 

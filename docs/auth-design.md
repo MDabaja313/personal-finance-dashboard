@@ -8,8 +8,14 @@ while the code under `lib/auth/**`/`lib/supabase/**` is the authoritative *execu
 [DEVELOPMENT_PLAN.md §Phase 5](../DEVELOPMENT_PLAN.md#phase-5--authentication--complete) for the
 verified completion facts (checkpoints, tests, runtime-verified behaviors). See
 [docs/rls-policies.md](rls-policies.md) for the object-privilege/RLS layer this design sits above.
-**The finance DAL (`lib/data/**`) remains mock-fixture-backed through all of Phase 5** — nothing in
-this document changes that; the swap to real Supabase queries is Phase 6, not done yet.
+**The finance DAL (`lib/data/**`) is now Supabase-backed — Phase 6 is complete.** Nothing in this
+document changed to make that true: every `lib/data/**` read obtains identity through
+`lib/data/supabase.ts`'s `getOwnerId()`, which calls `getClaims()` directly — the same
+verified-identity rule this document describes for `lib/auth/session.ts` (§5), never
+`getSession()`, and unconditionally, before any query, regardless of whether
+`app/(app)/layout.tsx`'s navigation-level guard already ran. See
+[DEVELOPMENT_PLAN.md §Phase 6](../DEVELOPMENT_PLAN.md#phase-6--dal-swap) and
+[docs/database-schema.md §16](database-schema.md#16-dal-function-mapping) for what shipped.
 
 ## Contents
 

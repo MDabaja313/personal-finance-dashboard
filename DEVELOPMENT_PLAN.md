@@ -329,21 +329,103 @@ owner at the exact same deterministic UUID (`scripts/seed-identity.ts`'s `SEED_U
 real authenticated session and real seeded data addressing the same user from day one, with no
 separate reconciliation step.
 
-## Phase 6 — DAL swap
+## Phase 6 — DAL swap ✅ complete
 
-Not yet started. `lib/data/**` function bodies swap from fixtures to Supabase queries; existing
-signatures, `lib/finance/**`, and all components are unchanged. Real `getToday()` reading
-`profiles.timezone`.
+All ten production `lib/data/**` read functions swapped from fixtures to Supabase queries with
+unchanged signatures: `getAccounts`, `getCategories`, `getTransactions`, `getRecentTransactions`,
+`getBudgets`, `getBills`, `getUpcomingBills`, `getGoals`, `getNetWorthHistory`, `getToday`.
+`lib/finance/**` and every component are untouched — only `lib/data/**` bodies and one new file,
+`lib/data/supabase.ts`, changed. `lib/mock/dal.ts` is retained as the `npm run test:parity` oracle
+only; no production code imports it.
 
-**Prerequisite carried forward from Phase 3:** `/transactions` is a full-history browser with no
-pagination or windowing. Before the Supabase-backed `/transactions` route is considered
-production-ready for a large transaction history, this phase must design and build bounded/paginated
-browsing for it — the unbounded `getTransactions()` call that page still makes fetches the user's
-entire transaction history on every load, unlike every other route, which was bounded in Phase 3.
+### Architecture
+
+- `lib/data/supabase.ts` is the **one** DAL seam allowed to import `lib/supabase/**` — enforced by
+  both `eslint.config.mjs` (`no-restricted-imports` over `lib/data/**`, exempting exactly this
+  file) and the static allowlist in `lib/auth/posture.test.ts`. It exposes `getDataClient()` (one
+  Supabase client per request, `React.cache`-scoped) and `getOwnerId()`.
+- **Every Supabase-backed read calls `getOwnerId()` — verified via `getClaims()`, never
+  `getSession()` — before issuing its query, unconditionally.** This does not depend on
+  `app/(app)/layout.tsx`'s navigation guard having run first: a Server Action is an independently
+  reachable endpoint that never renders a layout, and React may run layout and page work
+  concurrently. Each read also carries an explicit `user_id`/`owner_id` predicate on top of RLS —
+  defense in depth, not a substitute for it. Authenticated RLS (Phase 4) remains the enforced
+  floor regardless of any DAL-level filter bug.
+- `getAccounts()`/`getGoals()` read the `account_balances`/`goal_balances` `security_invoker`
+  views (derived balances, never a stored scalar).
+- `getBills()` is a two-query projection — active `bills`, then their `scheduled`
+  `bill_occurrences` — reduced to one occurrence per bill in TypeScript, because PostgREST's
+  embedded-resource `order`/`limit` applies to the flattened join rather than per parent row, so it
+  cannot express "the first occurrence of each bill."
+- `getTransactions()` orders `date DESC, created_at DESC, id ASC` (docs/database-schema.md §17)
+  and is never called unbounded from the UI: `/transactions` reads a **bounded, cumulative
+  "Load more" reveal window** — each press increases a `revealed` count by `PAGE_SIZE` (25); the
+  page re-reads `offset: 0, limit: revealed + 1` (the `+1` a has-more probe row, never rendered) as
+  one contiguous read of one ordering, split into consecutive `MAX_TRANSACTION_LIMIT`-sized DAL
+  queries so no single query is unbounded. There is no reveal-depth ceiling, only a ceiling on any
+  one underlying query's size. Changing a filter resets `page` client-side, so a new filter always
+  starts from the first window. This closes the Phase 3 deferred risk below.
+- `getNetWorthHistory()` queries `ORDER BY month DESC` + `LIMIT n` (only for `months > 0`) and
+  reverses the result in TypeScript for chronological (ASC) display — `months === 0` returns full
+  history, matching the fixture oracle's `slice(-0)` behavior.
+- `getToday()` derives the calendar date from the verified owner's `profiles.timezone` via the real
+  clock (`lib/data/clock.ts`, `calendarDateInTimeZone`) — **no dev-only `MOCK_TODAY` branch in
+  production.** Seeded fixture data ages out of "this month" as real time advances; every page
+  already has an empty state for that, and a clock that behaves differently in dev would be a
+  clock nothing could be verified against.
+- `public.movements` was not needed by any Phase 6 read — `Transaction.movementId` is a plain
+  FK-backed column on `transactions` itself, so its Phase 4 posture (no `authenticated` grant, no
+  RLS policy) is unchanged. A transfer/credit-card-payment pair's two legs remain independently
+  visible through the ordinary `getTransactions()` path, scoped by each leg's own `account_id`.
+- Every BIGINT cents value crossing the DB→TS boundary passes through `toCents()`
+  (`Number.isSafeInteger` guard) — reject invalid data, never silently coerce it.
+
+### Deferred, not a Phase 6 blocker
+
+- **`merchant` search has no `pg_trgm` index.** `TransactionFilters.search` runs as
+  `ILIKE '%…%'` with escaped wildcards (`lib/data/transactions.ts`, `lib/data/filters.ts`),
+  verified correct against the single-owner seeded dataset. Recorded as a **future performance
+  optimization** — add `pg_trgm` + a GIN index only if search latency actually becomes a problem
+  at realistic per-owner row counts; no migration for it shipped in Phase 6.
+- **Wildcard-escaping test coverage is asymmetric, deliberately.** `escapeLikePattern` is unit
+  tested offline (`lib/data/filters.test.ts`) for every escaping rule, and the parity suite
+  DB-proves the *negative* case — a literal `%`/`_`/`*` in a search term does not widen the match
+  to unrelated merchants. The *positive* case — searching for a literal `%`, `_`, or `*` that
+  actually appears in a merchant name — is not proven end-to-end against a live query, because the
+  seed data contains no such merchant. Deliberately not fixed by contaminating seed data solely to
+  close this test gap.
+
+### Testing
+
+- 264/264 Vitest tests pass offline (`npm test`), unchanged in kind from earlier phases but now
+  covering `lib/data/**` unit tests too.
+- 74/74 parity tests pass (`npm run test:parity`) — every Supabase-backed `lib/data/**` function
+  checked against the `lib/mock/dal.ts` fixture oracle, against a real local Supabase instance.
+- 242/242 pgTAP assertions pass (`npm run db:test`) — unchanged from Phase 4, since no migration
+  shipped in Phase 6.
+- `lint`, `npx next typegen`, `typecheck`, and `build` all pass.
+- `npm run auth:verify` passes against a running dev server.
+- Manually verified at runtime, authenticated: all 8 routes (`/dashboard`, `/accounts`,
+  `/transactions`, `/budgets`, `/bills`, `/goals`, `/analytics`, `/settings`) render without an
+  error boundary; `/transactions`' initial read and each "Load more" press stay bounded and
+  cumulative; a filter change resets the reveal window; account/goal derived balances render with
+  no `NaN`; transfer and credit-card-payment legs remain visible in transaction history; signing
+  out re-protects every route.
+
+### Prerequisite carried forward from Phase 3 — resolved
+
+`/transactions` was a full-history browser with no pagination or windowing. The bounded,
+cumulative "Load more" reveal window described above resolves this — no route makes an unbounded
+`getTransactions()` call.
 
 ## Phase 7 — Mutations
 
-Not yet started. Server Actions and forms, re-verifying auth and row ownership inside the DAL
-(Server Actions are independently reachable endpoints). Narrowly-scoped write RLS policies and
-object grants added per mutation as it's built. Zod introduced at this untrusted-input boundary.
-`BillOccurrence` DTO and mark-as-paid UI. Goal-contribution INSERT UI.
+Not yet started. Server Actions and forms, re-verifying auth and row ownership inside the DAL —
+Server Actions are independently reachable endpoints, so the same unconditional `getOwnerId()`
+pattern Phase 6 established for reads applies to every write. Narrowly-scoped write RLS policies
+and object grants added per mutation as it's built (§3/§4 of `docs/rls-policies.md` already record
+the intended eventual policy matrix). Zod introduced at this untrusted-input boundary. Scope
+includes accounts, categories, transactions, transfers/credit-card payments, budgets, bills/
+occurrences (including the `BillOccurrence` DTO and mark-as-paid UI), goals/contributions
+(goal-contribution INSERT UI, respecting the append-only model), and reconciliation/adjustments
+where designed. Detailed design is deferred to when Phase 7 actually starts, not settled here.
