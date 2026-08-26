@@ -19,6 +19,10 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["tests/parity/**/*.test.ts"],
+    // One password sign-in per run, in the Vitest main process; the resulting
+    // access token reaches each test file through `inject("parityAuth")`. See
+    // tests/parity/support/global-setup.ts.
+    globalSetup: ["tests/parity/support/global-setup.ts"],
     // Real network calls (sign-in, PostgREST) against a local Supabase stack
     // are slower than the offline unit suite's defaults.
     testTimeout: 30_000,

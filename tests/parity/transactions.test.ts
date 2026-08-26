@@ -3,6 +3,7 @@ import { beforeAll, describe, expect, it, vi } from "vitest";
 import { createParityContext } from "./support/context";
 import { translateTransaction } from "./support/id-translation";
 import { uuidFor } from "@/scripts/seed-identity";
+import { MAX_TRANSACTION_LIMIT, planFetchWindows } from "@/lib/data/filters";
 import type { Transaction } from "@/lib/types";
 
 const mocks = vi.hoisted(() => ({ client: undefined as unknown, ownerId: undefined as unknown as string }));
@@ -300,6 +301,201 @@ describe("getTransactions parity — search", () => {
     for (const search of ["a,b", "(a)", 'a"b', "a.b", "a:b", "&", "Electric & Water"]) {
       await expectParity({ search });
     }
+  });
+});
+
+/**
+ * ## Pagination parity
+ *
+ * The oracle has no pagination of its own, and giving it one would just be a
+ * second implementation to keep in sync. Instead the expectation is built the
+ * way the DAL must behave: **filter and order first, translate ids into the DB
+ * domain, then slice**. If the DAL applied `.range()` before its ordering
+ * chain — or paginated a differently-ordered set — every window past the first
+ * row would disagree with that slice.
+ */
+describe("getTransactions parity — pagination", () => {
+  /** The oracle's answer for `filters`, translated, then windowed. */
+  async function expectedWindow(
+    filters: TransactionFilters,
+    offset: number,
+    limit: number
+  ): Promise<Transaction[]> {
+    return (await expected(filters)).slice(offset, offset + limit);
+  }
+
+  async function expectWindow(
+    filters: TransactionFilters,
+    offset: number,
+    limit: number
+  ): Promise<Transaction[]> {
+    const rows = await getTransactions({ ...translateFilters(filters), offset, limit });
+    expect(rows).toEqual(await expectedWindow(filters, offset, limit));
+    return rows;
+  }
+
+  it("limit = 1 returns exactly the first row of the full ordering", async () => {
+    const rows = await expectWindow({}, 0, 1);
+    expect(rows.map((r) => r.id)).toEqual([uuidFor("txn-104")]);
+  });
+
+  it("a representative page size, at offset 0", async () => {
+    const rows = await expectWindow({}, 0, 25);
+    expect(rows).toHaveLength(25);
+    expect(rows).toEqual((await getTransactions()).slice(0, 25));
+  });
+
+  it("offset > 0 returns the corresponding interior window", async () => {
+    for (const [offset, limit] of [
+      [1, 1],
+      [25, 25],
+      [50, 25],
+      [10, 7],
+      [103, 5],
+    ] as const) {
+      await expectWindow({}, offset, limit);
+    }
+  });
+
+  it("consecutive windows tile the full list exactly — no gaps, no duplicates", async () => {
+    const all = await getTransactions();
+    const tiled: Transaction[] = [];
+    for (let offset = 0; offset < all.length; offset += 25) {
+      tiled.push(...(await getTransactions({ offset, limit: 25 })));
+    }
+    expect(tiled).toEqual(all);
+    expect(new Set(tiled.map((r) => r.id)).size).toBe(all.length);
+  });
+
+  it("a cumulative reveal is a strict superset of the previous one — the /transactions model", async () => {
+    // What the page actually issues: offset 0, a growing limit.
+    const first = await getTransactions({ offset: 0, limit: 25 });
+    const second = await getTransactions({ offset: 0, limit: 50 });
+    const third = await getTransactions({ offset: 0, limit: 75 });
+
+    expect(second.slice(0, 25)).toEqual(first);
+    expect(third.slice(0, 50)).toEqual(second);
+    expect(third).toEqual((await getTransactions()).slice(0, 75));
+  });
+
+  it("a window past the end returns the remainder, then nothing — never an error", async () => {
+    expect(await expectWindow({}, 100, 25)).toHaveLength(4);
+    expect(await expectWindow({}, 104, 25)).toEqual([]);
+    expect(await expectWindow({}, 500, 25)).toEqual([]);
+  });
+
+  it("paginates the filtered result, not the unfiltered one", async () => {
+    for (const filters of [
+      { month: "2026-08" },
+      { kind: "expense" },
+      { accountId: "acc-credit" },
+      { search: "whole" },
+      { month: "2026-08", kind: "expense" },
+    ] as TransactionFilters[]) {
+      const full = await expectParity(filters);
+      expect(full.length).toBeGreaterThan(1);
+
+      await expectWindow(filters, 0, 1);
+      await expectWindow(filters, 1, 2);
+      await expectWindow(filters, 0, full.length);
+    }
+  });
+
+  it("preserves date DESC / created_at DESC / id ASC inside a window that splits a same-day group", async () => {
+    // The 2026-08-18 group is three rows; slicing it must not reorder it.
+    const filters: TransactionFilters = { from: "2026-08-16", to: "2026-08-19" };
+    expect((await expectWindow(filters, 1, 2)).map((r) => r.id)).toEqual(
+      [uuidFor("txn-103"), uuidFor("txn-102")]
+    );
+    expect((await expectWindow(filters, 3, 2)).map((r) => r.id)).toEqual(
+      [uuidFor("txn-101"), uuidFor("txn-100")]
+    );
+  });
+
+  it("an empty date intersection stays [] under pagination", async () => {
+    await expect(
+      getTransactions({ month: "2026-08", to: "2026-01-01", offset: 0, limit: 25 })
+    ).resolves.toEqual([]);
+  });
+
+  it("omitting limit and offset preserves the full-query contract", async () => {
+    expect(await getTransactions({ offset: 0 })).toHaveLength(104);
+    expect(await getTransactions({})).toHaveLength(104);
+  });
+
+  it("rejects a negative offset instead of coercing it", async () => {
+    for (const offset of [-1, -25, 2.5, NaN]) {
+      await expect(getTransactions({ offset, limit: 25 })).rejects.toMatchObject({
+        code: "data_integrity",
+      });
+    }
+  });
+
+  it("rejects a zero, negative, or fractional limit instead of coercing it", async () => {
+    for (const limit of [0, -1, 2.5, NaN]) {
+      await expect(getTransactions({ limit })).rejects.toMatchObject({ code: "data_integrity" });
+    }
+  });
+
+  it("rejects a limit above MAX_TRANSACTION_LIMIT", async () => {
+    await expect(getTransactions({ limit: MAX_TRANSACTION_LIMIT })).resolves.toHaveLength(104);
+    await expect(getTransactions({ limit: MAX_TRANSACTION_LIMIT + 1 })).rejects.toMatchObject({
+      code: "data_integrity",
+    });
+  });
+
+  it("rejects an offset with no limit rather than reading an unbounded tail", async () => {
+    await expect(getTransactions({ offset: 25 })).rejects.toMatchObject({
+      code: "data_integrity",
+    });
+  });
+
+  it("multi-window concatenation equals the single-query answer, against real boundaries", async () => {
+    // `/transactions` reads a deep prefix as consecutive
+    // `MAX_TRANSACTION_LIMIT`-sized queries. The seed has 104 rows, so the
+    // real 500-row boundary is unreachable here — the planner is driven with a
+    // small window instead, which exercises the identical concatenation logic
+    // over many more real boundaries than a 500-row split ever would.
+    for (const [need, windowSize] of [
+      [104, 10],
+      [104, 7],
+      [50, 25],
+      [26, 25],
+      [1, 25],
+      [104, 1],
+    ] as const) {
+      const stitched: Transaction[] = [];
+      for (const window of planFetchWindows(need, windowSize)) {
+        const batch = await getTransactions({ offset: window.offset, limit: window.limit });
+        stitched.push(...batch);
+        if (batch.length < window.limit) break;
+      }
+
+      const single = (await getTransactions()).slice(0, need);
+      expect(stitched).toEqual(single);
+      expect(new Set(stitched.map((r) => r.id)).size).toBe(stitched.length);
+    }
+  });
+
+  it("multi-window concatenation holds under a filter too", async () => {
+    const filters: TransactionFilters = { month: "2026-08" };
+    const full = await getTransactions(translateFilters(filters));
+
+    const stitched: Transaction[] = [];
+    for (const window of planFetchWindows(full.length, 4)) {
+      stitched.push(
+        ...(await getTransactions({ ...translateFilters(filters), ...window }))
+      );
+    }
+
+    expect(stitched).toEqual(full);
+    expect(stitched).toEqual(await expected(filters));
+  });
+
+  it("validates before querying — an invalid window fails even for an empty date range", async () => {
+    await expect(
+      getTransactions({ month: "2026-08", to: "2026-01-01", limit: 0 })
+    ).rejects.toMatchObject({ code: "data_integrity" });
   });
 });
 

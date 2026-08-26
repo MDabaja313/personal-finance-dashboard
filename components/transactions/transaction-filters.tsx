@@ -40,6 +40,19 @@ export function TransactionFilters({ months, accounts, categories }: Transaction
   const [searchValue, setSearchValue] = useState(searchParams.get("search") ?? "");
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  /**
+   * The single funnel every filter control goes through — which is what makes
+   * the pagination reset below unmissable rather than something each control
+   * has to remember.
+   *
+   * Changing a filter changes *which* rows exist, so a reveal depth measured
+   * against the previous filter set is meaningless: keeping `page=4` would
+   * either over-fetch a now-short list or, worse, present a arbitrarily deep
+   * slice of a different result as if the user had asked for it. Dropping the
+   * param (rather than setting `page=1`) also keeps the common URL clean and
+   * identical to the pre-pagination one, so existing shareable/bookmarkable
+   * filter URLs are unchanged.
+   */
   function setParam(key: string, value: string) {
     const params = new URLSearchParams(searchParams.toString());
     if (!value || value === ALL) {
@@ -47,6 +60,7 @@ export function TransactionFilters({ months, accounts, categories }: Transaction
     } else {
       params.set(key, value);
     }
+    params.delete("page");
     router.push(`/transactions?${params.toString()}`);
   }
 

@@ -1,112 +1,93 @@
 /**
- * Parity-suite bootstrap: signs in a real Supabase Auth user with plain
- * `@supabase/supabase-js` — no `next/headers`, no cookie plumbing, since
- * `npm run test:parity` runs outside any Next.js request scope.
+ * Parity-suite bootstrap: builds an authenticated Supabase client for one test
+ * file from the session material `global-setup.ts` established **once** for
+ * the whole run.
  *
- * This is deliberately the *only* thing the parity suite fakes. Every parity
- * test mocks exactly `lib/data/supabase.ts` (the single seam `lib/data/**`
- * uses to reach the database) and injects the client + owner id this module
- * produces, so every mapper, query builder, ordering chain, and error path
- * under test in the production DAL stays real.
+ * This module used to call `signInWithPassword` itself, once per test file
+ * (Vitest isolates module state per file, so the cache below never spanned
+ * more than one). It now performs no authentication round-trip at all: the
+ * single sign-in happens in the Vitest main process, and each file receives
+ * the resulting access token through `inject()`.
  *
- * Fails loudly — never silently skips — when local Supabase isn't running or
- * the local owner can't sign in: a parity run that quietly no-ops would be
- * worse than no parity run at all.
+ * The client is constructed with that token as an explicit `Authorization`
+ * header rather than a restored session, which is what makes this free: no
+ * token exchange, no refresh, no `/auth/v1/user` call. Every PostgREST request
+ * still carries an ordinary `authenticated` user JWT, so RLS applies exactly
+ * as in production — and `verify()` below proves that per file rather than
+ * assuming it, so a mis-wired header fails loudly instead of quietly reading
+ * as `anon` (which would surface as empty results, not an error).
+ *
+ * This is deliberately still the *only* thing the parity suite fakes. Every
+ * parity test mocks exactly `lib/data/supabase.ts` — the single seam
+ * `lib/data/**` uses to reach the database — and injects the client + owner id
+ * this module produces, so every mapper, query builder, ordering chain, and
+ * error path under test in the production DAL stays real.
+ *
+ * Fails loudly — never silently skips — when anything is wrong: a parity run
+ * that quietly no-ops would be worse than no parity run at all.
  */
-import { existsSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
-
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
-
-const ROOT = resolve(import.meta.dirname, "..", "..", "..");
-const ENV_PATH = join(ROOT, ".env.local");
-
-const REQUIRED_ENV = [
-  "NEXT_PUBLIC_SUPABASE_URL",
-  "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY",
-  "LOCAL_OWNER_EMAIL",
-  "LOCAL_OWNER_PASSWORD",
-] as const;
+import { inject } from "vitest";
 
 export interface ParityContext {
   client: SupabaseClient;
   ownerId: string;
+  /** `profiles.timezone` as stored, read once by `global-setup.ts`. */
+  ownerTimezone: string;
 }
 
 class ParitySetupError extends Error {}
 
-/** Mirrors scripts/verify-auth.ts's .env.local loader. */
-function loadEnvFile(path: string): void {
-  for (const rawLine of readFileSync(path, "utf8").split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#")) continue;
-    const eq = line.indexOf("=");
-    if (eq === -1) continue;
-    const key = line.slice(0, eq).trim();
-    let value = line.slice(eq + 1).trim();
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
-    }
-    if (value !== "") process.env[key] = value;
-  }
-}
-
 let cached: Promise<ParityContext> | undefined;
 
 /**
- * Signs in with the local-only owner credentials and returns an
- * authenticated client plus the verified owner id (from `getClaims()`, never
- * `getSession()` — same authorization rule as `lib/data/supabase.ts`).
+ * The authenticated client + verified owner id for this test file.
  *
  * Cached per test-file module instance so multiple `describe` blocks in one
- * parity test file share a single sign-in.
+ * file share a single client and a single verification read.
  */
 export function createParityContext(): Promise<ParityContext> {
-  if (!cached) cached = signIn();
+  if (!cached) cached = build();
   return cached;
 }
 
-async function signIn(): Promise<ParityContext> {
-  if (existsSync(ENV_PATH)) loadEnvFile(ENV_PATH);
+async function build(): Promise<ParityContext> {
+  const auth = inject("parityAuth");
 
-  const missing = REQUIRED_ENV.filter((name) => !process.env[name]);
-  if (missing.length > 0) {
+  const client = createClient(auth.url, auth.publishableKey, {
+    // No session to persist and nothing to refresh: the run is far shorter
+    // than the token's lifetime, and an autorefresh timer would keep the
+    // worker's event loop alive after the last test.
+    auth: { persistSession: false, autoRefreshToken: false },
+    global: { headers: { Authorization: `Bearer ${auth.accessToken}` } },
+  });
+
+  await verify(client, auth.ownerId);
+
+  return { client, ownerId: auth.ownerId, ownerTimezone: auth.ownerTimezone };
+}
+
+/**
+ * Proves the client really is acting as the owner before any test runs.
+ *
+ * Without this, a client that silently fell back to the publishable key would
+ * still "work" — RLS would just filter everything to zero rows, and the parity
+ * failures would read as data problems rather than as an auth misconfiguration.
+ */
+async function verify(client: SupabaseClient, ownerId: string): Promise<void> {
+  const { data, error } = await client.from("profiles").select("id").eq("id", ownerId);
+
+  if (error) {
     throw new ParitySetupError(
-      `test:parity requires ${missing.join(", ")} to be set (.env.local or the environment). ` +
-        "Run `npm run auth:reset-local` first, and ensure a local Supabase stack is running."
+      "test:parity could not read the owner profile with the injected session. Is the local " +
+        "Supabase stack still running, and has `npm run auth:reset-local` been run?",
+      { cause: error }
     );
   }
-
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-  const publishableKey = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY!;
-  const email = process.env.LOCAL_OWNER_EMAIL!;
-  const password = process.env.LOCAL_OWNER_PASSWORD!;
-
-  const client = createClient(url, publishableKey);
-
-  const { error: signInError } = await client.auth.signInWithPassword({ email, password });
-  if (signInError) {
+  if (data.length !== 1) {
     throw new ParitySetupError(
-      "test:parity could not sign in the local owner. Is the local Supabase stack running " +
-        "(`supabase start`) and has `npm run auth:reset-local` been run?",
-      { cause: signInError }
+      "test:parity is not authenticated as the owner — the owner profile was not visible. " +
+        "The injected access token is not being applied to PostgREST requests."
     );
   }
-
-  const { data, error: claimsError } = await client.auth.getClaims();
-  if (claimsError || !data) {
-    throw new ParitySetupError("test:parity signed in but could not verify claims.", {
-      cause: claimsError,
-    });
-  }
-
-  const sub = data.claims.sub;
-  if (typeof sub !== "string" || sub === "") {
-    throw new ParitySetupError("test:parity received claims with no valid `sub`.");
-  }
-
-  return { client, ownerId: sub };
 }

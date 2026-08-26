@@ -6,6 +6,7 @@ import {
   containsPattern,
   effectiveDateBounds,
   isEmptyRange,
+  resolvePageRange,
 } from "@/lib/data/filters";
 import { toTransaction } from "@/lib/data/mappers";
 import type { TransactionRow } from "@/lib/data/rows";
@@ -24,6 +25,18 @@ export interface TransactionFilters {
   kind?: TransactionKind;
   /** Matches against merchant name, case-insensitive substring. */
   search?: string;
+  /**
+   * Bounded window size — a real `LIMIT`/`OFFSET` on the server, not a slice
+   * of a materialized list. Additive: omitting it (and `offset`) preserves the
+   * full-query contract exactly. Must be a positive safe integer no greater
+   * than `MAX_TRANSACTION_LIMIT`; anything else is `data_integrity`.
+   */
+  limit?: number;
+  /**
+   * Zero-based row offset within the ordered result. Defaults to 0, and is
+   * only meaningful alongside `limit` (see `resolvePageRange`).
+   */
+  offset?: number;
 }
 
 /**
@@ -37,10 +50,13 @@ const TRANSACTION_COLUMNS = "id, account_id, date, merchant, kind, category_id, 
  * The one query both reads share, so the ordering contract has exactly one
  * definition and `getRecentTransactions` cannot drift from `getTransactions`.
  *
- * `limit` is an internal parameter, not part of `TransactionFilters` — it
- * exists so a bounded read is a real `LIMIT` on the server rather than a slice
- * of a fully materialized list. (Caller-facing `limit`/`offset` pagination is
- * Checkpoint 4.)
+ * `recentLimit` is an internal parameter, distinct from
+ * `TransactionFilters.limit`: it is `getRecentTransactions`'s plain "newest N"
+ * `LIMIT`, which has no offset and no ceiling. The caller-facing
+ * `limit`/`offset` pair on the filters becomes a `.range()` window instead.
+ * The two are mutually exclusive in practice — `getRecentTransactions` passes
+ * no filters — and both are real server-side bounds, never a slice of a fully
+ * materialized list.
  *
  * Every read here follows the unconditional DAL rule: a verified `getOwnerId()`
  * first, then an explicit `user_id` predicate on top of RLS, then
@@ -53,9 +69,13 @@ const TRANSACTION_COLUMNS = "id, account_id, date, merchant, kind, category_id, 
  */
 async function readTransactions(
   filters: TransactionFilters,
-  limit?: number
+  recentLimit?: number
 ): Promise<Transaction[]> {
   const ownerId = await getOwnerId();
+
+  // Validated before the empty-range short-circuit below, so an invalid
+  // `limit`/`offset` fails the same way whatever the date bounds happen to be.
+  const page = resolvePageRange(filters, "transactions");
 
   const bounds = effectiveDateBounds(filters);
   // A non-overlapping intersection matches nothing by construction — return
@@ -82,8 +102,11 @@ async function readTransactions(
   // falsy and applies no filter at all, matching the legacy behavior.
   //
   // This is a `%…%` scan; there is no trigram index on `merchant` yet
-  // (deferred by the Phase 4 index migration, docs/database-schema.md §8) and
-  // adding one is a migration, not a Checkpoint 3 change.
+  // (deferred by the Phase 4 index migration, docs/database-schema.md §8).
+  // Adding `pg_trgm` + a GIN index is a reviewed migration in its own right,
+  // deliberately not folded into the read-path/UI work here — it is a
+  // Checkpoint 5 / follow-up performance item, and correctness comes first.
+  // Note the search path is now bounded by the page's `limit` regardless.
   if (filters.search) filtered = filtered.ilike("merchant", containsPattern(filters.search));
 
   // `date DESC, created_at DESC, id ASC` — docs/database-schema.md §17.
@@ -92,7 +115,10 @@ async function readTransactions(
     .order("created_at", { ascending: false })
     .order("id", { ascending: true });
 
-  if (limit !== undefined) ordered = ordered.limit(limit);
+  if (recentLimit !== undefined) ordered = ordered.limit(recentLimit);
+  // Applied *after* the ordering chain, which is what makes a window a stable
+  // slice of one defined order rather than an arbitrary set of rows.
+  if (page !== undefined) ordered = ordered.range(page.from, page.to);
 
   const { data, error } = await ordered;
 
@@ -119,8 +145,12 @@ async function readTransactions(
  * docs/database-schema.md. `created_at` never appears on the returned
  * `Transaction`.
  *
- * Phase 6 Checkpoint 3: reads `public.transactions`. Checkpoint 4 adds
- * validated `limit`/`offset` to `TransactionFilters`.
+ * Phase 6 Checkpoint 4 adds optional, validated `limit`/`offset` to the
+ * filters. They are strictly additive: **with neither supplied this remains
+ * the full unbounded query** it has always been, which is the contract the
+ * internal callers and the parity oracle rely on. What changed is that
+ * `/transactions` no longer *uses* that unbounded form — it asks for a bounded
+ * window (see the page's cumulative "Load more").
  */
 export async function getTransactions(filters: TransactionFilters = {}): Promise<Transaction[]> {
   return readTransactions(filters);
