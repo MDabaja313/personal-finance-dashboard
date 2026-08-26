@@ -1,9 +1,12 @@
 import "server-only";
 
-import { mockBudgets } from "@/lib/mock";
+import * as oracle from "@/lib/mock/dal";
 import type { Budget, MonthKey } from "@/lib/types";
 
 /**
+ * Phase 6 Checkpoint 1: delegates to the extracted fixture oracle. Checkpoint
+ * 2 replaces the body with a `budgets` read.
+ *
  * Ordering: `category_id ASC, id ASC` — a deterministic *technical* order
  * only, not a display order (this DAL has no join to `categories`, so it
  * cannot order by category name). Callers that render a budget list must
@@ -11,8 +14,5 @@ import type { Budget, MonthKey } from "@/lib/types";
  * fetch — see the `/budgets` page and the Dashboard's budget section.
  */
 export async function getBudgets(period: MonthKey): Promise<Budget[]> {
-  return mockBudgets
-    .filter((budget) => budget.period === period)
-    .slice()
-    .sort((a, b) => a.categoryId.localeCompare(b.categoryId) || a.id.localeCompare(b.id));
+  return oracle.getBudgets(period);
 }

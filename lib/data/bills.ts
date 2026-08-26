@@ -1,30 +1,28 @@
 import "server-only";
 
-import { mockBills } from "@/lib/mock";
+import * as oracle from "@/lib/mock/dal";
 import type { Bill } from "@/lib/types";
 
-/** Ordering: `due_date ASC, name ASC, id ASC` — see docs/database-schema.md. */
-function byDueDate(a: Bill, b: Bill): number {
-  return (
-    a.dueDate.localeCompare(b.dueDate) ||
-    a.name.localeCompare(b.name) ||
-    a.id.localeCompare(b.id)
-  );
-}
-
+/**
+ * Phase 6 Checkpoint 1: delegates to the extracted fixture oracle. Checkpoint
+ * 3 replaces these bodies with the two-query next-scheduled-occurrence
+ * projection over `bills` + `bill_occurrences` — `Bill.dueDate` is not a
+ * stored column.
+ *
+ * Ordering: `due_date ASC, name ASC, id ASC` — see docs/database-schema.md.
+ */
 export async function getBills(): Promise<Bill[]> {
-  return [...mockBills].sort(byDueDate);
+  return oracle.getBills();
 }
 
 /**
- * Soonest due date first — an overdue bill sorts to the top.
+ * Soonest due date first — an overdue bill sorts to the top. Deliberately
+ * applies no `today` filter.
  *
  * The contract this establishes is a `LIMIT`-capable query shape, so the
- * Phase 6 SQL implementation can fetch only `limit` rows instead of every
- * bill to display a handful. The mock implementation below still sorts the
- * full (small) fixture array before slicing — it does not itself avoid the
- * scan, only exposes the shape that lets SQL avoid it.
+ * Supabase implementation can stop after `limit` bills instead of materializing
+ * every one to display a handful.
  */
 export async function getUpcomingBills(limit: number): Promise<Bill[]> {
-  return [...mockBills].sort(byDueDate).slice(0, limit);
+  return oracle.getUpcomingBills(limit);
 }

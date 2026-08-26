@@ -75,6 +75,32 @@ const eslintConfig = defineConfig([
     rules: noProcessEnv,
   },
   {
+    // lib/data/supabase.ts is the single authorized crossing into
+    // lib/supabase/** from the DAL — every other lib/data module reaches the
+    // database through that seam's `getDataClient()`/`getOwnerId()`. Keeping
+    // it to one file is what lets the parity suite mock exactly one module
+    // while every mapper, query builder, and ordering chain under test stays
+    // real production code. `ignores` exempts that one path, not the
+    // directory. `noProcessEnv` above still applies to it: env access stays
+    // centralized in lib/supabase/env.ts.
+    files: ["lib/data/**/*.{ts,tsx}"],
+    ignores: ["lib/data/supabase.ts"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            {
+              group: ["@/lib/supabase", "@/lib/supabase/*"],
+              message:
+                "Only lib/data/supabase.ts may import lib/supabase/**. Use getDataClient()/getOwnerId() from that seam instead.",
+            },
+          ],
+        },
+      ],
+    },
+  },
+  {
     files: ["lib/finance/**/*.{ts,tsx}"],
     rules: {
       ...noProcessEnv,

@@ -1,7 +1,6 @@
 import "server-only";
 
-import { monthEnd, monthStart } from "@/lib/finance/dates";
-import { mockTransactions } from "@/lib/mock";
+import * as oracle from "@/lib/mock/dal";
 import type { CalendarDate, MonthKey, Transaction, TransactionKind } from "@/lib/types";
 
 export interface TransactionFilters {
@@ -18,25 +17,11 @@ export interface TransactionFilters {
   search?: string;
 }
 
-/** The tighter (later) of two optional lower bounds — undefined means "no bound". */
-function laterOf(a: CalendarDate | undefined, b: CalendarDate | undefined): CalendarDate | undefined {
-  if (a === undefined) return b;
-  if (b === undefined) return a;
-  return a > b ? a : b;
-}
-
-/** The tighter (earlier) of two optional upper bounds — undefined means "no bound". */
-function earlierOf(a: CalendarDate | undefined, b: CalendarDate | undefined): CalendarDate | undefined {
-  if (a === undefined) return b;
-  if (b === undefined) return a;
-  return a < b ? a : b;
-}
-
 /**
  * Filtering happens here, server-side — the simplest correct approach for
  * a page reading URL searchParams: no client fetching, no API route,
  * shareable/bookmarkable URLs, and it maps directly onto a SQL WHERE
- * clause in Phase 6.
+ * clause.
  *
  * `from`/`to` are both inclusive, compared as plain `CalendarDate` strings
  * (never `Date` objects) — 'YYYY-MM-DD' is lexicographically ordered, so
@@ -47,51 +32,19 @@ function earlierOf(a: CalendarDate | undefined, b: CalendarDate | undefined): Ca
  * each side). A non-overlapping intersection returns `[]`, never throws.
  *
  * Ordering is `date DESC, created_at DESC, id ASC` — see
- * docs/database-schema.md. The mock fixture array's index stands in for
- * `created_at` (a later fixture entry is a later "created_at"); the index
- * is used only to sort and never appears on a returned `Transaction`.
+ * docs/database-schema.md. `created_at` never appears on the returned
+ * `Transaction`.
+ *
+ * Phase 6 Checkpoint 1: delegates to the extracted fixture oracle, which holds
+ * the bound-intersection logic and the fixture-index stand-in for
+ * `created_at`. Checkpoint 3 replaces the body with the filter→query
+ * translation (bound intersection stays in TypeScript, `search` becomes an
+ * escaped `ilike`), and Checkpoint 4 adds validated `limit`/`offset`.
  */
 export async function getTransactions(filters: TransactionFilters = {}): Promise<Transaction[]> {
-  let effectiveFrom = filters.from;
-  let effectiveTo = filters.to;
-  if (filters.month) {
-    effectiveFrom = laterOf(effectiveFrom, monthStart(filters.month));
-    effectiveTo = earlierOf(effectiveTo, monthEnd(filters.month));
-  }
-
-  let results = mockTransactions.map((t, index) => ({ t, index }));
-
-  if (effectiveFrom !== undefined) {
-    const from = effectiveFrom;
-    results = results.filter(({ t }) => t.date >= from);
-  }
-  if (effectiveTo !== undefined) {
-    const to = effectiveTo;
-    results = results.filter(({ t }) => t.date <= to);
-  }
-  if (filters.accountId) {
-    results = results.filter(({ t }) => t.accountId === filters.accountId);
-  }
-  if (filters.categoryId) {
-    results = results.filter(({ t }) => t.categoryId === filters.categoryId);
-  }
-  if (filters.kind) {
-    results = results.filter(({ t }) => t.kind === filters.kind);
-  }
-  if (filters.search) {
-    const query = filters.search.toLowerCase();
-    results = results.filter(({ t }) => t.merchant.toLowerCase().includes(query));
-  }
-
-  results.sort((a, b) => {
-    if (a.t.date !== b.t.date) return b.t.date.localeCompare(a.t.date);
-    if (a.index !== b.index) return b.index - a.index;
-    return a.t.id.localeCompare(b.t.id);
-  });
-
-  return results.map(({ t }) => t);
+  return oracle.getTransactions(filters);
 }
 
 export async function getRecentTransactions(limit: number): Promise<Transaction[]> {
-  return (await getTransactions()).slice(0, limit);
+  return oracle.getRecentTransactions(limit);
 }
