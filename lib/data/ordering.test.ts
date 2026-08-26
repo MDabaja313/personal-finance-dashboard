@@ -1,10 +1,24 @@
+/**
+ * The legacy DAL's ordering contract, asserted against the fixture oracle
+ * (`lib/mock/dal.ts`) rather than `lib/data/**`.
+ *
+ * Phase 6 Checkpoint 1 repointed these imports. The assertions below are
+ * unchanged — they still use fixture slug ids, still run offline with no
+ * database, and are now the *definition* of the contract that
+ * `npm run test:parity` (Checkpoint 2 onward) holds the Supabase-backed DAL
+ * to. During Checkpoint 1 the production functions delegate to this same
+ * oracle, so these remain a live check of what the application returns.
+ */
 import { describe, expect, it } from "vitest";
-import { getAccounts } from "@/lib/data/accounts";
-import { getBills, getUpcomingBills } from "@/lib/data/bills";
-import { getBudgets } from "@/lib/data/budgets";
-import { getCategories } from "@/lib/data/categories";
-import { getGoals } from "@/lib/data/goals";
-import { getNetWorthHistory } from "@/lib/data/net-worth";
+import {
+  getAccounts,
+  getBills,
+  getBudgets,
+  getCategories,
+  getGoals,
+  getNetWorthHistory,
+  getUpcomingBills,
+} from "@/lib/mock/dal";
 
 describe("getAccounts ordering — name ASC, id ASC", () => {
   it("returns accounts alphabetically by name, independent of fixture order", async () => {

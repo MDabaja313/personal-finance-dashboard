@@ -1,5 +1,13 @@
+/**
+ * The legacy DAL's filtering/ordering contract for transactions, asserted
+ * against the fixture oracle (`lib/mock/dal.ts`) rather than
+ * `lib/data/transactions.ts`.
+ *
+ * Phase 6 Checkpoint 1 repointed these imports; every assertion is unchanged.
+ * See lib/data/ordering.test.ts for the full rationale.
+ */
 import { describe, expect, it } from "vitest";
-import { getRecentTransactions, getTransactions } from "@/lib/data/transactions";
+import { getRecentTransactions, getTransactions } from "@/lib/mock/dal";
 import { monthEnd, monthStart } from "@/lib/finance/dates";
 
 async function ids(...args: Parameters<typeof getTransactions>) {

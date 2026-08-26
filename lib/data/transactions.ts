@@ -1,7 +1,16 @@
 import "server-only";
 
-import { monthEnd, monthStart } from "@/lib/finance/dates";
-import { mockTransactions } from "@/lib/mock";
+import { mapDbError } from "@/lib/data/db-errors";
+import {
+  assertRowLimit,
+  containsPattern,
+  effectiveDateBounds,
+  isEmptyRange,
+  resolvePageRange,
+} from "@/lib/data/filters";
+import { toTransaction } from "@/lib/data/mappers";
+import type { TransactionRow } from "@/lib/data/rows";
+import { getDataClient, getOwnerId } from "@/lib/data/supabase";
 import type { CalendarDate, MonthKey, Transaction, TransactionKind } from "@/lib/types";
 
 export interface TransactionFilters {
@@ -16,27 +25,113 @@ export interface TransactionFilters {
   kind?: TransactionKind;
   /** Matches against merchant name, case-insensitive substring. */
   search?: string;
+  /**
+   * Bounded window size — a real `LIMIT`/`OFFSET` on the server, not a slice
+   * of a materialized list. Additive: omitting it (and `offset`) preserves the
+   * full-query contract exactly. Must be a positive safe integer no greater
+   * than `MAX_TRANSACTION_LIMIT`; anything else is `data_integrity`.
+   */
+  limit?: number;
+  /**
+   * Zero-based row offset within the ordered result. Defaults to 0, and is
+   * only meaningful alongside `limit` (see `resolvePageRange`).
+   */
+  offset?: number;
 }
 
-/** The tighter (later) of two optional lower bounds — undefined means "no bound". */
-function laterOf(a: CalendarDate | undefined, b: CalendarDate | undefined): CalendarDate | undefined {
-  if (a === undefined) return b;
-  if (b === undefined) return a;
-  return a > b ? a : b;
-}
+/**
+ * Explicit column list — never `select("*")`. `created_at` is deliberately
+ * absent: it is an ordering key only (PostgREST can order by a column it does
+ * not project), and it must never appear on the `Transaction` DTO.
+ */
+const TRANSACTION_COLUMNS = "id, account_id, date, merchant, kind, category_id, movement_id, amount_cents";
 
-/** The tighter (earlier) of two optional upper bounds — undefined means "no bound". */
-function earlierOf(a: CalendarDate | undefined, b: CalendarDate | undefined): CalendarDate | undefined {
-  if (a === undefined) return b;
-  if (b === undefined) return a;
-  return a < b ? a : b;
+/**
+ * The one query both reads share, so the ordering contract has exactly one
+ * definition and `getRecentTransactions` cannot drift from `getTransactions`.
+ *
+ * `recentLimit` is an internal parameter, distinct from
+ * `TransactionFilters.limit`: it is `getRecentTransactions`'s plain "newest N"
+ * `LIMIT`, which has no offset and no ceiling. The caller-facing
+ * `limit`/`offset` pair on the filters becomes a `.range()` window instead.
+ * The two are mutually exclusive in practice — `getRecentTransactions` passes
+ * no filters — and both are real server-side bounds, never a slice of a fully
+ * materialized list.
+ *
+ * Every read here follows the unconditional DAL rule: a verified `getOwnerId()`
+ * first, then an explicit `user_id` predicate on top of RLS, then
+ * `mapDbError` before `data` is touched, then a mapper over the rows. No raw
+ * row escapes.
+ *
+ * There is no `movements` query and no join to one: `Transaction.movementId`
+ * is the plain `transactions.movement_id` column, and `authenticated` has no
+ * SELECT grant on `movements` (nor needs one) — see the RLS/grants migration.
+ */
+async function readTransactions(
+  filters: TransactionFilters,
+  recentLimit?: number
+): Promise<Transaction[]> {
+  const ownerId = await getOwnerId();
+
+  // Validated before the empty-range short-circuit below, so an invalid
+  // `limit`/`offset` fails the same way whatever the date bounds happen to be.
+  const page = resolvePageRange(filters, "transactions");
+
+  const bounds = effectiveDateBounds(filters);
+  // A non-overlapping intersection matches nothing by construction — return
+  // `[]` rather than issuing a query whose result is already known. Auth is
+  // still verified above, unconditionally.
+  if (isEmptyRange(bounds)) return [];
+
+  const supabase = await getDataClient();
+
+  let filtered = supabase
+    .from("transactions")
+    .select(TRANSACTION_COLUMNS)
+    .eq("user_id", ownerId);
+
+  // `from`/`to` are both inclusive, hence gte/lte.
+  if (bounds.from !== undefined) filtered = filtered.gte("date", bounds.from);
+  if (bounds.to !== undefined) filtered = filtered.lte("date", bounds.to);
+
+  if (filters.accountId) filtered = filtered.eq("account_id", filters.accountId);
+  if (filters.categoryId) filtered = filtered.eq("category_id", filters.categoryId);
+  if (filters.kind) filtered = filtered.eq("kind", filters.kind);
+  // Case-insensitive substring, with every wildcard in the user's text
+  // escaped to a literal — see lib/data/filters.ts. An empty string is
+  // falsy and applies no filter at all, matching the legacy behavior.
+  //
+  // This is a `%…%` scan; there is no trigram index on `merchant` yet
+  // (deferred by the Phase 4 index migration, docs/database-schema.md §8).
+  // Adding `pg_trgm` + a GIN index is a reviewed migration in its own right,
+  // deliberately not folded into the read-path/UI work here — it is a
+  // Checkpoint 5 / follow-up performance item, and correctness comes first.
+  // Note the search path is now bounded by the page's `limit` regardless.
+  if (filters.search) filtered = filtered.ilike("merchant", containsPattern(filters.search));
+
+  // `date DESC, created_at DESC, id ASC` — docs/database-schema.md §17.
+  let ordered = filtered
+    .order("date", { ascending: false })
+    .order("created_at", { ascending: false })
+    .order("id", { ascending: true });
+
+  if (recentLimit !== undefined) ordered = ordered.limit(recentLimit);
+  // Applied *after* the ordering chain, which is what makes a window a stable
+  // slice of one defined order rather than an arbitrary set of rows.
+  if (page !== undefined) ordered = ordered.range(page.from, page.to);
+
+  const { data, error } = await ordered;
+
+  if (error) throw mapDbError(error, "transactions");
+
+  return (data as TransactionRow[]).map(toTransaction);
 }
 
 /**
  * Filtering happens here, server-side — the simplest correct approach for
  * a page reading URL searchParams: no client fetching, no API route,
  * shareable/bookmarkable URLs, and it maps directly onto a SQL WHERE
- * clause in Phase 6.
+ * clause.
  *
  * `from`/`to` are both inclusive, compared as plain `CalendarDate` strings
  * (never `Date` objects) — 'YYYY-MM-DD' is lexicographically ordered, so
@@ -47,51 +142,28 @@ function earlierOf(a: CalendarDate | undefined, b: CalendarDate | undefined): Ca
  * each side). A non-overlapping intersection returns `[]`, never throws.
  *
  * Ordering is `date DESC, created_at DESC, id ASC` — see
- * docs/database-schema.md. The mock fixture array's index stands in for
- * `created_at` (a later fixture entry is a later "created_at"); the index
- * is used only to sort and never appears on a returned `Transaction`.
+ * docs/database-schema.md. `created_at` never appears on the returned
+ * `Transaction`.
+ *
+ * Phase 6 Checkpoint 4 adds optional, validated `limit`/`offset` to the
+ * filters. They are strictly additive: **with neither supplied this remains
+ * the full unbounded query** it has always been, which is the contract the
+ * internal callers and the parity oracle rely on. What changed is that
+ * `/transactions` no longer *uses* that unbounded form — it asks for a bounded
+ * window (see the page's cumulative "Load more").
  */
 export async function getTransactions(filters: TransactionFilters = {}): Promise<Transaction[]> {
-  let effectiveFrom = filters.from;
-  let effectiveTo = filters.to;
-  if (filters.month) {
-    effectiveFrom = laterOf(effectiveFrom, monthStart(filters.month));
-    effectiveTo = earlierOf(effectiveTo, monthEnd(filters.month));
-  }
-
-  let results = mockTransactions.map((t, index) => ({ t, index }));
-
-  if (effectiveFrom !== undefined) {
-    const from = effectiveFrom;
-    results = results.filter(({ t }) => t.date >= from);
-  }
-  if (effectiveTo !== undefined) {
-    const to = effectiveTo;
-    results = results.filter(({ t }) => t.date <= to);
-  }
-  if (filters.accountId) {
-    results = results.filter(({ t }) => t.accountId === filters.accountId);
-  }
-  if (filters.categoryId) {
-    results = results.filter(({ t }) => t.categoryId === filters.categoryId);
-  }
-  if (filters.kind) {
-    results = results.filter(({ t }) => t.kind === filters.kind);
-  }
-  if (filters.search) {
-    const query = filters.search.toLowerCase();
-    results = results.filter(({ t }) => t.merchant.toLowerCase().includes(query));
-  }
-
-  results.sort((a, b) => {
-    if (a.t.date !== b.t.date) return b.t.date.localeCompare(a.t.date);
-    if (a.index !== b.index) return b.index - a.index;
-    return a.t.id.localeCompare(b.t.id);
-  });
-
-  return results.map(({ t }) => t);
+  return readTransactions(filters);
 }
 
+/**
+ * The `limit` most recent transactions, in the same
+ * `date DESC, created_at DESC, id ASC` order as `getTransactions()`.
+ *
+ * A real bounded query — the `LIMIT` is applied by the database, not by
+ * slicing a fully materialized list.
+ */
 export async function getRecentTransactions(limit: number): Promise<Transaction[]> {
-  return (await getTransactions()).slice(0, limit);
+  assertRowLimit(limit, "recent transactions");
+  return readTransactions({}, limit);
 }

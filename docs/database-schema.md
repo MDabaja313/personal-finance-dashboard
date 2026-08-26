@@ -8,8 +8,11 @@ the migrations are the authoritative *executable* source; small illustrative SQL
 predate the migrations and are kept only where they still clarify a shape or a constraint's intent,
 not as a claim that they're what actually shipped. See
 [DEVELOPMENT_PLAN.md](../DEVELOPMENT_PLAN.md) for phase sequencing and
-[docs/rls-policies.md](rls-policies.md) for security. The application (`lib/data/**`) is still
-mock-fixture-backed — the DAL swap to these tables is Phase 6, not done yet.
+[docs/rls-policies.md](rls-policies.md) for security. **Phase 6 is complete** — all ten
+production `lib/data/**` read functions (§16) are Supabase-backed. `lib/mock/dal.ts` remains only
+as the parity-test oracle; no production code reads it (`eslint.config.mjs` and
+`lib/auth/posture.test.ts`-style static checks keep it that way). No migration changed during
+Phase 6 — the schema below is exactly what Phase 4 shipped.
 
 ## Contents
 
@@ -63,8 +66,8 @@ auth.users (Supabase)
 - `account_balances` — derived current balance per account.
 - `goal_balances` — derived `saved_cents` per goal.
 
-**Decided in Phase 4:** the bill next-unpaid-occurrence projection is **not** a view — it remains
-a Phase 6 DAL query, per §13/§16.
+**Decided in Phase 4, shipped in Phase 6:** the bill next-unpaid-occurrence projection is **not** a
+view — it is a two-query Phase 6 DAL projection (`lib/data/bills.ts`), per §13/§16.
 
 No table list changed across the review rounds that produced this document — the balance-
 reconciliation limitation (§18) is recorded as a *future* prerequisite, not a table added now.
@@ -420,7 +423,7 @@ see the error taxonomy in [DEVELOPMENT_PLAN.md](../DEVELOPMENT_PLAN.md) (Phase 3
 | `transactions` | `(user_id, account_id, date DESC)` | `TransactionFilters.accountId` |
 | `transactions` | `(user_id, category_id, date DESC)` | `spendingByCategory`, budget rollups |
 | `transactions` | `(movement_id)` WHERE `movement_id IS NOT NULL` | Partial index — the movement trigger's leg lookup |
-| `transactions` | trigram index on `merchant` | Deferred — needs the `pg_trgm` extension. `TransactionFilters.search` is a substring match; flagged as a Phase 6 verification item, not designed here. |
+| `transactions` | trigram index on `merchant` | **Not a Phase 6 correctness blocker.** `TransactionFilters.search` runs as `ILIKE '%…%'` (`lib/data/transactions.ts`) with no trigram index, verified in Phase 6 to still return correct, bounded results against the single-owner dataset. Recorded as a **future performance optimization** — add `pg_trgm` + a GIN index only if `merchant` search latency actually becomes a problem at realistic per-owner row counts. No migration for it shipped in Phase 6. |
 | `accounts` | `(user_id)`; `UNIQUE (id, user_id)` | Listing + composite FK target |
 | `categories` | `(user_id)`; `UNIQUE (id, user_id)`; **a unique expression index** on `(user_id, lower(name))` — not an ordinary `UNIQUE` constraint, since it indexes the result of `lower(name)` rather than a plain column list | Per-user uniqueness without case-duplicate categories |
 | `budgets` | `UNIQUE (user_id, category_id, period)` | One budget per category per month |
@@ -500,15 +503,20 @@ output (`lib/finance/money.ts`) — a display value, never re-stored.
     immutable per-row invariant, which is unsound across dump/restore and catalog version
     changes.
 - **Production `getToday()` derives the calendar date from the authenticated user's
-  `profiles.timezone`**, never the server's clock. **Not implemented in this phase** — recorded
-  here as the intended Phase 6 strategy, not a promise about any single API call's exact output
-  format: construct `Intl.DateTimeFormat` with explicit `{ timeZone: tz, year: 'numeric', month:
-  '2-digit', day: '2-digit' }`, call `.formatToParts()` rather than `.format()`, and explicitly
-  assemble the `year`/`month`/`day` parts into a `'YYYY-MM-DD'` string. `Intl.DateTimeFormat`'s
-  locale-formatted string output (even with locale `'en-CA'`) is not guaranteed across
-  environments to be exactly machine-parseable `YYYY-MM-DD` — separators, part order, and
-  padding are locale/implementation details. `formatToParts()` gives structured
-  `{ type, value }` parts to assemble explicitly instead of relying on that string shape.
+  `profiles.timezone`**, never the server's clock — **implemented in Phase 6 Checkpoint 4**
+  (`lib/data/clock.ts`, `calendarDateInTimeZone` in `lib/data/calendar.ts`). There is deliberately
+  no development-only `MOCK_TODAY` branch in production: seeded fixture data ages out of "this
+  month" as real time advances, which is the correct, visible consequence, and every page already
+  has an empty state for it. `getToday()` throws `data_integrity` rather than defaulting to UTC if
+  the verified owner has no profile row or an unusable zone — a silently wrong "today" would
+  silently corrupt "this month" totals, budget periods, and overdue-bill grouping.
+  `calendarDateInTimeZone` constructs `Intl.DateTimeFormat` with explicit `{ timeZone: tz, year:
+  'numeric', month: '2-digit', day: '2-digit' }`, calls `.formatToParts()` rather than `.format()`,
+  and explicitly assembles the `year`/`month`/`day` parts into a `'YYYY-MM-DD'` string —
+  `Intl.DateTimeFormat`'s locale-formatted string output (even with locale `'en-CA'`) is not
+  guaranteed across environments to be exactly machine-parseable `YYYY-MM-DD`; `formatToParts()`
+  gives structured `{ type, value }` parts to assemble explicitly instead of relying on that string
+  shape.
 - **Financial dates stay `DATE`**: `transactions.date`, `bill_occurrences.due_date`,
   `goal_contributions.occurred_on`, `goals.target_date`, `bills.anchor_date` — calendar values,
   never instants. Audit columns (`created_at`, `updated_at`) are `TIMESTAMPTZ`. Conflating the
@@ -717,7 +725,7 @@ Occurrences are generated forward through a rolling horizon, idempotent via
 `UNIQUE (bill_id, due_date)` so re-running the generator never duplicates. **The generator itself
 is not built in this phase** — it arrives with the snapshot writer in Phase 4.
 
-### DTO projection — how the existing `Bill` shape survives Phase 6 unchanged
+### DTO projection — how the existing `Bill` shape survived Phase 6 unchanged
 
 Today, `Bill` ([lib/types/index.ts](../lib/types/index.ts)) is one object carrying `dueDate`
 directly, and `billStatus(bill, today)` (`lib/finance/bills.ts`) reads that field. Bills is **the
@@ -726,12 +734,15 @@ model would ripple through `lib/types`, `lib/finance/bills.ts` and its tests,
 `components/bills/**`, `components/dashboard/upcoming-bills.tsx`, and both consuming pages.
 
 **Resolution:** the schema satisfies the "no mutable pointer, full history retained" requirement
-completely at the storage layer. The **Phase 6 DAL** then projects the next unpaid occurrence
-into the existing `Bill` DTO shape — `dueDate` becomes "the earliest `scheduled` occurrence's
-`due_date` for this bill," computed at query time. **Decided in Phase 4: this projection is a
-Phase 6 DAL query, not a third view** — `20260822150005_views.sql` creates exactly the two views
-in §1 (`account_balances`, `goal_balances`). `BillOccurrence` does not enter the UI, and no
-component changes, until Phase 7 actually needs occurrence history or a mark-as-paid action.
+completely at the storage layer. The **Phase 6 DAL** (`lib/data/bills.ts`) projects the next
+unpaid occurrence into the existing `Bill` DTO shape — `dueDate` is "the earliest `scheduled`
+occurrence's `due_date` for this bill," computed at query time via two queries (active `bills`,
+then their `scheduled` `bill_occurrences`) reduced to one occurrence per bill in TypeScript, since
+PostgREST's embedded-resource `order`/`limit` applies to the flattened join rather than per parent
+row. **Decided in Phase 4, shipped in Phase 6: this projection is a DAL query, not a third
+view** — `20260822150005_views.sql` creates exactly the two views in §1 (`account_balances`,
+`goal_balances`). `BillOccurrence` does not enter the UI, and no component changes, until Phase 7
+actually needs occurrence history or a mark-as-paid action.
 
 ---
 
@@ -856,6 +867,12 @@ repeated invocation.
 | *(new)* | `profiles` | a new `Profile` DTO (timezone) — consumed by `getToday()`, never rendered directly by the UI |
 | *(no read DTO needed)* | `movements`, `goal_contributions` | surface only in Phase 7 mutation UI |
 
+**`movements` was not needed by any Phase 6 read.** `Transaction.movementId` is a plain FK-backed
+column on the `transactions` row itself (§4) — no Phase 6 query joins to `movements`, so the
+table's Phase 4 posture (no `authenticated` grant, no RLS policy — §1, `rls-policies.md`) is
+unchanged by the DAL swap. A transfer/credit-card-payment pair's two legs remain independently
+visible wherever their own `account_id` puts them, through the ordinary `getTransactions()` path.
+
 **Ten of the eleven existing DTOs are unchanged.** That's the direct payoff of deriving values
 into the same shape rather than exposing normalized rows to the UI — and it's why
 `lib/finance/**` and all 66 existing tests survive this design untouched. SQL primary keys are
@@ -865,27 +882,38 @@ into the same shape rather than exposing normalized rows to the UI — and it's 
 
 ## 16. DAL function mapping
 
-| Function (`lib/data/**`) | Future query | Note |
+All ten functions below are Supabase-backed as of Phase 6; `lib/mock/dal.ts` is retained only as
+the `test:parity` oracle, never called from production code.
+
+| Function (`lib/data/**`) | Query | Note |
 |---|---|---|
-| `getToday()` | `profiles.timezone` + `Intl.DateTimeFormat('en-CA', …)` | The single clock seam — unchanged signature |
-| `getAccounts()` | `SELECT * FROM account_balances WHERE user_id = auth.uid() ORDER BY name` | Ordering is currently implicit in fixture array order — must become an explicit contract |
-| `getCategories()` | `WHERE user_id = auth.uid() ORDER BY name` | Same explicit-ordering requirement |
-| `getTransactions(filters)` | `WHERE` clause + `ORDER BY date DESC, created_at DESC, id ASC` | Maps 1:1 today, including the Phase 3 `from`/`to` bounds; `search` needs `pg_trgm` (§8) |
-| `getRecentTransactions(limit)` | `ORDER BY date DESC LIMIT n` | Currently fetches the full unbounded list and slices client-side — becomes a real `LIMIT` |
-| `getBudgets(period)` | `WHERE period = $1` | 1:1 |
-| `getBills()` | `bills` joined to each bill's next unpaid occurrence (§13) | The one non-trivial rewrite in this table — a Phase 6 DAL query, not a view (§13, §1) |
-| `getUpcomingBills(limit)` | `bill_occurrences ORDER BY due_date LIMIT n` | Wired into the Dashboard as of Phase 3, replacing an unbounded `getBills()` + sort + slice |
-| `getGoals()` | `goals` + `goal_balances` rollup, `WHERE archived_at IS NULL` | The soft-delete filter is new; everything else maps directly |
-| `getNetWorthHistory(months?)` | `ORDER BY month DESC LIMIT n`, reversed for chronological display | Currently implemented as `.slice(-months)` over the full fixture array |
+| `getToday()` | `profiles.timezone` + `Intl.DateTimeFormat('en-CA', …).formatToParts()` | The single clock seam — unchanged signature; `lib/data/clock.ts` (§10) |
+| `getAccounts()` | `SELECT ... FROM account_balances WHERE user_id = $1 ORDER BY name ASC, id ASC` | `lib/data/accounts.ts`; explicit ordering, not fixture array order |
+| `getCategories()` | `WHERE user_id = $1 ORDER BY name ASC, id ASC` | `lib/data/categories.ts` |
+| `getTransactions(filters)` | `WHERE` clause + `ORDER BY date DESC, created_at DESC, id ASC`, `range()`-bounded | `lib/data/transactions.ts`; includes the Phase 3 `from`/`to` bounds and the Phase 6 `limit`/`offset` window (§ below); `search` is `ILIKE` with escaped wildcards — no `pg_trgm` (§8) |
+| `getRecentTransactions(limit)` | `ORDER BY date DESC, created_at DESC, id ASC LIMIT n` | `lib/data/transactions.ts`; a real `LIMIT`, not a client-side slice of an unbounded fetch |
+| `getBudgets(period)` | `WHERE period = $1 ORDER BY category_id ASC` | `lib/data/budgets.ts`; technical order only — callers apply their own semantic order (§17) |
+| `getBills()` | Two queries: active `bills`, then their `scheduled` `bill_occurrences`, reduced to one occurrence per bill in TypeScript, sorted `due_date ASC, name ASC, id ASC` | `lib/data/bills.ts`; the one non-trivial rewrite in this table — a DAL projection, not a view (§13, §1) |
+| `getUpcomingBills(limit)` | Derived from `getBills()`, sliced to `limit` | `lib/data/bills.ts`; the sort key is the projected due date, which no single relation carries, so the database cannot correctly truncate this list itself |
+| `getGoals()` | `goal_balances`, `WHERE user_id = $1 AND archived_at IS NULL ORDER BY target_date ASC NULLS LAST, name ASC, id ASC` | `lib/data/goals.ts` |
+| `getNetWorthHistory(months?)` | `ORDER BY month DESC` + `LIMIT n` (only for `months > 0`), reversed in TypeScript for chronological (ASC) display | `lib/data/net-worth.ts`; `months === 0` returns full history, matching the fixture oracle's `slice(-0)` behavior |
 
 **`getAccountById` and `getTransactionsForMonth` were deleted in Phase 3** (superseded by
 `getTransactions({ from, to })`) and are not part of this mapping — the table above reflects the
 current `lib/data/**` surface, not the Phase 2 draft that preceded that cleanup.
 
-**Implicit ordering is a latent bug, not a feature.** Several fixture-backed functions today
-return arrays whose order is an accident of fixture-file layout. SQL guarantees no ordering
-without an explicit `ORDER BY`; every list-returning function needs one, or the UI will reorder
-unpredictably the moment the DAL swap lands.
+**Transaction bounded-window reads (Phase 6 Checkpoint 4):** `/transactions` (`app/(app)/transactions/page.tsx`)
+reads a cumulative-reveal prefix, never an unbounded full-history fetch. Each "Load more" press
+increases a `revealed` count by `PAGE_SIZE` (25); the page re-reads `offset: 0, limit: revealed + 1`
+as one contiguous read of one ordering (the `+1` is a has-more probe row, never rendered), split
+into consecutive `MAX_TRANSACTION_LIMIT`-sized DAL queries by `fetchPrefix`/`iterateFetchWindows`
+(`lib/data/filters.ts`) so no single `getTransactions()` call is ever unbounded. There is no
+maximum reveal depth — only a ceiling on the size of any one underlying query. Changing a filter
+resets `page` client-side (`components/transactions/transaction-filters.tsx` deletes the `page`
+search param), so a new filter always starts from the first window.
+
+**Explicit ordering is now a verified contract, not an accident of fixture-file layout** — every
+list-returning function above has an explicit `ORDER BY`-equivalent chain, matching §17.
 
 ---
 

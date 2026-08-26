@@ -202,9 +202,17 @@ describe("Phase 5 auth posture", () => {
     expect(offenders).toEqual([]);
   });
 
-  it("only lib/auth/**, lib/supabase/** (internally), and root proxy.ts import lib/supabase/**", () => {
+  it("only lib/auth/**, lib/supabase/** (internally), root proxy.ts, and lib/data/supabase.ts import lib/supabase/**", () => {
+    // Phase 6 narrowed rather than widened this allowlist: the DAL's crossing
+    // is exactly one file, `lib/data/supabase.ts`, not the `lib/data/`
+    // directory. Everything else in lib/data/** reaches the database through
+    // that seam's getDataClient()/getOwnerId(), which is separately asserted
+    // below and mirrored by a no-restricted-imports rule in eslint.config.mjs.
     const ALLOWED = (repoPath: string) =>
-      repoPath.startsWith("lib/auth/") || repoPath.startsWith("lib/supabase/") || repoPath === "proxy.ts";
+      repoPath.startsWith("lib/auth/") ||
+      repoPath.startsWith("lib/supabase/") ||
+      repoPath === "proxy.ts" ||
+      repoPath === "lib/data/supabase.ts";
 
     const offenders = filesWithCode
       .filter(({ code }) => importsModuleUnder(extractImportSpecifiers(code), "lib/supabase"))
@@ -212,6 +220,25 @@ describe("Phase 5 auth posture", () => {
       .filter((repoPath) => !ALLOWED(repoPath));
 
     expect(offenders).toEqual([]);
+  });
+
+  it("no lib/data module other than lib/data/supabase.ts imports lib/supabase/**", () => {
+    const offenders = filesWithCode
+      .filter(({ repoPath }) => repoPath.startsWith("lib/data/") && repoPath !== "lib/data/supabase.ts")
+      .filter(({ code }) => importsModuleUnder(extractImportSpecifiers(code), "lib/supabase"))
+      .map(({ repoPath }) => repoPath);
+
+    expect(offenders).toEqual([]);
+  });
+
+  it("lib/data/supabase.ts exists and is the seam the allowlist assumes", () => {
+    // Guards the allowlist entry above against becoming a dead exemption: if
+    // the seam is ever renamed or deleted, the permission for that path must
+    // not linger silently.
+    const seam = filesWithCode.find(({ repoPath }) => repoPath === "lib/data/supabase.ts");
+
+    expect(seam).toBeDefined();
+    expect(importsModuleUnder(extractImportSpecifiers(seam!.code), "lib/supabase")).toBe(true);
   });
 
   it("has no service-role/admin/database secret in application source or .env.example", () => {
