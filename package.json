@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:parity": "vitest run --config vitest.parity.config.ts",
     "seed:generate": "tsx scripts/generate-seed.ts",
     "auth:reset-local": "tsx scripts/provision-owner.ts",
     "auth:verify": "tsx scripts/verify-auth.ts",
