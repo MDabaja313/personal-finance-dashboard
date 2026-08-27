@@ -14,7 +14,6 @@ import {
   toGoal,
   toNetWorthSnapshot,
   toTransaction,
-  ACCOUNT_TYPES,
 } from "@/lib/data/mappers";
 import type {
   AccountBalanceRow,
@@ -26,6 +25,7 @@ import type {
   TransactionRow,
 } from "@/lib/data/rows";
 import { AppError, isAppError } from "@/lib/errors";
+import { ACCOUNT_TYPES } from "@/lib/types/enums";
 
 // A value that survives JSON but not the safe-integer invariant, chosen so a
 // leak into a user-facing message is unmistakable in an assertion.

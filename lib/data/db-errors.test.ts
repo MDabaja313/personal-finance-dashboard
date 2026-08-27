@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { mapDbError } from "@/lib/data/db-errors";
+import { mapDbError, mapWriteError } from "@/lib/data/db-errors";
 import { AppError, dataIntegrity, unauthorized } from "@/lib/errors";
 
 /**
@@ -125,6 +125,111 @@ describe("mapDbError — non-leakage", () => {
   it("retains the original error as `cause`, which stays server-side", () => {
     for (const raw of [leakyPostgrestError, { code: "42501" }, { code: "PGRST301" }, { status: 500 }]) {
       expect(mapDbError(raw, "accounts").cause).toBe(raw);
+    }
+  });
+});
+
+/**
+ * A write error carrying the worst possible payload: PostgREST embeds the
+ * failing row itself on a constraint violation.
+ */
+const leakyWriteError = {
+  code: "23505",
+  message: 'duplicate key value violates unique constraint "categories_user_id_lower_name_key"',
+  details: "Key (user_id, lower(name))=(0e2f…, groceries) already exists.",
+  hint: "Pick a different name.",
+};
+
+describe("mapWriteError — taxonomy", () => {
+  it("maps unique_violation (23505) to conflict", () => {
+    const error = mapWriteError(leakyWriteError, "categories");
+
+    expect(error).toBeInstanceOf(AppError);
+    expect(error.code).toBe("conflict");
+  });
+
+  it("maps foreign_key_violation (23503) to invalid_input", () => {
+    // Also how the composite-FK ownership design surfaces a reference to
+    // another user's row — it must never read as a server fault.
+    expect(mapWriteError({ code: "23503" }, "transactions").code).toBe("invalid_input");
+  });
+
+  it("maps check_violation (23514) to invalid_input, not data_integrity", () => {
+    // data_integrity means stored data contradicts an invariant. A rejected
+    // write means the database successfully defended one — the opposite.
+    expect(mapWriteError({ code: "23514" }, "transactions").code).toBe("invalid_input");
+  });
+
+  it("maps Postgres class 22 (data exception) to invalid_input", () => {
+    for (const code of ["22P02", "22003", "22007", "22001"]) {
+      expect(mapWriteError({ code }, "budgets").code).toBe("invalid_input");
+    }
+  });
+
+  it("preserves the existing auth and permission behavior", () => {
+    expect(mapWriteError({ code: "42501" }, "accounts").code).toBe("forbidden");
+    expect(mapWriteError({ code: "28000" }, "accounts").code).toBe("forbidden");
+    expect(mapWriteError({ code: "28P01" }, "accounts").code).toBe("forbidden");
+    for (const code of ["PGRST301", "PGRST302", "PGRST303"]) {
+      expect(mapWriteError({ code }, "accounts").code).toBe("unauthorized");
+    }
+    expect(mapWriteError({ status: 401 }, "accounts").code).toBe("unauthorized");
+    expect(mapWriteError({ status: 403 }, "accounts").code).toBe("forbidden");
+    expect(mapWriteError({ statusCode: "403" }, "accounts").code).toBe("forbidden");
+  });
+
+  it("classifies auth failures identically to the read mapper", () => {
+    // Same failure, same classification, whether it interrupted a SELECT or
+    // an INSERT — only the wording differs.
+    for (const raw of [{ code: "42501" }, { code: "28P01" }, { code: "PGRST301" }, { status: 401 }]) {
+      expect(mapWriteError(raw, "accounts").code).toBe(mapDbError(raw, "accounts").code);
+    }
+  });
+
+  it("falls back to unavailable for an unrecognized failure", () => {
+    expect(mapWriteError({ code: "08006" }, "accounts").code).toBe("unavailable");
+    expect(mapWriteError({ status: 500 }, "accounts").code).toBe("unavailable");
+    expect(mapWriteError(new Error("socket hang up"), "accounts").code).toBe("unavailable");
+    expect(mapWriteError(null, "accounts").code).toBe("unavailable");
+    expect(mapWriteError(undefined, "accounts").code).toBe("unavailable");
+  });
+
+  it("passes an AppError through untouched", () => {
+    const original = dataIntegrity("Invalid cents value for accounts.opening_balance_cents.");
+    expect(mapWriteError(original, "accounts")).toBe(original);
+    expect(mapWriteError(unauthorized(), "accounts").code).toBe("unauthorized");
+  });
+});
+
+describe("mapWriteError — non-leakage", () => {
+  it("never quotes the raw message, details, hint, constraint, or code", () => {
+    const error = mapWriteError(leakyWriteError, "categories");
+
+    expect(error.message).not.toContain(leakyWriteError.message);
+    expect(error.message).not.toContain(leakyWriteError.details);
+    expect(error.message).not.toContain(leakyWriteError.hint);
+    expect(error.message).not.toContain("categories_user_id_lower_name_key");
+    expect(error.message).not.toContain("groceries");
+    expect(error.message).not.toContain("23505");
+  });
+
+  it("keeps the user-facing message to a generic sentence naming only the operation", () => {
+    expect(mapWriteError({ code: "23505" }, "categories").message).toBe(
+      "Conflicts with existing categories."
+    );
+    expect(mapWriteError({ code: "23503" }, "transactions").message).toBe(
+      "Invalid input for transactions."
+    );
+    expect(mapWriteError({ code: "42501" }, "accounts").message).toBe(
+      "Not permitted to modify accounts."
+    );
+    expect(mapWriteError({ code: "PGRST301" }, "accounts").message).toBe("Not authenticated.");
+    expect(mapWriteError({ status: 500 }, "budgets").message).toBe("Failed to save budgets.");
+  });
+
+  it("retains the original error as `cause`, which stays server-side", () => {
+    for (const raw of [leakyWriteError, { code: "23503" }, { code: "42501" }, { status: 500 }]) {
+      expect(mapWriteError(raw, "accounts").cause).toBe(raw);
     }
   });
 });

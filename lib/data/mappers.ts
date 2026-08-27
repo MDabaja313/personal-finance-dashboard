@@ -22,6 +22,11 @@
  *    `lib/errors.ts` forbids balances, amounts, merchant names, and row
  *    payloads in `message` because dev forwards `message` to the client. The
  *    original throw travels as `cause`, which stays server-side.
+ *
+ * The enum label sets `enumFrom()` narrows against live in
+ * `lib/types/enums.ts`, not here. Validating untrusted *input*
+ * (`lib/validation/**`) needs the same lists, and that layer is fenced off
+ * from `lib/data/**` — so the lists sit in the one layer both may import.
  */
 import type {
   AccountBalanceRow,
@@ -35,9 +40,7 @@ import type {
 import { dataIntegrity } from "@/lib/errors";
 import type {
   Account,
-  AccountType,
   Bill,
-  BillFrequency,
   Budget,
   CalendarDate,
   Category,
@@ -46,9 +49,14 @@ import type {
   MonthKey,
   NetWorthSnapshot,
   Transaction,
-  TransactionKind,
 } from "@/lib/types";
 import { toCents } from "@/lib/types";
+import {
+  ACCOUNT_TYPES,
+  BILL_FREQUENCIES,
+  CATEGORY_KINDS,
+  TRANSACTION_KINDS,
+} from "@/lib/types/enums";
 
 // ============================================================
 // Field validators
@@ -146,28 +154,6 @@ export function enumFrom<T extends string>(value: unknown, allowed: readonly T[]
   }
   return value as T;
 }
-
-/** Enum members, mirroring `supabase/migrations/20260822150002_enums_and_tables.sql`. */
-export const ACCOUNT_TYPES: readonly AccountType[] = [
-  "checking",
-  "savings",
-  "cash",
-  "credit",
-  "investment",
-  "loan",
-];
-
-export const CATEGORY_KINDS: readonly Category["kind"][] = ["income", "expense"];
-
-export const TRANSACTION_KINDS: readonly TransactionKind[] = [
-  "income",
-  "expense",
-  "refund",
-  "transfer",
-  "credit_card_payment",
-];
-
-export const BILL_FREQUENCIES: readonly BillFrequency[] = ["weekly", "biweekly", "monthly", "yearly"];
 
 // ============================================================
 // Row → DTO

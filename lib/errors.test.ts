@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   AppError,
+  conflict,
   dataIntegrity,
   forbidden,
+  invalidInput,
   isAppError,
   notFound,
   unauthorized,
@@ -66,12 +68,29 @@ describe("factories", () => {
     expect(notFound().code).toBe("not_found");
   });
 
+  it("conflict() produces the conflict code", () => {
+    expect(conflict().code).toBe("conflict");
+  });
+
+  it("invalidInput() produces the invalid_input code", () => {
+    expect(invalidInput().code).toBe("invalid_input");
+  });
+
   it("dataIntegrity() produces the data_integrity code", () => {
     expect(dataIntegrity().code).toBe("data_integrity");
   });
 
   it("unavailable() produces the unavailable code", () => {
     expect(unavailable().code).toBe("unavailable");
+  });
+
+  it("the write-side factories keep the value out of the message and in the cause", () => {
+    // A unique violation quotes the colliding value; a check violation quotes
+    // the failing row. Both stay in `cause`, which is server-side only.
+    const raw = { code: "23505", details: "Key (name)=(Chase Checking) already exists." };
+    const error = conflict("Conflicts with existing accounts.", { cause: raw });
+    expect(error.message).not.toContain("Chase Checking");
+    expect(error.cause).toBe(raw);
   });
 
   it("factories accept a custom message and cause", () => {
