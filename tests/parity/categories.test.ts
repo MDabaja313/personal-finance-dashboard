@@ -30,4 +30,21 @@ describe("getCategories parity", () => {
     expect(actual).toEqual(expected);
     expect(actual).toHaveLength(expected.length);
   });
+
+  it("exposes archive state from the database, without filtering on it", async () => {
+    // Phase 7 CP2 added `isArchived` to the Category DTO. Two properties, and
+    // the second is the one that could regress silently: the flag must come
+    // from the row (not be defaulted in the mapper), and exposing it must not
+    // turn into filtering by it — an archived category is what resolves the
+    // label on a historical transaction, so the count must stay the oracle's.
+    const actual = await getCategories();
+
+    for (const category of actual) {
+      expect(typeof category.isArchived, `${category.name} carries a boolean archive flag`).toBe(
+        "boolean"
+      );
+    }
+
+    expect(actual).toHaveLength((await oracle.getCategories()).length);
+  });
 });

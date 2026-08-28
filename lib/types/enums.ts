@@ -37,6 +37,26 @@ export const ACCOUNT_TYPES: readonly AccountType[] = [
   "loan",
 ];
 
+/**
+ * Which optional account columns a given type may carry at all — the TypeScript
+ * mirror of `accounts_credit_limit_domain_ck` and
+ * `accounts_interest_rate_domain_ck`.
+ *
+ * Here rather than in `lib/validation/accounts.ts` for the same reason the enum
+ * lists are here: two layers need the identical rule and `lib/types` is the one
+ * both may import. The account form renders a field only where the type permits
+ * it, the schema rejects one supplied where it does not, and a component
+ * importing `lib/validation/**` directly would pull Zod into the client bundle
+ * for what is a two-line predicate.
+ */
+export function allowsCreditLimit(type: AccountType): boolean {
+  return type === "credit";
+}
+
+export function allowsInterestRate(type: AccountType): boolean {
+  return type === "credit" || type === "loan";
+}
+
 /** `public.category_kind`. */
 export const CATEGORY_KINDS: readonly Category["kind"][] = ["income", "expense"];
 

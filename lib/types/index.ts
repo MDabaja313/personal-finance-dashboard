@@ -44,6 +44,13 @@ export interface Category {
   id: string;
   name: string;
   kind: "income" | "expense";
+  /**
+   * Archived categories stay readable and keep resolving names for the
+   * historical rows that reference them — `getCategories()` deliberately
+   * returns them. The flag is what lets a management surface show archive
+   * state while a future new-entry picker hides archived options.
+   */
+  isArchived: boolean;
 }
 
 /**

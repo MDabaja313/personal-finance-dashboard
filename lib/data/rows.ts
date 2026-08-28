@@ -64,16 +64,20 @@ export interface AccountBalanceRow {
 }
 
 /**
- * `public.categories`. `is_archived` exists on the table but is not selected:
- * the `Category` DTO has no archived field, and this list resolves category
- * *names* for historical transactions — filtering archived rows out would
- * blank the labels on old rows.
+ * `public.categories`.
+ *
+ * `is_archived` is selected as of Phase 7 CP2. Archived rows are still
+ * *returned* — this list resolves category names for historical transactions,
+ * and filtering them out would blank the labels on old rows — but the DTO now
+ * carries the flag, so a management surface can show archive state and a
+ * future new-entry picker can hide archived options.
  */
 export interface CategoryRow {
   id: string;
   name: string;
   /** `public.category_kind` — 'income' | 'expense'. */
   kind: string;
+  is_archived: boolean;
 }
 
 /**

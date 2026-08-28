@@ -13,7 +13,7 @@
 -- a missing policy on a granted table would silently return zero rows,
 -- which a bare success check could not distinguish from an empty table.
 begin;
-select plan(38);
+select plan(39);
 
 insert into auth.users (id, aud, role, email) values
   ('17000000-0000-4000-8000-000000000001', 'authenticated', 'authenticated', 'priv-test@local.test');
@@ -74,10 +74,26 @@ select is(
        'public.validate_profile_timezone()'::regprocedure,
        'public.validate_movement()'::regprocedure,
        'public.guard_bill_occurrence_delete()'::regprocedure,
-       'private.next_bill_occurrence_date(date,public.bill_frequency,date)'::regprocedure
+       'private.next_bill_occurrence_date(date,public.bill_frequency,date)'::regprocedure,
+       -- Phase 7 CP2.
+       'public.accounts_guard_update()'::regprocedure,
+       'public.guard_category_kind_change()'::regprocedure
      )),
-  5,
-  'all 5 invoker functions are SECURITY INVOKER (prosecdef = false)'
+  7,
+  'all 7 invoker functions are SECURITY INVOKER (prosecdef = false)'
+);
+
+-- The two CP2 guards are trigger functions and are never called
+-- directly. `authenticated` reaching them by name would be a way to run
+-- their body outside a trigger context, so EXECUTE is revoked from it
+-- explicitly in the migration as well as by the Phase 4 default-privilege
+-- posture -- asserted here rather than assumed.
+select ok(
+  not has_function_privilege('authenticated', 'public.accounts_guard_update()'::regprocedure, 'execute')
+  and not has_function_privilege('authenticated', 'public.guard_category_kind_change()'::regprocedure, 'execute')
+  and not has_function_privilege('anon', 'public.accounts_guard_update()'::regprocedure, 'execute')
+  and not has_function_privilege('anon', 'public.guard_category_kind_change()'::regprocedure, 'execute'),
+  'neither application role can EXECUTE the two CP2 write-guard functions'
 );
 
 select ok(

@@ -1,7 +1,7 @@
 -- Object inventory: every enum, table, view, index, and function exists
 -- with the correct security context.
 begin;
-select plan(37);
+select plan(39);
 
 -- Enums (6)
 select has_type('public', 'account_type', 'account_type enum exists');
@@ -56,6 +56,21 @@ select is(
   (select prosecdef from pg_proc where oid = 'private.next_bill_occurrence_date(date,public.bill_frequency,date)'::regprocedure),
   false,
   'next_bill_occurrence_date is SECURITY INVOKER'
+);
+
+-- Phase 7 CP2's two write guards. SECURITY INVOKER like every other
+-- trigger function here: both are reachable from `authenticated`'s own
+-- writes, and a definer context would hand a browser-reachable path
+-- privileges it has no use for.
+select is(
+  (select prosecdef from pg_proc where oid = 'public.accounts_guard_update()'::regprocedure),
+  false,
+  'accounts_guard_update is SECURITY INVOKER'
+);
+select is(
+  (select prosecdef from pg_proc where oid = 'public.guard_category_kind_change()'::regprocedure),
+  false,
+  'guard_category_kind_change is SECURITY INVOKER'
 );
 
 -- Three SECURITY DEFINER system functions (prosecdef = true), owned by finance_snapshot_writer

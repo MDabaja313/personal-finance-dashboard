@@ -173,12 +173,20 @@ export function toAccount(row: AccountBalanceRow): Account {
   };
 }
 
-/** `categories` row → `Category`. `is_archived` is not selected or exposed. */
+/**
+ * `categories` row → `Category`.
+ *
+ * `isArchived` is exposed as of Phase 7 CP2. It filters nothing here: archived
+ * categories are still returned, because they are what resolves the label on a
+ * historical transaction. The flag only tells a caller which of them to keep
+ * out of a *new-entry* picker.
+ */
 export function toCategory(row: CategoryRow): Category {
   return {
     id: row.id,
     name: row.name,
     kind: enumFrom(row.kind, CATEGORY_KINDS, "categories.kind"),
+    isArchived: row.is_archived,
   };
 }
 

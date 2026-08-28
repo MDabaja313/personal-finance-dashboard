@@ -365,8 +365,17 @@ describe("write-boundary source posture", () => {
     // Stated as an allowlist rather than a blocklist: this layer's purity is
     // the reason it can be trusted at the untrusted-input boundary, and a new
     // dependency here should be a deliberate decision, not a drive-by import.
+    //
+    // `@/lib/types/*` is included alongside `@/lib/types` because the enum
+    // label sets and the account-type domain predicates live in
+    // `lib/types/enums.ts` — the one layer both this validator and the DB-row
+    // mappers may import, so a label set has a single definition. Nothing under
+    // lib/types carries a client, a clock, or an env read.
     const ALLOWED = (specifier: string) =>
-      specifier === "zod" || specifier === "@/lib/types" || specifier.startsWith("@/lib/validation/");
+      specifier === "zod" ||
+      specifier === "@/lib/types" ||
+      specifier.startsWith("@/lib/types/") ||
+      specifier.startsWith("@/lib/validation/");
 
     const offenders = filesWithCode
       .filter(({ repoPath }) => repoPath.startsWith("lib/validation/"))
@@ -395,43 +404,95 @@ describe("write-boundary source posture", () => {
   });
 });
 
-describe("CP1 remains read-only", () => {
-  it("has no Server Action outside the auth ones", () => {
-    // 'use server' marks a file whose exports are independently reachable
-    // HTTP endpoints. CP1 adds the foundation for writes and no writes: the
-    // only such file in the application is still lib/auth/actions.ts.
+describe("CP2 write surface is exactly accounts + categories", () => {
+  // CP1's version of this block asserted the application was still entirely
+  // read-only. CP2 opens exactly two domains, so the assertions become an
+  // allowlist rather than an emptiness check — the point is unchanged: the set
+  // of writable things is a checked fact, and adding a third one cannot happen
+  // quietly.
+
+  it("has Server Actions only for auth, accounts, and categories", () => {
+    // 'use server' marks a file whose exports are independently reachable HTTP
+    // endpoints. Every one of them is a new attack surface, so the list is
+    // enumerated rather than bounded.
     const serverActionFiles = filesWithCode
       .filter(({ code }) => /^\s*["']use server["']/m.test(code))
-      .map(({ repoPath }) => repoPath);
+      .map(({ repoPath }) => repoPath)
+      .sort();
 
-    expect(serverActionFiles).toEqual(["lib/auth/actions.ts"]);
+    expect(serverActionFiles).toEqual([
+      "lib/actions/accounts.ts",
+      "lib/actions/categories.ts",
+      "lib/auth/actions.ts",
+    ]);
   });
 
-  it("has no mutation DAL layer yet", () => {
-    // lib/data/mutations/** is fenced before it exists, exactly as
-    // lib/supabase/** was in Phase 2. CP2 creates it.
+  it("has mutation DAL modules only for accounts and categories", () => {
     const mutationModules = filesWithCode
       .map(({ repoPath }) => repoPath)
-      .filter((repoPath) => repoPath.startsWith("lib/data/mutations/"));
+      .filter((repoPath) => repoPath.startsWith("lib/data/mutations/"))
+      .sort();
 
-    expect(mutationModules).toEqual([]);
+    expect(mutationModules).toEqual([
+      "lib/data/mutations/accounts.ts",
+      "lib/data/mutations/categories.ts",
+    ]);
   });
 
-  it("issues no PostgREST insert/update/upsert/delete in the data or action layers", () => {
-    // The PostgREST write verbs. None may appear while the app is read-only —
-    // and `authenticated` has no write GRANT to satisfy one anyway (see
-    // supabase/tests/database/100-write-grants.sql).
+  it("issues PostgREST writes only from lib/data/mutations/**", () => {
+    // The PostgREST write verbs. A read module or an action that reached for
+    // one would be writing outside the one layer where auth re-verification,
+    // owner predicates, and the write error mapper live.
     //
-    // Scoped to the two layers that can reach a client at all. A repo-wide
-    // scan would be a worse test, not a stricter one: `.delete(` is also
+    // Scoped to the layers that can reach a client at all. A repo-wide scan
+    // would be a worse test, not a stricter one: `.delete(` is also
     // URLSearchParams' and Map's own method (components/transactions/
     // transaction-filters.tsx legitimately calls `params.delete(...)`), and a
     // check that has to be muted for false positives stops being trusted.
     const offenders = filesWithCode
-      .filter(({ repoPath }) => repoPath.startsWith("lib/data/") || repoPath.startsWith("lib/actions/"))
+      .filter(
+        ({ repoPath }) =>
+          (repoPath.startsWith("lib/data/") && !repoPath.startsWith("lib/data/mutations/")) ||
+          repoPath.startsWith("lib/actions/")
+      )
       .filter(({ code }) => /\.(insert|update|upsert|delete)\s*\(/.test(code))
       .map(({ repoPath }) => repoPath);
 
     expect(offenders).toEqual([]);
+  });
+
+  it("never issues a PostgREST delete, anywhere", () => {
+    // No table has a DELETE grant for `authenticated`, and no mutation asks
+    // for one: accounts and categories are archived, never removed. This is
+    // the source-side half of that claim; the privilege-side half is
+    // supabase/tests/database/100-write-grants.sql.
+    const offenders = filesWithCode
+      .filter(({ repoPath }) => repoPath.startsWith("lib/data/mutations/"))
+      .filter(({ code }) => /\.delete\s*\(/.test(code))
+      .map(({ repoPath }) => repoPath);
+
+    expect(offenders).toEqual([]);
+  });
+
+  it("writes to no table other than accounts and categories", () => {
+    // Every `.from("...")` in the mutation layer, enumerated. The read probes
+    // (transactions/budgets/bills, for the preflights) are legitimate and
+    // appear here too — this asserts the *set of relations the layer touches*,
+    // which is the number that must not grow silently.
+    const relations = new Set<string>();
+
+    for (const { repoPath, code } of filesWithCode) {
+      if (!repoPath.startsWith("lib/data/mutations/")) continue;
+      for (const match of code.matchAll(/\.from\(\s*["'`]([a-z_]+)["'`]/g)) relations.add(match[1]);
+    }
+
+    expect([...relations].sort()).toEqual([
+      "account_balances",
+      "accounts",
+      "bills",
+      "budgets",
+      "categories",
+      "transactions",
+    ]);
   });
 });

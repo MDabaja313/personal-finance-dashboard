@@ -418,14 +418,69 @@ only; no production code imports it.
 cumulative "Load more" reveal window described above resolves this — no route makes an unbounded
 `getTransactions()` call.
 
-## Phase 7 — Mutations
+## Phase 7 — Mutations 🚧 in progress
 
-Not yet started. Server Actions and forms, re-verifying auth and row ownership inside the DAL —
-Server Actions are independently reachable endpoints, so the same unconditional `getOwnerId()`
-pattern Phase 6 established for reads applies to every write. Narrowly-scoped write RLS policies
-and object grants added per mutation as it's built (§3/§4 of `docs/rls-policies.md` already record
-the intended eventual policy matrix). Zod introduced at this untrusted-input boundary. Scope
-includes accounts, categories, transactions, transfers/credit-card payments, budgets, bills/
-occurrences (including the `BillOccurrence` DTO and mark-as-paid UI), goals/contributions
-(goal-contribution INSERT UI, respecting the append-only model), and reconciliation/adjustments
-where designed. Detailed design is deferred to when Phase 7 actually starts, not settled here.
+Checkpoints 1 and 2 are complete. **CP3 has not started.**
+
+### CP1 — Write foundation ✅ (no migration, no write grant, no mutating code)
+
+The reusable pieces every later checkpoint builds on: `lib/validation/**` (Zod at the untrusted-input
+boundary — `parseMoneyToCents` never constructs a float, `zNotFuture(today)` takes `today` as a
+parameter), the `ActionState`/`attempt()` contract (`lib/actions/**`, with a fixed six-sentence
+message table and no `NEXT_*` digest inspection), `mapWriteError()` plus the `conflict`/
+`invalid_input` error codes, the enum label sets in `lib/types/enums.ts`, and the ESLint fences
+around all of it — proven to actually fire by `lib/write-posture.test.ts`, which lints negative
+probes through the repo's real config rather than trusting the config to be correct.
+
+### CP2 — Accounts + categories ✅
+
+**The owner can create, edit, and archive/unarchive accounts and categories. Nothing else became
+writable.**
+
+- **One additive migration**, `20260827120001_account_category_writes.sql`. No Phase 4 migration was
+  edited. It grants `authenticated` **column-scoped** `INSERT`/`UPDATE` on exactly `accounts` and
+  `categories`, adds four operation-specific RLS policies (`INSERT … WITH CHECK`,
+  `UPDATE … USING + WITH CHECK`), and creates two `BEFORE UPDATE` guard triggers. **No `DELETE`
+  grant anywhere, no `FOR ALL` policy anywhere, and `anon` is not named once.** The column lists and
+  their rationale are in [docs/rls-policies.md §3](docs/rls-policies.md).
+- **`accounts_guard_update()`** — type immutable; `opening_balance_cents` editable only while the
+  account has zero transactions (it is the only stored balance figure, so editing it later restates
+  history, including written snapshots); archiving requires a **derived** balance of exactly zero,
+  while unarchiving is unconditional.
+- **`guard_category_kind_change()`** — `kind` is immutable once the category is referenced by any
+  `transactions`, `budgets`, or `bills` row; rename and archive stay available. This is a database
+  invariant because `authenticated` now holds a direct `UPDATE (kind)` privilege, and `kind` is what
+  separates income from spending in every rollup.
+- **Layering:** `lib/actions/{accounts,categories}.ts` validate, run the mutation inside `attempt()`,
+  turn `unauthenticated` into `redirect("/login")`, and revalidate precisely (`/accounts`,
+  `/dashboard`, `/analytics`; `/transactions`, `/budgets`, `/dashboard`, `/analytics`) — never
+  `revalidatePath("/")`. `lib/data/mutations/**` is the only layer issuing PostgREST writes, never
+  takes an owner id from its caller, and is fenced away from `next/navigation`/`next/cache`.
+- **Read-side change:** `Category` gained `isArchived`. Read *semantics* are unchanged — archived
+  categories are still returned, because they resolve the labels on historical transactions — the
+  flag simply became visible so a management view can show it and a future entry picker can hide it.
+- **Deliberate limitation:** the account edit form's opening-balance field is optional and blank
+  means "unchanged". `Account` exposes the *derived* balance, not the stored opening figure, and
+  widening the DTO would force the fixture oracle to invent the seed's back-computed opening
+  balances. Prefilling with the derived balance would be worse: it would silently restate an
+  account's history on any save. Revisit alongside the balance-adjustment/reconciliation work.
+- **UI:** account management on `/accounts` (create disclosure, per-card edit, archive/unarchive);
+  category management as one section of the existing `/settings` page — no new route and no settings
+  sub-system, since a route built for one list would be dismantled the moment budgets and bills need
+  managing. Plain `<form>` + `useActionState` throughout; no form library.
+- **`npm run test:mutations`** (`vitest.mutations.config.ts`, `tests/mutations/**`) — the integration
+  harness. Rebuilds the local database, signs in as the real owner, and drives the real Server
+  Actions, mutation DAL, and production read DAL; mocks only `lib/data/supabase.ts` plus
+  `next/cache`/`next/navigation`, and records those two rather than no-oping them so revalidation
+  targets are asserted. Refuses to run against a non-loopback URL. Serial.
+
+### Remaining — CP3 onward, not started
+
+Every other finance domain is still read-only, and its grants and policies land only alongside the
+feature that needs them: transactions, transfers/credit-card payments, budgets, bills/occurrences
+(including the `BillOccurrence` DTO and mark-as-paid UI), goals/contributions (INSERT only,
+respecting the append-only model), and reconciliation/adjustments where designed. The same rules
+hold throughout — Server Actions are independently reachable endpoints, so the unconditional
+`getOwnerId()` pattern Phase 6 established for reads applies to every write; narrowly-scoped write
+RLS policies and object grants are added per mutation as it's built; §3/§4 of
+`docs/rls-policies.md` records the intended eventual policy matrix.

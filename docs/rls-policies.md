@@ -85,22 +85,50 @@ naming precisely, since "leaks every row" and "returns zero rows" call for very 
 
 ---
 
-## 3. Least-privilege grants, Phases 4–6
+## 3. Least-privilege grants
 
 | Role | Table/view access | INSERT | UPDATE | DELETE |
 |---|---|---|---|---|
 | `anon` | **None** on any user-financial table or view. | ❌ | ❌ | ❌ |
-| `authenticated` | `SELECT` only, on the tables/views the application actually reads. | ❌ | ❌ | ❌ |
+| `authenticated` | `SELECT` on the tables/views the application actually reads, plus **column-scoped** `INSERT`/`UPDATE` on `accounts` and `categories` only. | accounts, categories | accounts, categories | ❌ **nothing, anywhere** |
 
-This holds for the entire read-only period of the roadmap — Phases 4, 5, and 6. There is no
-mutation UI, no Server Action, and no application code path that writes to the database before
-Phase 7, so there is no reason for `authenticated` to hold `INSERT`/`UPDATE`/`DELETE` grants on
-anything before then. Granting them "in case" would hand a compromised or misused browser session
-write access years before the application uses it.
+Through Phases 4, 5, and 6 this was `SELECT` only, without exception: there was no mutation UI, no
+Server Action, and no application code path that wrote to the database, so there was no reason for
+`authenticated` to hold write grants on anything. Granting them "in case" would have handed a
+compromised or misused browser session write access years before the application used it.
 
 **Phase 7 adds object grants and operation-specific RLS policies together, per mutation, as each
-one is actually implemented** — never in advance of the corresponding feature. See §4's matrix
-for which operation lands with which future feature.
+one is actually implemented** — never in advance of the corresponding feature. See §4's matrix for
+which operation lands with which feature.
+
+### What Phase 7 CP2 actually granted
+
+`supabase/migrations/20260827120001_account_category_writes.sql`, and nothing else so far. Every
+grant is column-scoped (see §4 for why that is a `GRANT` concern and not an RLS one):
+
+| Table | `INSERT` columns | `UPDATE` columns |
+|---|---|---|
+| `accounts` | `user_id`, `name`, `institution`, `type`, `opening_balance_cents`, `credit_limit_cents`, `interest_rate_bps` | `name`, `institution`, `credit_limit_cents`, `interest_rate_bps`, `opening_balance_cents`, `is_archived` |
+| `categories` | `user_id`, `name`, `kind` | `name`, `kind`, `is_archived` |
+
+The exclusions carry the design:
+
+- **`id` and `created_at` are in neither list.** Both have defaults, and a column absent from a
+  column-scoped `INSERT` grant simply takes its default rather than failing — so omitting them
+  costs nothing and removes any way to choose a row's id or backdate it.
+- **`user_id` is `INSERT`-only.** The ownership predicate needs it assignable for a row to be
+  insertable at all; leaving it out of `UPDATE` is what makes re-homing a row unreachable rather
+  than merely policy-checked.
+- **`accounts.type` is `INSERT`-only** — it decides asset/liability classification, which optional
+  columns are even legal, and how every historical snapshot already classified the account.
+  `categories.kind` *is* updatable, but only while the category is unreferenced
+  (`guard_category_kind_change()`; see database-schema.md §6).
+- **`is_archived` is `UPDATE`-only on both.** Neither may be *created* already archived.
+- **No `DELETE` grant on either table**, matching §4's "prefer archive" row.
+
+`anon` is not named in a single GRANT or policy in that migration. The complete privilege matrix
+is asserted table by table and column by column in
+`supabase/tests/database/100-write-grants.sql`, which also proves its own table list is complete.
 
 Functions/RPCs (the snapshot writer, the timezone-validation trigger function) get `EXECUTE`
 revoked from `PUBLIC` by default — see §11.
@@ -121,8 +149,8 @@ Combined with §3's grants, this table is the intended eventual policy matrix �
 | Table | SELECT | INSERT | UPDATE | DELETE |
 |---|---|---|---|---|
 | `profiles` | own row | ❌ never — provisioning/admin creates it, not the application | Phase 7, **column-scoped to `timezone` only** (see below) | ❌ never |
-| `accounts` | own rows | Phase 7 | Phase 7 | ❌ prefer archive (`is_archived`) over delete |
-| `categories` | own rows | Phase 7 | Phase 7, including archive | ❌ no routine hard delete while referenced |
+| `accounts` | own rows | ✅ **CP2** (`accounts_insert_own`) | ✅ **CP2**, incl. archive (`accounts_update_own`) | ❌ prefer archive (`is_archived`) over delete |
+| `categories` | own rows | ✅ **CP2** (`categories_insert_own`) | ✅ **CP2**, including archive (`categories_update_own`) | ❌ no routine hard delete while referenced |
 | `transactions` | own rows | Phase 7 | Phase 7 | Phase 7, non-movement rows only |
 | `movements` | own rows | Phase 7 | ❌ never | Phase 7 — cascades both legs |
 | `budgets` | own rows | Phase 7 | Phase 7 | Phase 7, only if deliberately needed |
@@ -149,6 +177,20 @@ row, including ones the application never intends to expose. The column restrict
 `GRANT UPDATE (timezone) ON profiles TO authenticated`-style column-level grant, applied when
 Phase 7 builds that feature. Documenting this now so it isn't mistaken for something the RLS
 policy alone will cover.
+
+Phase 7 CP2 is the first place this actually landed — see §3's column tables for `accounts` and
+`categories`. Two consequences worth recording, both learned by building it:
+
+- The `UPDATE` policies take **both** `USING` and `WITH CHECK`. `USING` decides which existing
+  rows the statement may touch; `WITH CHECK` decides what they may look like afterwards. With
+  `USING` alone, an owned row could be updated into a shape no longer satisfying the predicate.
+  `user_id` is not in the `UPDATE` grant, so that is already unreachable — but a policy that
+  depends on a grant's column list for its own correctness is one edit away from being wrong.
+- `has_table_privilege(role, table, 'insert')` is **false** for a role holding only column
+  privileges, so a posture test written with it would report "zero write grants" on a
+  demonstrably writable table. `has_any_column_privilege()` is the right function, except for
+  `DELETE`, which has no column-level form at all and raises "unrecognized privilege type" if
+  asked. `supabase/tests/database/100-write-grants.sql` uses each accordingly.
 
 ---
 

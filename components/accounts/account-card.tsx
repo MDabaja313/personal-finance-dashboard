@@ -1,3 +1,5 @@
+import { AccountCardActions } from "@/components/accounts/account-card-actions";
+import type { AccountMutationActions } from "@/components/accounts/types";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { availableCredit } from "@/lib/finance/accounts";
@@ -18,7 +20,18 @@ function formatInterestRate(bps: number): string {
   return `${(bps / 100).toFixed(2)}% APR`;
 }
 
-export function AccountCard({ account }: { account: Account }) {
+/**
+ * `actions` is optional so the card stays usable as a pure display component.
+ * `/accounts` is the management surface and passes them; anywhere else that
+ * renders an account can omit them and get read-only output.
+ */
+export function AccountCard({
+  account,
+  actions,
+}: {
+  account: Account;
+  actions?: AccountMutationActions;
+}) {
   const credit = availableCredit(account);
 
   return (
@@ -52,6 +65,7 @@ export function AccountCard({ account }: { account: Account }) {
             {formatInterestRate(account.interestRateBps)}
           </p>
         )}
+        {actions && <AccountCardActions account={account} actions={actions} />}
       </CardContent>
     </Card>
   );

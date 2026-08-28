@@ -339,6 +339,31 @@ eligibility depends on the row's `status` at delete time, which is a delete-oper
 a same-row insert/update invariant. Specified in full in §13; noted here so the constraint list
 and the trigger list aren't confused for one another.
 
+### Write-guard triggers (Phase 7 CP2) — also not `CHECK`s
+
+Two `BEFORE UPDATE` triggers were added when `authenticated` first gained write privileges on
+`accounts` and `categories`
+(`supabase/migrations/20260827120001_account_category_writes.sql`). Both express rules a `CHECK`
+cannot: each compares `NEW` against `OLD`, and two of the three consult other tables.
+
+- **`accounts_guard_update()`** — (1) `type` is immutable once the account exists; (2)
+  `opening_balance_cents` may change only while the account has **zero** transactions, since it is
+  the only stored balance figure and editing it retroactively restates every balance that account
+  has ever reported (§11), including ones already written into `net_worth_snapshots`; (3) the
+  `is_archived` `false → true` transition requires a **derived** balance of exactly zero
+  (`opening_balance_cents + SUM(that account's transactions)`), because an archived account is
+  excluded from net worth and from the asset/liability totals. Unarchiving is unconditional — it
+  can only restore a figure to the totals, never hide one.
+- **`guard_category_kind_change()`** — `kind` may change only while the category is referenced by
+  no row in `transactions.category_id`, `budgets.category_id`, or `bills.category_id`. `kind` is
+  what separates income from spending in every rollup, so changing it on a category with history
+  silently reclassifies settled figures. Rename and archive stay available to referenced
+  categories: the rule is scoped to the one column.
+
+Both are `SECURITY INVOKER` with `search_path = ''`, have `EXECUTE` revoked from `PUBLIC`/`anon`/
+`authenticated`, and fire on `UPDATE` only — so neither affects the whole-user teardown cascade
+(§5). Tests: `supabase/tests/database/120-account-guard.sql`, `130-category-guard.sql`.
+
 ### Deliberately absent constraints
 
 - **No global `amount_cents <> 0` on `transactions`.** Would reject the legal zero-amount fixture

@@ -1,7 +1,9 @@
 -- Row Level Security: ownership isolation on the 10 grant-bearing
 -- tables, movements' deliberate GRANT-layer exclusion, anon's total
--- exclusion, write-denial for authenticated, and both security_invoker
--- views. All fixture setup runs as the migration owner (postgres has
+-- exclusion, write-denial for authenticated on every table Phase 7 CP2
+-- did NOT open (accounts and categories are covered by 100/110/120/130
+-- instead), and both security_invoker views. All fixture setup runs as
+-- the migration owner (postgres has
 -- BYPASSRLS, so it bypasses FORCE ROW LEVEL SECURITY entirely -- the
 -- same reason 020/030/040/050 could seed rows directly). Role/claim
 -- switches use the verified local auth.uid() form:
@@ -138,10 +140,16 @@ select is(
 -- operation and a representative spread of tables -- no write GRANT
 -- exists on any table through Phase 6, so every attempt fails 42501
 -- regardless of ownership.
+-- Phase 7 CP2 gave `authenticated` column-scoped INSERT/UPDATE on
+-- accounts and categories, so this file no longer asserts blanket
+-- write-denial on those two -- their full grant, RLS, and trigger
+-- behavior is 100/110/120/130. Every *other* table is still read-only
+-- for this role, which is what the spread below covers. budgets stands
+-- in here for the table this assertion used to name.
 select throws_ok(
-  $$ insert into public.accounts (id, user_id, name, institution, type, opening_balance_cents) values ('14000000-0000-4000-8000-0000000000a3', '14000000-0000-4000-8000-000000000001', 'X', 'Bank', 'checking', 0) $$,
+  $$ insert into public.budgets (id, user_id, category_id, period, limit_cents) values ('14000000-0000-4000-8000-0000000000b3', '14000000-0000-4000-8000-000000000001', '14000000-0000-4000-8000-0000000000c1', '2026-02', 1000) $$,
   '42501', null,
-  'authenticated INSERT on accounts (even own row) is denied at the GRANT layer'
+  'authenticated INSERT on budgets (even own row) is denied at the GRANT layer'
 );
 select throws_ok(
   $$ update public.transactions set merchant = 'changed' where id = '14000000-0000-4000-8000-000000000101' $$,
