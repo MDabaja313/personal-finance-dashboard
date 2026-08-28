@@ -1,7 +1,7 @@
 -- Object inventory: every enum, table, view, index, and function exists
 -- with the correct security context.
 begin;
-select plan(39);
+select plan(40);
 
 -- Enums (6)
 select has_type('public', 'account_type', 'account_type enum exists');
@@ -47,7 +47,8 @@ select has_check('public', 'transactions', 'transactions has a CHECK constraint'
 select has_check('public', 'net_worth_snapshots', 'net_worth_snapshots has a CHECK constraint');
 select col_is_pk('public', 'net_worth_snapshots', array['user_id', 'month'], 'net_worth_snapshots PK is (user_id, month)');
 
--- Five SECURITY INVOKER functions (prosecdef = false)
+-- SECURITY INVOKER functions (prosecdef = false) -- five from Phase 4,
+-- two from CP2, one from CP3
 select is((select prosecdef from pg_proc where oid = 'public.set_updated_at()'::regprocedure), false, 'set_updated_at is SECURITY INVOKER');
 select is((select prosecdef from pg_proc where oid = 'public.validate_profile_timezone()'::regprocedure), false, 'validate_profile_timezone is SECURITY INVOKER');
 select is((select prosecdef from pg_proc where oid = 'public.validate_movement()'::regprocedure), false, 'validate_movement is SECURITY INVOKER');
@@ -71,6 +72,17 @@ select is(
   (select prosecdef from pg_proc where oid = 'public.guard_category_kind_change()'::regprocedure),
   false,
   'guard_category_kind_change is SECURITY INVOKER'
+);
+
+-- Phase 7 CP3's transaction guard, SECURITY INVOKER for the same reason:
+-- under FORCE RLS the invoker sees its own profile, accounts and
+-- categories, which is exactly the scope every lookup in it wants. A
+-- definer context would hand a browser-reachable INSERT/UPDATE path
+-- privileges it has no use for.
+select is(
+  (select prosecdef from pg_proc where oid = 'public.assert_transaction_refs()'::regprocedure),
+  false,
+  'assert_transaction_refs is SECURITY INVOKER'
 );
 
 -- Three SECURITY DEFINER system functions (prosecdef = true), owned by finance_snapshot_writer

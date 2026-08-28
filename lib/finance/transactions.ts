@@ -4,13 +4,25 @@ import { toCents, type Cents, type MonthKey, type Transaction } from "@/lib/type
 
 /**
  * `transfer` and `credit_card_payment` move money between two owned
- * accounts — they are never spending, regardless of amount or sign.
+ * accounts — they are never spending, regardless of amount or sign. Nor is
+ * `adjustment`: it reconciles an account's balance to reality rather than
+ * recording an economic event, carries no category by construction
+ * (`transactions_adjustment_no_category_ck`), and counting it would attribute a
+ * reconciliation difference to a month's spending.
+ *
+ * Stated as an allowlist of the two kinds that *are* spending, so a kind added
+ * to the enum later is excluded until someone decides otherwise — the safe
+ * default for a figure every budget and chart is built on.
  */
 export function countsAsSpending(transaction: Transaction): boolean {
   return transaction.kind === "expense" || transaction.kind === "refund";
 }
 
-/** A refund is not income — it only reduces its category's spend. */
+/**
+ * A refund is not income — it only reduces its category's spend. Neither is an
+ * `adjustment`: a reconciliation that happens to be positive is not money
+ * earned, and treating it as income would inflate the savings rate.
+ */
 export function countsAsIncome(transaction: Transaction): boolean {
   return transaction.kind === "income";
 }

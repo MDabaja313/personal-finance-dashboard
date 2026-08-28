@@ -1,12 +1,13 @@
 import Link from "next/link";
-import type { TransactionRow } from "@/components/transactions/types";
+import type { TransactionDisplayRow } from "@/components/transactions/types";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
 import { formatCentsSigned } from "@/lib/format/currency";
 import { formatCalendarDate } from "@/lib/format/date";
+import { isMovementKind } from "@/lib/types/enums";
 import { cn } from "@/lib/utils";
 
-export function RecentTransactions({ rows }: { rows: TransactionRow[] }) {
+export function RecentTransactions({ rows }: { rows: TransactionDisplayRow[] }) {
   return (
     <Card>
       <CardHeader className="flex flex-row items-center justify-between">
@@ -20,7 +21,9 @@ export function RecentTransactions({ rows }: { rows: TransactionRow[] }) {
           <p className="text-sm text-muted-foreground">No transactions yet.</p>
         ) : (
           rows.map((row, index) => {
-            const isMovement = row.kind === "transfer" || row.kind === "credit_card_payment";
+            // Movement legs and adjustments alike: neither is spending or
+            // income, so neither takes the amount's signed colouring.
+            const isMovement = isMovementKind(row.kind) || row.kind === "adjustment";
             return (
               <div key={row.id}>
                 {index > 0 && <Separator className="my-3" />}

@@ -1,0 +1,41 @@
+-- Phase 7 Checkpoint 3, migration M10: one new `transaction_kind` label.
+--
+-- This migration contains exactly one statement, and that is the whole
+-- point of it existing separately.
+--
+-- `ALTER TYPE ... ADD VALUE` may run inside a transaction block on
+-- PostgreSQL 12+, but the value it adds **cannot be used by any other
+-- statement in that same transaction** -- not in a CHECK constraint, not
+-- in a function body that is validated at creation, not in a policy
+-- predicate. The Supabase CLI applies each migration file in its own
+-- transaction, so the only way to add a label and then use it is to put
+-- the two in different files. M11a
+-- (20260828120002_transaction_writes.sql) is that second file, and it
+-- references 'adjustment' freely because this one has already committed.
+--
+-- Appending rather than inserting: `ADD VALUE` with no BEFORE/AFTER puts
+-- the label last in the enum's sort order, which keeps every existing
+-- label's ordinal unchanged. `lib/types/enums.ts` mirrors that order and
+-- `lib/types/enums.test.ts` parses this file to prove the mirror is
+-- exact, so the position is a checked fact rather than a convention.
+--
+-- What this label does NOT do, stated here because a bare `ADD VALUE` is
+-- easy to mistake for a feature:
+--
+--   * It creates no way to enter an adjustment. The CP3 ordinary
+--     create/edit form accepts income/expense/refund only
+--     (`ORDINARY_TRANSACTION_KINDS` in lib/types/enums.ts,
+--     `zOrdinaryTransactionKind` in lib/validation/transactions.ts), and
+--     M11a's UPDATE policy makes an adjustment row non-editable in the
+--     database regardless of what any caller asks for.
+--   * Reconciliation -- the mechanism that will actually *write*
+--     adjustment rows -- is CP5. This label lands now so that the read
+--     path, the DTO union, the filters, and the badge can all handle an
+--     adjustment row safely before one can ever exist, rather than being
+--     retrofitted around live data later.
+--
+-- The read side is therefore complete for adjustments as of CP3
+-- (readable, filterable, badged) while the write side is deliberately
+-- closed.
+
+alter type public.transaction_kind add value 'adjustment';

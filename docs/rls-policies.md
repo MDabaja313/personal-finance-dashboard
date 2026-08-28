@@ -90,7 +90,7 @@ naming precisely, since "leaks every row" and "returns zero rows" call for very 
 | Role | Table/view access | INSERT | UPDATE | DELETE |
 |---|---|---|---|---|
 | `anon` | **None** on any user-financial table or view. | ❌ | ❌ | ❌ |
-| `authenticated` | `SELECT` on the tables/views the application actually reads, plus **column-scoped** `INSERT`/`UPDATE` on `accounts` and `categories` only. | accounts, categories | accounts, categories | ❌ **nothing, anywhere** |
+| `authenticated` | `SELECT` on the tables/views the application actually reads, plus **column-scoped** `INSERT`/`UPDATE` on `accounts`, `categories` and `transactions` only, and `DELETE` on `transactions` only. | accounts, categories, transactions | accounts, categories, transactions | **transactions only** |
 
 Through Phases 4, 5, and 6 this was `SELECT` only, without exception: there was no mutation UI, no
 Server Action, and no application code path that wrote to the database, so there was no reason for
@@ -130,6 +130,39 @@ The exclusions carry the design:
 is asserted table by table and column by column in
 `supabase/tests/database/100-write-grants.sql`, which also proves its own table list is complete.
 
+### What Phase 7 CP3 added
+
+`supabase/migrations/20260828120002_transaction_writes.sql` — one table, and the first `DELETE`
+grant in this schema:
+
+| Table | `INSERT` columns | `UPDATE` columns | `DELETE` |
+|---|---|---|---|
+| `transactions` | `id`, `user_id`, `account_id`, `date`, `merchant`, `kind`, `category_id`, `movement_id`, `amount_cents` | `account_id`, `date`, `merchant`, `kind`, `category_id`, `amount_cents` | ✅ table-level, narrowed by policy |
+
+Four things about that row carry the design:
+
+- **`id` is grantable on `INSERT` here and nowhere else.** Ordinary transaction creation is the
+  first operation in this application where a double submit produces a *real* duplicate — two
+  coffees, same amount, same day, both plausible — so nothing about the row's contents could
+  distinguish a retry from a second purchase. The create form therefore generates one
+  client-side UUID per logical submission and posts it as the row's id, so a retry collides with
+  itself on the primary key instead of inserting a second row.
+  `lib/data/mutations/transactions.ts` turns that `23505` into either "this is my own identical
+  row, the first attempt won" or a refusal — never a blind success. There is no idempotency
+  table and no middleware: the primary key already enforces uniqueness, transactionally.
+- **`movement_id` is `INSERT`-only and confers nothing yet.** The biconditional `CHECK` means an
+  `INSERT` grant omitting it could not express a movement leg at all, so it is granted for CP4 —
+  but `authenticated` has no `INSERT` on `public.movements`, so there is no parent to point at,
+  and `validate_movement()` rejects any movement not ending the transaction with exactly two
+  balanced legs.
+- **`created_at` is in neither list.** It is the `date DESC, created_at DESC, id ASC` ordering's
+  entry-recency tie-break; a backdatable one would silently reorder same-day history.
+- **`DELETE` is table-level because PostgreSQL has no column-level `DELETE`.** The narrowing is
+  entirely in the policy's `USING` predicate (§4). Transactions are deleted rather than archived
+  because, unlike accounts/categories/bills/goals, a transaction is not a *label* historical rows
+  resolve through — it *is* the history, a mistyped one has no correct archived state, and a
+  "voided" flag would mean every balance, budget, KPI and chart growing a clause to exclude it.
+
 Functions/RPCs (the snapshot writer, the timezone-validation trigger function) get `EXECUTE`
 revoked from `PUBLIC` by default — see §11.
 
@@ -151,7 +184,7 @@ Combined with §3's grants, this table is the intended eventual policy matrix �
 | `profiles` | own row | ❌ never — provisioning/admin creates it, not the application | Phase 7, **column-scoped to `timezone` only** (see below) | ❌ never |
 | `accounts` | own rows | ✅ **CP2** (`accounts_insert_own`) | ✅ **CP2**, incl. archive (`accounts_update_own`) | ❌ prefer archive (`is_archived`) over delete |
 | `categories` | own rows | ✅ **CP2** (`categories_insert_own`) | ✅ **CP2**, including archive (`categories_update_own`) | ❌ no routine hard delete while referenced |
-| `transactions` | own rows | Phase 7 | Phase 7 | Phase 7, non-movement rows only |
+| `transactions` | own rows | ✅ **CP3** (`transactions_insert_own`) | ✅ **CP3**, own **ordinary non-adjustment** rows only (`transactions_update_own_ordinary`) | ✅ **CP3**, own **non-movement** rows only (`transactions_delete_own_non_movement`) |
 | `movements` | own rows | Phase 7 | ❌ never | Phase 7 — cascades both legs |
 | `budgets` | own rows | Phase 7 | Phase 7 | Phase 7, only if deliberately needed |
 | `bills` | own rows | Phase 7 | Phase 7, including archive | ❌ prefer archive |
@@ -178,8 +211,34 @@ row, including ones the application never intends to expose. The column restrict
 Phase 7 builds that feature. Documenting this now so it isn't mistaken for something the RLS
 policy alone will cover.
 
-Phase 7 CP2 is the first place this actually landed — see §3's column tables for `accounts` and
-`categories`. Two consequences worth recording, both learned by building it:
+### CP3: a policy predicate doing more than ownership
+
+`transactions` is the first table where the write policies filter on something other than the
+owner, and each extra clause replaces a capability the application must not have:
+
+- **`movement_id IS NULL`**, in the `UPDATE` policy's `USING` *and* `WITH CHECK`, and in the
+  `DELETE` policy's `USING`. It is the entire mechanism by which a transfer or card-payment leg
+  is unreachable from the ordinary transaction surface: a leg is invisible to both statements, so
+  neither can half-rewrite a movement or remove one leg and strand the other. Deleting a movement
+  stays a CP4 operation on the *parent* row, which cascades both legs
+  (`transactions_movement_fk` is `ON DELETE CASCADE`). It is deliberately absent from the
+  `INSERT` policy — a leg has to be insertable for CP4 to exist, and every other guarantee about
+  legs is `validate_movement()`'s deferred job.
+- **`kind <> 'adjustment'`**, in the `UPDATE` policy's `USING` *and* `WITH CHECK`, refusing two
+  different things. `USING` stops an existing adjustment being targeted: it records a
+  reconciliation decision, and editing it would restate the balance that decision produced
+  without the reconciliation that justified it. `WITH CHECK` stops an ordinary row being *turned
+  into* one — without it, the entry surface would be a two-step path (create an expense, retype
+  it) to writing the CP5-only row CP3 is not supposed to ship. Adjustment `DELETE` is left
+  possible on purpose: reconciliation is delete-and-rewrite.
+
+The `UPDATE`-with-no-error failure mode described below matters most here. An `UPDATE` whose
+target fails `USING` raises *nothing* — it simply matches zero rows — so
+`supabase/tests/database/110-write-rls.sql` proves each of these by re-reading the row afterwards
+rather than by trusting the absence of a throw.
+
+Phase 7 CP2 is the first place column-scoping actually landed — see §3's column tables for
+`accounts` and `categories`. Two consequences worth recording, both learned by building it:
 
 - The `UPDATE` policies take **both** `USING` and `WITH CHECK`. `USING` decides which existing
   rows the statement may touch; `WITH CHECK` decides what they may look like afterwards. With
@@ -355,8 +414,10 @@ Every function/RPC in this schema — the timezone-validation trigger function
 ([database-schema.md §10](database-schema.md#10-date-and-timezone-rules)), the movement
 constraint-trigger function ([database-schema.md §7](database-schema.md#7-the-movement-invariant-in-detail)),
 the bill-occurrence deletion-guard trigger function
-([database-schema.md §13](database-schema.md#13-recurring-bill--occurrence-model)), and the
-snapshot writer (§9) — follows the same rule:
+([database-schema.md §13](database-schema.md#13-recurring-bill--occurrence-model)), the Phase 7
+write guards (`accounts_guard_update()`, `guard_category_kind_change()`,
+`assert_transaction_refs()` — [database-schema.md §6](database-schema.md#6-constraints-and-cross-row-invariants)),
+and the snapshot writer (§9) — follows the same rule:
 
 **`EXECUTE` is revoked from `PUBLIC` by default. A function is callable by `anon` or
 `authenticated` only when that access is intentional and explicitly granted for a stated
@@ -383,6 +444,17 @@ PostgreSQL trigger execution works, and the claim is retracted:**
   hardening already specified for the snapshot writer (§9): a fixed, safe `search_path`,
   fully-qualified references where appropriate, minimal privileges, and no unnecessary direct
   `EXECUTE` exposure.
+
+**How it actually turned out: every trigger function in this schema is `SECURITY INVOKER`,
+including the three Phase 7 write guards.** That is not an oversight and it is asserted, not
+assumed — `supabase/tests/database/000-objects.sql` checks `prosecdef = false` on each of them.
+The reasoning is the same in every case and is worth stating once: each guard reads rows the
+triggering role already has `SELECT` on, and under `FORCE ROW LEVEL SECURITY` the invoker sees
+exactly its own — which is precisely the scope the check wants. `assert_transaction_refs()` is
+the sharpest example: it looks up the owner's profile, the account, and the category, and every
+one of those lookups *should* be limited to the caller's own rows. Taking a definer's privileges
+would hand a browser-reachable write path capabilities it has no use for, in exchange for
+nothing.
 
 **The correct reason `EXECUTE` on these trigger functions doesn't need a direct grant to
 `authenticated`** is unrelated to execution context: PostgreSQL invokes a trigger function

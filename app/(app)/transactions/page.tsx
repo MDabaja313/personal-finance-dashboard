@@ -1,11 +1,21 @@
 import { ArrowLeftRight } from "lucide-react";
 import Link from "next/link";
+import { AddTransaction } from "@/components/transactions/add-transaction";
 import { TransactionFilters } from "@/components/transactions/transaction-filters";
 import { TransactionList } from "@/components/transactions/transaction-list";
 import { TransactionTable } from "@/components/transactions/transaction-table";
-import type { TransactionRow } from "@/components/transactions/types";
+import type {
+  AccountOption,
+  CategoryOption,
+  TransactionRow,
+} from "@/components/transactions/types";
 import { EmptyState } from "@/components/shared/empty-state";
 import { PageHeader } from "@/components/shared/page-header";
+import {
+  createTransactionAction,
+  deleteTransactionAction,
+  updateTransactionAction,
+} from "@/lib/actions/transactions";
 import { getAccounts } from "@/lib/data/accounts";
 import { getCategories } from "@/lib/data/categories";
 import { getToday } from "@/lib/data/clock";
@@ -18,14 +28,15 @@ import { getTransactions } from "@/lib/data/transactions";
 import { addMonths, listMonths, monthKey } from "@/lib/finance/dates";
 import { monthLabel } from "@/lib/format/date";
 import type { TransactionKind } from "@/lib/types";
+import { TRANSACTION_KINDS, isOrdinaryTransactionKind } from "@/lib/types/enums";
 
-const VALID_KINDS: readonly TransactionKind[] = [
-  "income",
-  "expense",
-  "refund",
-  "transfer",
-  "credit_card_payment",
-];
+/**
+ * Every kind a stored row can carry — the filter accepts all of them,
+ * `adjustment` included, because filtering and creating are different
+ * questions. Read from the single canonical list rather than re-spelled, so a
+ * kind added to the enum is filterable without a second edit here.
+ */
+const VALID_KINDS: readonly TransactionKind[] = TRANSACTION_KINDS;
 
 /** Rows revealed per "Load more" press. */
 const PAGE_SIZE = 25;
@@ -142,11 +153,45 @@ export default async function TransactionsPage({ searchParams }: TransactionsPag
     id: t.id,
     date: t.date,
     merchant: t.merchant,
-    categoryName: t.categoryId ? (categoryName.get(t.categoryId) ?? t.categoryId) : null,
+    accountId: t.accountId,
     accountName: accountName.get(t.accountId) ?? t.accountId,
+    categoryId: t.categoryId ?? null,
+    categoryName: t.categoryId ? (categoryName.get(t.categoryId) ?? t.categoryId) : null,
     kind: t.kind,
     amountCents: t.amountCents,
+    // Ordinary rows only. A movement leg cannot be edited or deleted on its own
+    // without leaving a movement with one leg (CP4 supplies controls over the
+    // movement parent), and an adjustment is a CP5 reconciliation outcome the
+    // database refuses to let an UPDATE target. Both stay fully visible here.
+    editable: isOrdinaryTransactionKind(t.kind),
   }));
+
+  /**
+   * What the entry form may post to: active accounts and active categories
+   * only.
+   *
+   * Archived rows are still *read* — `getAccounts()`/`getCategories()` return
+   * them, and they are what resolves the names on historical rows above — but
+   * offering one in a picker would be offering a control that always fails:
+   * `assert_transaction_refs()` refuses an archived account or category, and
+   * the mutation layer refuses it first with "unarchive it before using it".
+   */
+  const accountOptions: AccountOption[] = accounts
+    .filter((a) => !a.isArchived)
+    .map((a) => ({ id: a.id, name: a.name }));
+
+  const categoryOptions: CategoryOption[] = categories
+    .filter((c) => !c.isArchived)
+    .map((c) => ({ id: c.id, name: c.name, kind: c.kind }));
+
+  // Imported here, in app/**, and handed to the client components as props:
+  // components/** may not value-import lib/actions/**, and may not reach
+  // lib/data/mutations/** at all. The route is the seam.
+  const mutationActions = {
+    create: createTransactionAction,
+    update: updateTransactionAction,
+    remove: deleteTransactionAction,
+  };
 
   // Next URL carries every active filter forward unchanged and increments only
   // `page`, so revealing more never silently widens or drops a filter.
@@ -171,14 +216,35 @@ export default async function TransactionsPage({ searchParams }: TransactionsPag
     <div className="flex flex-col gap-6">
       <PageHeader title="Transactions" description="Full transaction history across all accounts." />
 
+      <div>
+        <AddTransaction
+          action={createTransactionAction}
+          accounts={accountOptions}
+          categories={categoryOptions}
+          today={today}
+        />
+      </div>
+
       <TransactionFilters months={months} accounts={accounts} categories={categories} />
 
       {rows.length === 0 ? (
         <EmptyState title="No transactions match these filters" icon={ArrowLeftRight} />
       ) : (
         <>
-          <TransactionTable rows={rows} />
-          <TransactionList rows={rows} />
+          <TransactionTable
+            rows={rows}
+            actions={mutationActions}
+            accounts={accountOptions}
+            categories={categoryOptions}
+            today={today}
+          />
+          <TransactionList
+            rows={rows}
+            actions={mutationActions}
+            accounts={accountOptions}
+            categories={categoryOptions}
+            today={today}
+          />
 
           {/* Shown iff the probe row exists — there is no page ceiling that
               could hide it while more history remains. */}

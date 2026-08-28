@@ -404,14 +404,13 @@ describe("write-boundary source posture", () => {
   });
 });
 
-describe("CP2 write surface is exactly accounts + categories", () => {
+describe("CP3 write surface is exactly accounts + categories + transactions", () => {
   // CP1's version of this block asserted the application was still entirely
-  // read-only. CP2 opens exactly two domains, so the assertions become an
-  // allowlist rather than an emptiness check — the point is unchanged: the set
-  // of writable things is a checked fact, and adding a third one cannot happen
-  // quietly.
+  // read-only; CP2's turned it into a two-domain allowlist. CP3 adds the
+  // third. The point is unchanged throughout: the set of writable things is a
+  // checked fact, and adding a fourth cannot happen quietly.
 
-  it("has Server Actions only for auth, accounts, and categories", () => {
+  it("has Server Actions only for auth, accounts, categories, and transactions", () => {
     // 'use server' marks a file whose exports are independently reachable HTTP
     // endpoints. Every one of them is a new attack surface, so the list is
     // enumerated rather than bounded.
@@ -423,11 +422,12 @@ describe("CP2 write surface is exactly accounts + categories", () => {
     expect(serverActionFiles).toEqual([
       "lib/actions/accounts.ts",
       "lib/actions/categories.ts",
+      "lib/actions/transactions.ts",
       "lib/auth/actions.ts",
     ]);
   });
 
-  it("has mutation DAL modules only for accounts and categories", () => {
+  it("has mutation DAL modules only for accounts, categories, and transactions", () => {
     const mutationModules = filesWithCode
       .map(({ repoPath }) => repoPath)
       .filter((repoPath) => repoPath.startsWith("lib/data/mutations/"))
@@ -436,7 +436,69 @@ describe("CP2 write surface is exactly accounts + categories", () => {
     expect(mutationModules).toEqual([
       "lib/data/mutations/accounts.ts",
       "lib/data/mutations/categories.ts",
+      "lib/data/mutations/transactions.ts",
     ]);
+  });
+
+  it("has no movement mutation module — CP4 is not implemented", () => {
+    // The specific thing CP3 must not have started. A movements module would
+    // also fail the enumeration above, but failing here says why.
+    const modules = filesWithCode.map(({ repoPath }) => repoPath);
+    expect(modules).not.toContain("lib/data/mutations/movements.ts");
+    expect(modules).not.toContain("lib/actions/movements.ts");
+  });
+
+  it("never assigns `adjustment` as a kind in a write payload", () => {
+    // Reconciliation is CP5. The read side handles `adjustment` everywhere —
+    // DTO union, badge, filter — and the mutation layer legitimately *compares*
+    // against it to refuse editing one, which is why this looks for an
+    // assignment (`kind: "adjustment"`) rather than for the word. The mutation
+    // layer's kind is typed `OrdinaryTransactionKind` so the type system already
+    // forbids it; the payload nonetheless reaches PostgREST as a plain object,
+    // and this covers that gap.
+    const offenders = filesWithCode
+      .filter(
+        ({ repoPath }) =>
+          repoPath.startsWith("lib/data/mutations/") ||
+          repoPath.startsWith("lib/actions/") ||
+          repoPath.startsWith("lib/validation/")
+      )
+      .filter(({ code }) => /\bkind\s*:\s*["'`]adjustment["'`]/.test(code))
+      .map(({ repoPath }) => repoPath);
+
+    expect(offenders).toEqual([]);
+  });
+
+  it("keeps the ordinary write path free of movement columns", () => {
+    // No mutation may set `movement_id` to anything but null. Creating a
+    // movement is a two-leg operation over a movement parent — CP4 — and a
+    // single-row write that assigned one would leave a movement with one leg,
+    // which validate_movement() rejects at COMMIT anyway. Refusing it here
+    // means the mistake is caught in review rather than in a failing integration
+    // test.
+    //
+    // Matches an object-literal property only: `movement_id:` followed by
+    // something other than `null`, on a line that ends the property with a
+    // comma. A TypeScript member declaration (`movement_id: string | null;`)
+    // ends in a semicolon and so cannot match, which is what keeps the row-shape
+    // interfaces this layer needs from reading as violations.
+    // The lookahead absorbs the whitespace itself rather than sitting after a
+    // separate `\s*`, which would let the pattern backtrack to a zero-width
+    // match and defeat its own negation.
+    const assignsNonNullMovement = /movement_id\s*:(?!\s*null\s*,)[^;\n]*,/;
+
+    const offenders = filesWithCode
+      .filter(({ repoPath }) => repoPath.startsWith("lib/data/mutations/"))
+      .filter(({ code }) => assignsNonNullMovement.test(code))
+      .map(({ repoPath }) => repoPath);
+
+    expect(offenders).toEqual([]);
+
+    // Positive control: the probe would catch the mistake it is looking for.
+    // Without this, a regex that stopped matching anything would pass forever.
+    expect(assignsNonNullMovement.test("movement_id: input.movementId,")).toBe(true);
+    expect(assignsNonNullMovement.test("movement_id: null,")).toBe(false);
+    expect(assignsNonNullMovement.test("  movement_id: string | null;")).toBe(false);
   });
 
   it("issues PostgREST writes only from lib/data/mutations/**", () => {
@@ -461,24 +523,29 @@ describe("CP2 write surface is exactly accounts + categories", () => {
     expect(offenders).toEqual([]);
   });
 
-  it("never issues a PostgREST delete, anywhere", () => {
-    // No table has a DELETE grant for `authenticated`, and no mutation asks
-    // for one: accounts and categories are archived, never removed. This is
-    // the source-side half of that claim; the privilege-side half is
-    // supabase/tests/database/100-write-grants.sql.
-    const offenders = filesWithCode
+  it("issues a PostgREST delete from exactly one module", () => {
+    // CP3 adds the first DELETE in this application, and it is deliberately
+    // the only one: accounts, categories, bills and goals are *labels* that
+    // historical rows resolve through, so they are archived; a transaction is
+    // the history itself and has no correct archived state. This is the
+    // source-side half of that claim; the privilege-side half is
+    // supabase/tests/database/100-write-grants.sql, which still proves DELETE
+    // is granted on transactions and on nothing else.
+    const deleters = filesWithCode
       .filter(({ repoPath }) => repoPath.startsWith("lib/data/mutations/"))
       .filter(({ code }) => /\.delete\s*\(/.test(code))
-      .map(({ repoPath }) => repoPath);
+      .map(({ repoPath }) => repoPath)
+      .sort();
 
-    expect(offenders).toEqual([]);
+    expect(deleters).toEqual(["lib/data/mutations/transactions.ts"]);
   });
 
-  it("writes to no table other than accounts and categories", () => {
+  it("writes to no table other than accounts, categories, and transactions", () => {
     // Every `.from("...")` in the mutation layer, enumerated. The read probes
-    // (transactions/budgets/bills, for the preflights) are legitimate and
-    // appear here too — this asserts the *set of relations the layer touches*,
-    // which is the number that must not grow silently.
+    // (budgets/bills for the category preflight, bill_occurrences for the
+    // delete preflight, account_balances for the account preflight) are
+    // legitimate and appear here too — this asserts the *set of relations the
+    // layer touches*, which is the number that must not grow silently.
     const relations = new Set<string>();
 
     for (const { repoPath, code } of filesWithCode) {
@@ -489,10 +556,15 @@ describe("CP2 write surface is exactly accounts + categories", () => {
     expect([...relations].sort()).toEqual([
       "account_balances",
       "accounts",
+      "bill_occurrences",
       "bills",
       "budgets",
       "categories",
       "transactions",
     ]);
+
+    // Stated separately because it is the one name whose absence is a CP4
+    // boundary rather than an accident.
+    expect(relations.has("movements")).toBe(false);
   });
 });

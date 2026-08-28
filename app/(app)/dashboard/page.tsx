@@ -7,7 +7,7 @@ import { RecentTransactions } from "@/components/dashboard/recent-transactions";
 import { SpendingByCategory } from "@/components/dashboard/spending-by-category";
 import { UpcomingBills } from "@/components/dashboard/upcoming-bills";
 import { PageHeader } from "@/components/shared/page-header";
-import type { TransactionRow } from "@/components/transactions/types";
+import type { TransactionDisplayRow } from "@/components/transactions/types";
 import { getAccounts } from "@/lib/data/accounts";
 import { getUpcomingBills } from "@/lib/data/bills";
 import { getBudgets } from "@/lib/data/budgets";
@@ -49,7 +49,7 @@ export default async function DashboardPage() {
   const accountName = new Map(accounts.map((a) => [a.id, a.name]));
   const categoryName = new Map(categories.map((c) => [c.id, c.name]));
 
-  const recentRows: TransactionRow[] = recentTransactionsRaw.map((t) => ({
+  const recentRows: TransactionDisplayRow[] = recentTransactionsRaw.map((t) => ({
     id: t.id,
     date: t.date,
     merchant: t.merchant,

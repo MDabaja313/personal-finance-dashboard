@@ -79,7 +79,7 @@ reconciliation limitation (§18) is recorded as a *future* prerequisite, not a t
 | Enum | Values | Note |
 |---|---|---|
 | `account_type` | `checking`, `savings`, `cash`, `credit`, `investment`, `loan` | Matches `AccountType` in `lib/types/index.ts` |
-| `transaction_kind` | `income`, `expense`, `refund`, `transfer`, `credit_card_payment` | Matches `TransactionKind` |
+| `transaction_kind` | `income`, `expense`, `refund`, `transfer`, `credit_card_payment`, `adjustment` | Matches `TransactionKind`. `adjustment` was appended by Phase 7 CP3 (`20260828120001_transaction_kind_adjustment.sql`) as its own migration — a label added by `ALTER TYPE … ADD VALUE` is unusable in the transaction that adds it, so the constraints and policies that reference it had to land in a second file. It is **readable but not writable**: the ordinary entry form offers `income`/`expense`/`refund` only, and the UPDATE policy refuses both to target an adjustment and to produce one (§6). Reconciliation, which is what will actually create them, is CP5 (§18) |
 | `movement_kind` | `transfer`, `credit_card_payment` | **Deliberately narrower** than `transaction_kind` — makes "a movement can only be one of the two paired kinds" a type-level fact, not a runtime check |
 | `bill_frequency` | `weekly`, `biweekly`, `monthly`, `yearly` | Matches `BillFrequency` |
 | `category_kind` | `income`, `expense` | Matches `Category.kind` |
@@ -182,7 +182,7 @@ No amounts or dates live here — those belong to the two `transactions` legs (�
 | `date` | `DATE` | NOT NULL | Calendar value — see §10 |
 | `merchant` | `TEXT` | NOT NULL | |
 | `kind` | `transaction_kind` | NOT NULL | |
-| `category_id` | `UUID` | **nullable** | Composite FK → `categories(id, user_id)`. Null on movement legs *and* legally on some ordinary rows — see `txn-094`, §17 |
+| `category_id` | `UUID` | **nullable** | Composite FK → `categories(id, user_id)`. Null on movement legs, null on `adjustment` rows, *and* legally null on some ordinary rows — see `txn-094`, §17 |
 | `movement_id` | `UUID` | **nullable** | Composite FK → `movements(id, user_id)`. Non-null iff `kind` is a movement kind (§6) |
 | `amount_cents` | `BIGINT` | NOT NULL | Signed. Zero is legal for ordinary rows, illegal for movement legs (§6) |
 | `created_at` | `TIMESTAMPTZ` | NOT NULL, default `now()` | **Phase 3 amendment.** Query-ordering only — never surfaced on the `Transaction` DTO. Added specifically because deterministic same-day transaction ordering required an entry-recency tie-break: without it, `ORDER BY date DESC, id ASC` alone would order tied rows by UUID, which carries no meaning a user could read. Exists so `ORDER BY date DESC, created_at DESC, id ASC` has a real entry-recency tie-break instead (§8, §17). |
@@ -306,8 +306,17 @@ transaction row is deleted.
 ### Single-row `CHECK` constraints
 
 - `transactions`: `kind IN ('income','refund') → amount_cents >= 0`;
-  `kind = 'expense' → amount_cents <= 0`. **Non-strict** — a legal fixture row has
-  `amount_cents = 0` on an `expense` (§17).
+  `kind = 'expense' → amount_cents <= 0`; `kind = 'adjustment'` — **unconstrained in sign**.
+  **Non-strict** — a legal fixture row has `amount_cents = 0` on an `expense` (§17). The
+  adjustment branch was added by Phase 7 CP3, which dropped and re-created the constraint with
+  every existing branch preserved verbatim (no Phase 4 migration was edited). An adjustment is
+  whatever signed delta reconciles a derived balance to a real one, so a rule guessing its
+  direction now would be a rule the reconciliation work has to fight; its integrity comes from
+  being uncreatable and uneditable through the ordinary surface instead (§18).
+- `transactions`: `kind = 'adjustment' → category_id IS NULL` (Phase 7 CP3). An adjustment
+  corrects an account's *balance* rather than recording consumption, so a category on one would
+  put a reconciliation difference into `spendingByCategory`, budget utilisation, and the
+  income/expense split. One-directional, like the movement rule below.
 - `transactions`: **`kind IN ('transfer','credit_card_payment') → amount_cents <> 0`.** Combined
   with "exactly two legs" and "legs sum to zero" (§7), this makes **opposite-signed legs a
   database guarantee**, not just a convention.
@@ -363,6 +372,47 @@ cannot: each compares `NEW` against `OLD`, and two of the three consult other ta
 Both are `SECURITY INVOKER` with `search_path = ''`, have `EXECUTE` revoked from `PUBLIC`/`anon`/
 `authenticated`, and fire on `UPDATE` only — so neither affects the whole-user teardown cascade
 (§5). Tests: `supabase/tests/database/120-account-guard.sql`, `130-category-guard.sql`.
+
+### `assert_transaction_refs()` (Phase 7 CP3) — `BEFORE INSERT OR UPDATE` on `transactions`
+
+Added when `authenticated` gained `INSERT`/`UPDATE`/`DELETE` on `transactions`
+(`supabase/migrations/20260828120002_transaction_writes.sql`). It carries the four cross-row rules
+no `GRANT`, `CHECK`, or policy can express. It applies to **every** row, movement legs included:
+CP4 will insert transfer and card-payment legs through this same table, and a leg dated tomorrow
+or landing in an archived account corrupts exactly the same figures as an ordinary row doing it.
+
+1. **`date` may not be later than the owner's current calendar day**, computed as
+   `(now() AT TIME ZONE <the owner's profiles.timezone>)::date` — the same source
+   `lib/data/clock.ts` reads for `getToday()`, so the form's message and the database's refusal
+   can never disagree. **There is no server-UTC shortcut**, and that is the point: for an owner at
+   UTC+13 a UTC ceiling would reject a transaction they are entering right now on the date their
+   own calendar shows, and for an owner at UTC−8 it would accept one dated tomorrow for several
+   hours each night. `135-posted-ledger.sql` contains cases built specifically to fail if this is
+   ever rewritten against a UTC date. This table is the ledger of what *has happened*; a
+   future-dated row is an intention, and this schema already has a place for those (§13).
+2. **The account may not be archived.** Archiving requires a derived balance of exactly zero
+   (`accounts_guard_update()`, above) and an archived account is excluded from net worth and from
+   the asset/liability totals — so posting into one would create money that exists in the ledger
+   and in no summary. "Unarchive it first" is the rule.
+3. **A category, when present, must be active and kind-compatible** — `income` requires an
+   `income` category; `expense` and `refund` require an `expense` one (a refund reduces the spend
+   of the category it refunds; it is not income). Uncategorized ordinary rows stay legal.
+4. **An adjustment carries no category**, and neither does a movement leg — both also `CHECK`s,
+   so the same SQLSTATE arrives whichever layer fires first.
+
+Cross-*owner* references are deliberately **not** this trigger's business: the composite FKs
+(§6) already make a foreign account or category structurally impossible, so each lookup is scoped
+to `(id, user_id)` and raises nothing when it finds no row, letting the deferred FK produce its
+own `23503`. Taking those cases over would change the error code of situations
+`040-ownership.sql` already pins, without refusing anything they do not already refuse. A profile
+this statement cannot see is treated the same way, and the argument that this is safe is spelled
+out in full in the migration: under RLS the only invisible profile belongs to a row the
+`INSERT`/`UPDATE` policy is already refusing, and `transactions.user_id → profiles.id` is
+`NOT DEFERRABLE` regardless.
+
+`SECURITY INVOKER` with `search_path = ''`, `EXECUTE` revoked from `PUBLIC`/`anon`/
+`authenticated`, and `INSERT`/`UPDATE` only — never `DELETE` — so the whole-user teardown cascade
+(§5) is unaffected. Tests: `supabase/tests/database/135-posted-ledger.sql`.
 
 ### Deliberately absent constraints
 
@@ -1023,3 +1073,23 @@ an auditable account-balance adjustment/reconciliation mechanism** — recorded 
 
 **Not designed or implemented in this phase.** No table for it exists in §1's table list — adding
 one is explicitly out of scope until bank-sync or investment work is actually planned.
+
+### Phase 7 CP3 — the enum label, and nothing else
+
+CP3 added the `adjustment` label to `transaction_kind` (§2) and the two constraints that go with
+it, and **stopped there deliberately**. What exists now is the *shape* an adjustment will have —
+a signed amount on an account, no category, excluded from `countsAsSpending`/`countsAsIncome` by
+`lib/finance/transactions.ts` — so the read path, the DTO union, the `/transactions` filter, and
+the badge all handle one safely before one can exist.
+
+What does **not** exist, and is CP5's work: any way to create an adjustment. The ordinary entry
+form offers `income`/`expense`/`refund` only, `lib/data/mutations/transactions.ts` types its kind
+as `OrdinaryTransactionKind` so `adjustment` cannot be spelled there at all, and
+`transactions_update_own_ordinary` refuses both to target an existing adjustment and to turn an
+ordinary row into one. Adjustment **`DELETE` is deliberately left possible**: reconciliation is
+delete-and-rewrite, and a superseded adjustment has to be removable or re-reconciling an account
+would stack them forever.
+
+The four requirements listed above are unchanged and still unmet as a whole — in particular,
+nothing yet decides *when* an adjustment is written or how a reconciliation is recorded and
+audited.

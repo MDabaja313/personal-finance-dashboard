@@ -141,20 +141,21 @@ select is(
 -- exists on any table through Phase 6, so every attempt fails 42501
 -- regardless of ownership.
 -- Phase 7 CP2 gave `authenticated` column-scoped INSERT/UPDATE on
--- accounts and categories, so this file no longer asserts blanket
--- write-denial on those two -- their full grant, RLS, and trigger
--- behavior is 100/110/120/130. Every *other* table is still read-only
--- for this role, which is what the spread below covers. budgets stands
--- in here for the table this assertion used to name.
+-- accounts and categories; CP3 added transactions (INSERT/UPDATE/
+-- DELETE). So this file no longer asserts blanket write-denial on those
+-- three -- their full grant, RLS, and trigger behavior is
+-- 100/110/120/130/135. Every *other* table is still read-only for this
+-- role, which is what the spread below covers. budgets and bills stand
+-- in here for the tables these assertions used to name.
 select throws_ok(
   $$ insert into public.budgets (id, user_id, category_id, period, limit_cents) values ('14000000-0000-4000-8000-0000000000b3', '14000000-0000-4000-8000-000000000001', '14000000-0000-4000-8000-0000000000c1', '2026-02', 1000) $$,
   '42501', null,
   'authenticated INSERT on budgets (even own row) is denied at the GRANT layer'
 );
 select throws_ok(
-  $$ update public.transactions set merchant = 'changed' where id = '14000000-0000-4000-8000-000000000101' $$,
+  $$ update public.bills set name = 'changed' where user_id = '14000000-0000-4000-8000-000000000001' $$,
   '42501', null,
-  'authenticated UPDATE on transactions (even own row) is denied at the GRANT layer'
+  'authenticated UPDATE on bills (even own row) is denied at the GRANT layer'
 );
 select throws_ok(
   $$ delete from public.goals where id = '14000000-0000-4000-8000-000000000401' $$,

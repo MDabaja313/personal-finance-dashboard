@@ -37,3 +37,32 @@ export const ACCOUNT_ROUTES = ["/accounts", "/dashboard", "/analytics"];
 
 /** The routes a category write must invalidate. */
 export const CATEGORY_ROUTES = ["/transactions", "/budgets", "/dashboard", "/analytics"];
+
+/**
+ * The routes a transaction write must invalidate.
+ *
+ * Wider than either of the above, because a single ledger row moves an account
+ * balance, a month's KPIs, a budget's utilisation, and four charts.
+ */
+export const TRANSACTION_ROUTES = [
+  "/transactions",
+  "/dashboard",
+  "/accounts",
+  "/budgets",
+  "/analytics",
+];
+
+/**
+ * The calendar day `delta` days from `date`, as 'YYYY-MM-DD'.
+ *
+ * `Date.UTC` rather than local-midnight construction, for the same reason
+ * `lib/finance/dates.ts` uses it: a local-time construction near a DST boundary
+ * can shift the day. Used to build "the owner's tomorrow" from the owner's own
+ * `getToday()`, which is the only date the posted-ledger ceiling can be tested
+ * against without hardcoding a literal that ages.
+ */
+export function shiftCalendarDate(date: string, delta: number): string {
+  const [year, month, day] = date.split("-").map(Number);
+  const shifted = new Date(Date.UTC(year, month - 1, day + delta));
+  return shifted.toISOString().slice(0, 10);
+}

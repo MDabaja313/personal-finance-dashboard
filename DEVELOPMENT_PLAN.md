@@ -420,7 +420,7 @@ cumulative "Load more" reveal window described above resolves this — no route 
 
 ## Phase 7 — Mutations 🚧 in progress
 
-Checkpoints 1 and 2 are complete. **CP3 has not started.**
+Checkpoints 1, 2 and 3 are complete. **CP4 has not started.**
 
 ### CP1 — Write foundation ✅ (no migration, no write grant, no mutating code)
 
@@ -474,13 +474,73 @@ writable.**
   `next/cache`/`next/navigation`, and records those two rather than no-oping them so revalidation
   targets are asserted. Refuses to run against a non-loopback URL. Serial.
 
-### Remaining — CP3 onward, not started
+### CP3 — Ordinary transactions ✅
+
+**The owner can now create, edit, and delete ordinary income, expense and refund transactions.
+Transfers, card payments and adjustments remain uncreatable and unedatable, and nothing else
+became writable.**
+
+- **Two additive migrations, and the split between them is forced, not stylistic.**
+  `20260828120001_transaction_kind_adjustment.sql` contains exactly one statement —
+  `ALTER TYPE public.transaction_kind ADD VALUE 'adjustment'` — because a label added that way is
+  unusable in the transaction that adds it, and the Supabase CLI applies each migration file in
+  its own transaction. `20260828120002_transaction_writes.sql` then references `'adjustment'`
+  freely in a `CHECK`, in two policy predicates and in a trigger body. No Phase 4 or CP2 migration
+  file was edited; CP3 does drop and re-create `transactions_sign_by_kind_ck` with a wider
+  predicate, in its own forward migration, with every existing branch preserved verbatim.
+- **Grants.** Column-scoped `INSERT` (`id`, `user_id`, `account_id`, `date`, `merchant`, `kind`,
+  `category_id`, `movement_id`, `amount_cents`) and `UPDATE` (`account_id`, `date`, `merchant`,
+  `kind`, `category_id`, `amount_cents`) on `transactions`, plus the schema's **first `DELETE`
+  grant** — on `transactions` and nothing else. `created_at` is in neither list (it is the
+  same-day ordering tie-break); `id`, `user_id` and `movement_id` are `INSERT`-only. `anon` is
+  not named once. Full rationale in [docs/rls-policies.md §3](docs/rls-policies.md).
+- **Policies.** `transactions_insert_own`, `transactions_update_own_ordinary`
+  (`USING` **and** `WITH CHECK`, each carrying `movement_id IS NULL AND kind <> 'adjustment'`),
+  and `transactions_delete_own_non_movement` (`movement_id IS NULL`). Those two extra clauses are
+  what make a movement leg unreachable from the ordinary surface and an adjustment non-editable
+  in *both* directions — an existing one cannot be targeted, and an ordinary row cannot be
+  retyped into one. Adjustment `DELETE` is deliberately left possible so CP5 can reconcile by
+  delete-and-rewrite.
+- **`assert_transaction_refs()`** — a `BEFORE INSERT OR UPDATE` trigger carrying the four
+  cross-row rules no grant, `CHECK` or policy can express: **no row dated later than the owner's
+  own calendar day** (`(now() AT TIME ZONE profiles.timezone)::date` — the same source
+  `getToday()` reads, never server UTC); no archived account; an active, kind-compatible category
+  when one is present; and no category on an adjustment. It covers movement legs too, so CP4
+  inherits the protection rather than having to remember it.
+- **Sign is derived, never submitted.** The form collects a non-negative magnitude and
+  `signedAmountFor(kind, magnitude)` (`lib/types/enums.ts`, mirroring
+  `transactions_sign_by_kind_ck`) produces the stored value. A signed field would let a
+  well-formed submission contradict its own kind. Zero stays exactly `0`.
+- **Creation is idempotent by client-generated UUID.** Ordinary transaction entry is the first
+  operation here where a double submit produces a *real* duplicate, so the create form mints one
+  key per mounted form and posts it as the row's `id`; a retry collides on the primary key.
+  `createTransaction` does **not** treat that `23505` as success: it re-reads its own row and
+  compares the complete normalized payload — exact match is a successful retry, the same key with
+  a different payload is a `conflict`, and a key belonging to another owner (invisible through
+  RLS) falls through as the ordinary unique conflict it is. No idempotency table, no middleware.
+- **Revalidation** is exactly `/transactions`, `/dashboard`, `/accounts`, `/budgets`,
+  `/analytics` — every route that reads the ledger, a derived balance, or a category rollup.
+- **`adjustment` is read-side only.** The DTO union, the `/transactions` kind filter, and the
+  badge all handle it; nothing can create one. `lib/finance/transactions.ts` counts it as neither
+  spending nor income. Reconciliation is CP5.
+- **UI:** an "Add transaction" sheet on `/transactions`, per-row Edit (same sheet) and a two-step
+  inline Delete confirmation — rendered only for ordinary rows. Movement legs and adjustments
+  stay fully visible in history and get no controls at all rather than disabled ones. Pickers
+  offer active accounts and active categories only, narrowed to the kinds the selected
+  transaction kind permits, with "Uncategorized" still legal. URL filtering, search and the
+  cumulative "Load more" reveal are unchanged.
+- **Deliberate limitation:** deleting a transaction whose account is archived is refused by the
+  mutation layer only — the `DELETE` policy is about *rows*, not account state — and that is
+  recorded in `lib/data/mutations/transactions.ts` rather than implied. It is the one CP3 rule
+  without a database backstop.
+
+### Remaining — CP4 onward, not started
 
 Every other finance domain is still read-only, and its grants and policies land only alongside the
-feature that needs them: transactions, transfers/credit-card payments, budgets, bills/occurrences
-(including the `BillOccurrence` DTO and mark-as-paid UI), goals/contributions (INSERT only,
-respecting the append-only model), and reconciliation/adjustments where designed. The same rules
-hold throughout — Server Actions are independently reachable endpoints, so the unconditional
-`getOwnerId()` pattern Phase 6 established for reads applies to every write; narrowly-scoped write
-RLS policies and object grants are added per mutation as it's built; §3/§4 of
+feature that needs them: transfers/credit-card payments over a `movements` parent (CP4),
+reconciliation/adjustments (CP5), budgets, bills/occurrences (including the `BillOccurrence` DTO
+and mark-as-paid UI), and goals/contributions (INSERT only, respecting the append-only model). The
+same rules hold throughout — Server Actions are independently reachable endpoints, so the
+unconditional `getOwnerId()` pattern Phase 6 established for reads applies to every write;
+narrowly-scoped write RLS policies and object grants are added per mutation as it's built; §3/§4 of
 `docs/rls-policies.md` records the intended eventual policy matrix.

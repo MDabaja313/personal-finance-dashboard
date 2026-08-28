@@ -1,12 +1,19 @@
--- Write-privilege posture: the exact CP2 matrix, and nothing wider.
+-- Write-privilege posture: the exact CP3 matrix, and nothing wider.
 --
 -- Phase 7 CP1 shipped no migration and no write GRANT at all, and this
--- file proved it. CP2 opens exactly two tables -- accounts and
--- categories -- so the file becomes an allowlist rather than an
--- emptiness check. The purpose is unchanged and, if anything, sharper:
--- the set of things `authenticated` can write is a checked fact, down
--- to the column, so neither a later checkpoint nor a careless migration
+-- file proved it. CP2 opened two tables -- accounts and categories --
+-- so the file became an allowlist rather than an emptiness check. CP3
+-- adds a third, transactions, and with it the first DELETE grant in
+-- this schema. The purpose is unchanged and, if anything, sharper: the
+-- set of things `authenticated` can write is a checked fact, down to
+-- the column, so neither a later checkpoint nor a careless migration
 -- can widen it without a test turning red here.
+--
+-- INSERT/UPDATE: accounts, categories, transactions -- column-scoped in
+-- every case. DELETE: transactions and nothing else. Accounts,
+-- categories, bills and goals are *labels* historical rows resolve
+-- through, so they are archived rather than removed; a transaction is
+-- the history itself and has no correct archived state.
 --
 -- Three layers, all asserted, because no one of them is sufficient:
 --
@@ -51,7 +58,7 @@
 -- user_id reassignment, anon) is 110-write-rls.sql; the invariant
 -- triggers are 120/130.
 begin;
-select plan(57);
+select plan(63);
 
 -- Every user-financial table. The last assertion in this file proves
 -- this list is exactly `public`'s table set, so it cannot silently fall
@@ -62,18 +69,24 @@ insert into write_posture_tables (name) values
   ('budgets'), ('bills'), ('bill_occurrences'), ('goals'), ('goal_contributions'),
   ('net_worth_snapshots');
 
--- The two tables CP2 makes writable, kept as a separate list so every
--- assertion below reads as "these two and no others" rather than as a
--- hardcoded name repeated in nine places.
-create temporary table cp2_writable_tables (name text primary key) on commit drop;
-insert into cp2_writable_tables (name) values ('accounts'), ('categories');
+-- The tables that hold any INSERT/UPDATE grant, kept as a separate list
+-- so every assertion below reads as "these and no others" rather than
+-- as a hardcoded name repeated in a dozen places.
+create temporary table writable_tables (name text primary key) on commit drop;
+insert into writable_tables (name) values ('accounts'), ('categories'), ('transactions');
+
+-- DELETE is tracked separately because it is granted on a strictly
+-- narrower set: exactly one table. Folding it into the list above would
+-- make "accounts cannot be deleted" untestable.
+create temporary table deletable_tables (name text primary key) on commit drop;
+insert into deletable_tables (name) values ('transactions');
 
 -- The behavioral section below reads these lists while running *as*
 -- `authenticated`/`anon`, so those roles need to see them. Scoped to
 -- transaction-local temporary tables that are dropped at commit and
 -- rolled back regardless: a test-harness concern only, granting nothing
 -- on any application object.
-grant select on write_posture_tables, cp2_writable_tables to authenticated, anon;
+grant select on write_posture_tables, writable_tables, deletable_tables to authenticated, anon;
 
 -- ============================================================
 -- Table-level catalog: anon still has zero write grants anywhere
@@ -101,46 +114,56 @@ select is(
 );
 
 -- ============================================================
--- Table-level catalog: authenticated writes exactly two tables
+-- Table-level catalog: authenticated writes exactly three tables
 -- ============================================================
 
 select is(
   (select count(*)::int from write_posture_tables t
    where has_any_column_privilege('authenticated', 'public.' || t.name, 'insert')
-     and t.name not in (select name from cp2_writable_tables)),
+     and t.name not in (select name from writable_tables)),
   0,
-  'authenticated has no INSERT grant on any table outside accounts/categories'
+  'authenticated has no INSERT grant on any table outside accounts/categories/transactions'
 );
 select is(
-  (select count(*)::int from cp2_writable_tables t
+  (select count(*)::int from writable_tables t
    where has_any_column_privilege('authenticated', 'public.' || t.name, 'insert')),
-  2,
-  'authenticated does hold an INSERT grant on both accounts and categories (not vacuous)'
+  3,
+  'authenticated does hold an INSERT grant on all three writable tables (not vacuous)'
 );
 
 select is(
   (select count(*)::int from write_posture_tables t
    where has_any_column_privilege('authenticated', 'public.' || t.name, 'update')
-     and t.name not in (select name from cp2_writable_tables)),
+     and t.name not in (select name from writable_tables)),
   0,
-  'authenticated has no UPDATE grant on any table outside accounts/categories'
+  'authenticated has no UPDATE grant on any table outside accounts/categories/transactions'
 );
 select is(
-  (select count(*)::int from cp2_writable_tables t
+  (select count(*)::int from writable_tables t
    where has_any_column_privilege('authenticated', 'public.' || t.name, 'update')),
-  2,
-  'authenticated does hold an UPDATE grant on both accounts and categories (not vacuous)'
+  3,
+  'authenticated does hold an UPDATE grant on all three writable tables (not vacuous)'
 );
 
+-- DELETE is table-level only -- PostgreSQL has no column-level DELETE
+-- privilege at all, so `has_any_column_privilege(..., 'delete')` does
+-- not merely fail to help, it raises "unrecognized privilege type".
 select is(
   (select count(*)::int from write_posture_tables t
-   where has_table_privilege('authenticated', 'public.' || t.name, 'delete')),
+   where has_table_privilege('authenticated', 'public.' || t.name, 'delete')
+     and t.name not in (select name from deletable_tables)),
   0,
-  'authenticated has zero DELETE grants across every user-financial table, accounts and categories included'
+  'authenticated has no DELETE grant on any table outside transactions -- accounts and categories included'
+);
+select is(
+  (select count(*)::int from deletable_tables t
+   where has_table_privilege('authenticated', 'public.' || t.name, 'delete')),
+  1,
+  'authenticated does hold DELETE on transactions (not vacuous)'
 );
 
 -- ============================================================
--- Column-level catalog: the exact CP2 column matrix
+-- Column-level catalog: the exact CP2/CP3 column matrix
 -- ============================================================
 -- Compared as sorted arrays rather than as counts: a count would pass
 -- if one column were swapped for another, and "user_id became
@@ -175,6 +198,38 @@ select is(
      and has_column_privilege('authenticated', a.attrelid, a.attnum, 'insert')),
   'kind,name,user_id',
   'authenticated may INSERT exactly the 3 intended categories columns (id/is_archived excluded)'
+);
+
+-- transactions. `id` IS grantable here and nowhere else in this schema:
+-- ordinary transaction creation is the one operation where a double
+-- submit produces a real duplicate, so the create form supplies a
+-- client-generated UUID as the row's id and a retry collides with
+-- itself on the primary key. `movement_id` is grantable for CP4's legs
+-- and confers nothing today (no INSERT grant exists on public.movements
+-- to create a parent to point at). `created_at` is excluded: it is the
+-- `date DESC, created_at DESC, id ASC` ordering's tie-break, and a
+-- backdatable entry order would silently reorder same-day history.
+select is(
+  (select string_agg(a.attname::text, ',' order by a.attname)
+   from pg_attribute a
+   where a.attrelid = 'public.transactions'::regclass
+     and a.attnum > 0 and not a.attisdropped
+     and has_column_privilege('authenticated', a.attrelid, a.attnum, 'insert')),
+  'account_id,amount_cents,category_id,date,id,kind,merchant,movement_id,user_id',
+  'authenticated may INSERT exactly the 9 intended transactions columns (created_at excluded)'
+);
+
+-- The UPDATE list is what stands between "correct the amount on my
+-- coffee" and "re-home this row", "adopt it into a movement", or "edit
+-- away the idempotency collision".
+select is(
+  (select string_agg(a.attname::text, ',' order by a.attname)
+   from pg_attribute a
+   where a.attrelid = 'public.transactions'::regclass
+     and a.attnum > 0 and not a.attisdropped
+     and has_column_privilege('authenticated', a.attrelid, a.attnum, 'update')),
+  'account_id,amount_cents,category_id,date,kind,merchant',
+  'authenticated may UPDATE exactly the 6 intended transactions columns (id/user_id/movement_id/created_at excluded)'
 );
 
 select is(
@@ -217,7 +272,7 @@ select is(
 );
 
 -- ============================================================
--- Behavioral: authenticated cannot write the other nine tables
+-- Behavioral: authenticated cannot write the other eight tables
 -- ============================================================
 
 reset role;
@@ -238,7 +293,7 @@ select throws_ok(
   null,
   format('authenticated INSERT on %s is denied at the GRANT layer', t.name)
 ) from write_posture_tables t
-where t.name not in (select name from cp2_writable_tables);
+where t.name not in (select name from writable_tables);
 
 -- `where false` still requires the UPDATE privilege: permission is
 -- checked before the qualifier is evaluated.
@@ -249,7 +304,7 @@ select throws_ok(
   format('authenticated UPDATE on %s is denied at the GRANT layer', t.name)
 ) from write_posture_tables t
 where t.name <> 'profiles'
-  and t.name not in (select name from cp2_writable_tables);
+  and t.name not in (select name from writable_tables);
 
 -- profiles has no user_id column -- its primary key *is* the user id.
 select throws_ok(
@@ -259,15 +314,17 @@ select throws_ok(
   'authenticated UPDATE on profiles is denied at the GRANT layer'
 );
 
--- DELETE covers all eleven, accounts and categories included: CP2 adds
--- no DELETE grant to either, because both are archived rather than
--- removed.
+-- DELETE covers ten of the eleven -- accounts and categories included,
+-- since CP2 added no DELETE grant to either and CP3 adds none now.
+-- transactions is the sole exception, excluded by the list rather than
+-- by name so the exception cannot silently grow.
 select throws_ok(
   format('delete from public.%I where false', t.name),
   '42501',
   null,
   format('authenticated DELETE on %s is denied at the GRANT layer', t.name)
-) from write_posture_tables t;
+) from write_posture_tables t
+where t.name not in (select name from deletable_tables);
 
 -- ============================================================
 -- Behavioral: the ungranted columns of the two writable tables
@@ -308,6 +365,33 @@ select throws_ok(
   'authenticated cannot UPDATE categories.id'
 );
 
+-- transactions' four excluded UPDATE columns, each by an actual
+-- statement. `id` and `movement_id` are the two that are new in kind:
+-- an editable id would let an idempotency collision be edited away, and
+-- an editable movement_id would let an ordinary row be adopted into a
+-- movement (or a leg re-parented) -- which validate_movement() would
+-- catch at COMMIT, but this makes it impossible rather than futile.
+select throws_ok(
+  $$ update public.transactions set user_id = user_id where false $$,
+  '42501', null,
+  'authenticated cannot UPDATE transactions.user_id -- a transaction can never be re-homed'
+);
+select throws_ok(
+  $$ update public.transactions set id = id where false $$,
+  '42501', null,
+  'authenticated cannot UPDATE transactions.id -- the idempotency key is chosen once'
+);
+select throws_ok(
+  $$ update public.transactions set movement_id = movement_id where false $$,
+  '42501', null,
+  'authenticated cannot UPDATE transactions.movement_id -- no re-parenting, no adoption into a movement'
+);
+select throws_ok(
+  $$ update public.transactions set created_at = now() where false $$,
+  '42501', null,
+  'authenticated cannot UPDATE transactions.created_at -- the same-day ordering tie-break'
+);
+
 -- INSERT is column-scoped too: naming a column outside the grant fails
 -- at the privilege layer before any value is considered.
 select throws_ok(
@@ -322,6 +406,12 @@ select throws_ok(
   '42501', null,
   'authenticated cannot create an already-archived category'
 );
+select throws_ok(
+  $$ insert into public.transactions (user_id, account_id, date, merchant, kind, amount_cents, created_at)
+     values ('18000000-0000-4000-8000-000000000001', '18000000-0000-4000-8000-0000000000a9', '2026-01-01', 'x', 'expense', -1, now()) $$,
+  '42501', null,
+  'authenticated cannot backdate a transactions.created_at on INSERT'
+);
 
 -- ============================================================
 -- Behavioral: anon cannot write either
@@ -330,7 +420,9 @@ select throws_ok(
 -- anon has no grant of any kind, so no claim is set: the request never
 -- reaches RLS. Spot-checked rather than exhaustive -- the catalog half
 -- above already covers every table for this role -- but deliberately
--- spot-checked on the two tables CP2 opened.
+-- spot-checked on all three tables the application can write, DELETE
+-- included, since transactions is the first table where DELETE is
+-- granted to anyone at all.
 
 reset role;
 set local role anon;
@@ -352,6 +444,11 @@ select throws_ok(
 select throws_ok(
   $$ update public.categories set name = 'x' where false $$,
   '42501', null, 'anon UPDATE on categories is denied at the GRANT layer'
+);
+select throws_ok(
+  $$ insert into public.transactions (user_id, account_id, date, merchant, kind, amount_cents)
+     values ('18000000-0000-4000-8000-000000000001', '18000000-0000-4000-8000-0000000000a9', '2026-01-01', 'x', 'expense', -1) $$,
+  '42501', null, 'anon INSERT on transactions is denied at the GRANT layer'
 );
 select throws_ok(
   $$ delete from public.transactions where false $$,
