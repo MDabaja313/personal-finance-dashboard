@@ -82,6 +82,20 @@ export const RECONCILIATION_ROUTES = [
 ];
 
 /**
+ * The routes a budget write must invalidate — only the two routes that
+ * render a budget row or its utilisation. Neither `/accounts`,
+ * `/transactions`, nor `/analytics` reads a budget at all.
+ */
+export const BUDGET_ROUTES = ["/budgets", "/dashboard"];
+
+/**
+ * The routes a goal or goal-contribution write must invalidate — the same
+ * two-route shape as budgets, for the identical reason: a goal moves no
+ * balance and creates no transaction.
+ */
+export const GOAL_ROUTES = ["/goals", "/dashboard"];
+
+/**
  * The calendar day `delta` days from `date`, as 'YYYY-MM-DD'.
  *
  * `Date.UTC` rather than local-midnight construction, for the same reason

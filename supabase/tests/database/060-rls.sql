@@ -19,7 +19,7 @@
 -- 42501 before RLS is ever consulted; a granted-but-unmatched SELECT
 -- returns zero rows, not an error.
 begin;
-select plan(43);
+select plan(46);
 
 -- ============================================================
 -- Fixture: two users, one row in each of the 10 grant-bearing tables,
@@ -169,16 +169,19 @@ select is(
 -- regardless of ownership.
 -- Phase 7 CP2 gave `authenticated` column-scoped INSERT/UPDATE on
 -- accounts and categories; CP3 added transactions (INSERT/UPDATE/
--- DELETE); CP4 added movements (SELECT/INSERT/DELETE, never UPDATE). So
--- this file no longer asserts blanket write-denial on those four --
--- their full grant, RLS, trigger and RPC behavior is
--- 100/110/120/130/135/140. Every *other* table is still read-only for
--- this role, which is what the spread below covers. budgets and bills
--- stand in here for the tables these assertions used to name.
+-- DELETE); CP4 added movements (SELECT/INSERT/DELETE, never UPDATE);
+-- CP6 added budgets (INSERT/UPDATE/DELETE) and goals (INSERT/UPDATE,
+-- never DELETE) -- goal_contributions stays INSERT-only. So this file
+-- no longer asserts blanket write-denial on those six -- their full
+-- grant, RLS, trigger and RPC behavior is
+-- 100/110/120/130/135/140/170. Every *other* table is still read-only
+-- for this role, which is what the spread below covers. bills and
+-- bill_occurrences stand in here for the tables these assertions used
+-- to name.
 select throws_ok(
-  $$ insert into public.budgets (id, user_id, category_id, period, limit_cents) values ('14000000-0000-4000-8000-0000000000b3', '14000000-0000-4000-8000-000000000001', '14000000-0000-4000-8000-0000000000c1', '2026-02', 1000) $$,
+  $$ insert into public.bills (id, user_id, name, amount_cents, frequency, anchor_date) values ('14000000-0000-4000-8000-000000000203', '14000000-0000-4000-8000-000000000001', 'C-bill', 300, 'monthly', '2026-01-01') $$,
   '42501', null,
-  'authenticated INSERT on budgets (even own row) is denied at the GRANT layer'
+  'authenticated INSERT on bills (even own row) is denied at the GRANT layer'
 );
 select throws_ok(
   $$ update public.bills set name = 'changed' where user_id = '14000000-0000-4000-8000-000000000001' $$,
@@ -188,7 +191,22 @@ select throws_ok(
 select throws_ok(
   $$ delete from public.goals where id = '14000000-0000-4000-8000-000000000401' $$,
   '42501', null,
-  'authenticated DELETE on goals (even own row) is denied at the GRANT layer'
+  'authenticated DELETE on goals (even own row) is denied at the GRANT layer -- CP6 gave goals no DELETE grant'
+);
+select throws_ok(
+  $$ update public.goal_contributions set note = 'changed' where id = '14000000-0000-4000-8000-000000000501' $$,
+  '42501', null,
+  'authenticated UPDATE on goal_contributions is denied at the GRANT layer -- append-only, permanently'
+);
+select throws_ok(
+  $$ delete from public.goal_contributions where id = '14000000-0000-4000-8000-000000000501' $$,
+  '42501', null,
+  'authenticated DELETE on goal_contributions is denied at the GRANT layer -- append-only, permanently'
+);
+select throws_ok(
+  $$ insert into public.bill_occurrences (id, user_id, bill_id, due_date, status, amount_cents) values ('14000000-0000-4000-8000-000000000303', '14000000-0000-4000-8000-000000000001', '14000000-0000-4000-8000-000000000201', '2026-02-01', 'scheduled', 100) $$,
+  '42501', null,
+  'authenticated INSERT on bill_occurrences (even own row) is denied at the GRANT layer -- system-generated only'
 );
 select throws_ok(
   $$ update public.profiles set timezone = 'America/New_York' where id = '14000000-0000-4000-8000-000000000001' $$,

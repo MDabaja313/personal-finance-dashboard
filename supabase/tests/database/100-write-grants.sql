@@ -1,34 +1,46 @@
--- Write-privilege posture: the exact CP4 matrix, and nothing wider.
+-- Write-privilege posture: the exact CP6 matrix, and nothing wider.
 --
 -- Phase 7 CP1 shipped no migration and no write GRANT at all, and this
 -- file proved it. CP2 opened two tables -- accounts and categories --
 -- so the file became an allowlist rather than an emptiness check. CP3
 -- added a third, transactions, and with it the first DELETE grant in
--- this schema. CP4 adds a fourth, movements. The purpose is unchanged
--- and, if anything, sharper: the set of things `authenticated` can write
--- is a checked fact, down to the column and down to the operation, so
+-- this schema. CP4 added a fourth, movements. CP6 adds three more --
+-- budgets, goals, goal_contributions. The purpose is unchanged and, if
+-- anything, sharper: the set of things `authenticated` can write is a
+-- checked fact, down to the column and down to the operation, so
 -- neither a later checkpoint nor a careless migration can widen it
 -- without a test turning red here.
 --
--- INSERT: accounts, categories, transactions, movements -- column-scoped
--- in every case. UPDATE: the first three only. DELETE: transactions and
--- movements only. The three sets are deliberately different, and each
--- difference carries a reason:
+-- INSERT: accounts, categories, transactions, movements, budgets,
+-- goals, goal_contributions -- column-scoped in every case. UPDATE: all
+-- of those except movements and goal_contributions. DELETE:
+-- transactions, movements and budgets only. The sets are deliberately
+-- different, and each difference carries a reason:
 --
 --   * Accounts, categories, bills and goals are *labels* historical rows
 --     resolve through, so they are archived rather than removed. A
 --     transaction is the history itself and has no correct archived
 --     state; a movement is the only correct unit for removing a pair of
 --     legs, since deleting the parent cascades both and a leg is
---     invisible to DELETE outright.
+--     invisible to DELETE outright. A budget is planning metadata, not
+--     ledger history, so it alone among the archived-style tables gets
+--     an ordinary hard DELETE -- there is nothing about it worth
+--     preserving once it is wrong.
 --   * movements holds no UPDATE at all. Its row is (id, user_id, kind),
 --     and changing `kind` in place would contradict every leg's own kind
 --     -- an edit rewrites the pair through public.replace_movement, it
 --     does not retype the parent.
+--   * goal_contributions holds no UPDATE and no DELETE, ever --
+--     append-only is the entire point of the table
+--     (docs/database-schema.md §12). A correction is a new signed row.
 --
--- CP4 also brings the first two functions `authenticated` may EXECUTE
+-- CP4 also brought the first two functions `authenticated` may EXECUTE
 -- anywhere in this schema. Their full behavior is 140-movement-writes.sql;
--- what is asserted here is that `anon` cannot reach either one.
+-- what is asserted here is that `anon` cannot reach either one. CP6's
+-- full budget/goal/contribution behavior (idempotency, the category and
+-- archived-goal guard triggers, cross-owner refusal) is
+-- 170-budget-goal-writes.sql; this file stays scoped to the grant
+-- matrix.
 --
 -- Three layers, all asserted, because no one of them is sufficient:
 --
@@ -75,7 +87,7 @@
 -- for movements it is 140-movement-writes.sql; the invariant triggers
 -- are 120/130 and the movement invariant is 020.
 begin;
-select plan(70);
+select plan(81);
 
 -- Every user-financial table. The last assertion in this file proves
 -- this list is exactly `public`'s table set, so it cannot silently fall
@@ -91,24 +103,31 @@ insert into write_posture_tables (name) values
 -- hardcoded name repeated in a dozen places.
 create temporary table writable_tables (name text primary key) on commit drop;
 insert into writable_tables (name) values
-  ('accounts'), ('categories'), ('transactions'), ('movements');
+  ('accounts'), ('categories'), ('transactions'), ('movements'),
+  ('budgets'), ('goals'), ('goal_contributions');
 
--- UPDATE is tracked separately because CP4 made the two sets diverge:
--- movements holds INSERT and DELETE but **never** UPDATE. A movements
--- row is (id, user_id, kind), and changing `kind` in place would
--- contradict every leg's own kind (validate_movement() assert 3) --
--- rewriting the pair together is what public.replace_movement does, by
--- delete-and-recreate. Without its own list, "movements is writable"
--- would be true enough to hide the one operation that must stay shut.
+-- UPDATE is tracked separately because CP4 and CP6 made the two sets
+-- diverge: movements and goal_contributions hold INSERT (and, for
+-- movements, DELETE) but **never** UPDATE. A movements row is
+-- (id, user_id, kind), and changing `kind` in place would contradict
+-- every leg's own kind (validate_movement() assert 3) -- rewriting the
+-- pair together is what public.replace_movement does, by
+-- delete-and-recreate. goal_contributions has no UPDATE for a different
+-- reason: append-only is the entire point of the table. Without its own
+-- list, "movements/goal_contributions are writable" would be true
+-- enough to hide the one operation that must stay shut on each.
 create temporary table updatable_tables (name text primary key) on commit drop;
-insert into updatable_tables (name) values ('accounts'), ('categories'), ('transactions');
+insert into updatable_tables (name) values
+  ('accounts'), ('categories'), ('transactions'), ('budgets'), ('goals');
 
 -- DELETE is tracked separately too, because it is granted on a strictly
--- narrower set than INSERT: transactions and movements only. Folding it
--- into the list above would make "accounts cannot be deleted"
--- untestable.
+-- narrower set than INSERT: transactions, movements and budgets only.
+-- Folding it into the list above would make "accounts cannot be
+-- deleted" untestable. goals is deliberately absent -- CP6 gave it the
+-- CP2 accounts/categories treatment (soft-delete via `archived_at`),
+-- never a DELETE grant.
 create temporary table deletable_tables (name text primary key) on commit drop;
-insert into deletable_tables (name) values ('transactions'), ('movements');
+insert into deletable_tables (name) values ('transactions'), ('movements'), ('budgets');
 
 -- The behavioral section below reads these lists while running *as*
 -- `authenticated`/`anon`, so those roles need to see them. Scoped to
@@ -152,37 +171,42 @@ select is(
    where has_any_column_privilege('authenticated', 'public.' || t.name, 'insert')
      and t.name not in (select name from writable_tables)),
   0,
-  'authenticated has no INSERT grant outside accounts/categories/transactions/movements'
+  'authenticated has no INSERT grant outside accounts/categories/transactions/movements/budgets/goals/goal_contributions'
 );
 select is(
   (select count(*)::int from writable_tables t
    where has_any_column_privilege('authenticated', 'public.' || t.name, 'insert')),
-  4,
-  'authenticated does hold an INSERT grant on all four writable tables (not vacuous)'
+  7,
+  'authenticated does hold an INSERT grant on all seven writable tables (not vacuous)'
 );
 
 -- UPDATE is checked against `updatable_tables`, which is a strict subset
 -- of `writable_tables`: this is the assertion that would fail the moment
--- someone "completed" the movements grants by adding UPDATE.
+-- someone "completed" the movements or goal_contributions grants by
+-- adding UPDATE.
 select is(
   (select count(*)::int from write_posture_tables t
    where has_any_column_privilege('authenticated', 'public.' || t.name, 'update')
      and t.name not in (select name from updatable_tables)),
   0,
-  'authenticated has no UPDATE grant outside accounts/categories/transactions -- movements included'
+  'authenticated has no UPDATE grant outside accounts/categories/transactions/budgets/goals -- movements and goal_contributions included'
 );
 select is(
   (select count(*)::int from updatable_tables t
    where has_any_column_privilege('authenticated', 'public.' || t.name, 'update')),
-  3,
-  'authenticated does hold an UPDATE grant on all three updatable tables (not vacuous)'
+  5,
+  'authenticated does hold an UPDATE grant on all five updatable tables (not vacuous)'
 );
 -- Stated on its own as well, because it is the single most important
--- negative fact about the CP4 grants and a set-difference assertion is
--- easy to read past.
+-- negative fact about the CP4/CP6 grants and a set-difference assertion
+-- is easy to read past.
 select ok(
   not has_any_column_privilege('authenticated', 'public.movements', 'update'),
   'authenticated holds no UPDATE privilege on any column of movements'
+);
+select ok(
+  not has_any_column_privilege('authenticated', 'public.goal_contributions', 'update'),
+  'authenticated holds no UPDATE privilege on any column of goal_contributions -- append-only'
 );
 
 -- DELETE is table-level only -- PostgreSQL has no column-level DELETE
@@ -193,13 +217,13 @@ select is(
    where has_table_privilege('authenticated', 'public.' || t.name, 'delete')
      and t.name not in (select name from deletable_tables)),
   0,
-  'authenticated has no DELETE grant outside transactions/movements -- accounts and categories included'
+  'authenticated has no DELETE grant outside transactions/movements/budgets -- accounts, categories, goals and goal_contributions included'
 );
 select is(
   (select count(*)::int from deletable_tables t
    where has_table_privilege('authenticated', 'public.' || t.name, 'delete')),
-  2,
-  'authenticated does hold DELETE on transactions and movements (not vacuous)'
+  3,
+  'authenticated does hold DELETE on transactions, movements and budgets (not vacuous)'
 );
 
 -- ============================================================
@@ -309,6 +333,79 @@ select is(
      and has_column_privilege('authenticated', a.attrelid, a.attnum, 'update')),
   null,
   'authenticated may UPDATE no movements column whatsoever'
+);
+
+-- budgets. Every column the table has (id, user_id, category_id,
+-- period, limit_cents) is INSERT-grantable -- there is no created_at on
+-- this table and nothing else to exclude, unlike every other table
+-- here. `category_id` and `period` decide what the budget fundamentally
+-- *is* and are INSERT-only; only `limit_cents` survives into the UPDATE
+-- grant below.
+select is(
+  (select string_agg(a.attname::text, ',' order by a.attname)
+   from pg_attribute a
+   where a.attrelid = 'public.budgets'::regclass
+     and a.attnum > 0 and not a.attisdropped
+     and has_column_privilege('authenticated', a.attrelid, a.attnum, 'insert')),
+  'category_id,id,limit_cents,period,user_id',
+  'authenticated may INSERT exactly all 5 budgets columns (the table has no others)'
+);
+select is(
+  (select string_agg(a.attname::text, ',' order by a.attname)
+   from pg_attribute a
+   where a.attrelid = 'public.budgets'::regclass
+     and a.attnum > 0 and not a.attisdropped
+     and has_column_privilege('authenticated', a.attrelid, a.attnum, 'update')),
+  'limit_cents',
+  'authenticated may UPDATE only budgets.limit_cents (id/user_id/category_id/period excluded)'
+);
+
+-- goals. `archived_at` is UPDATE-only, exactly like accounts.is_archived
+-- -- a goal may never be *created* already archived. `id`/`user_id` are
+-- INSERT-only, as everywhere else in this schema.
+select is(
+  (select string_agg(a.attname::text, ',' order by a.attname)
+   from pg_attribute a
+   where a.attrelid = 'public.goals'::regclass
+     and a.attnum > 0 and not a.attisdropped
+     and has_column_privilege('authenticated', a.attrelid, a.attnum, 'insert')),
+  'id,name,target_cents,target_date,user_id',
+  'authenticated may INSERT exactly the 5 intended goals columns (archived_at excluded)'
+);
+select is(
+  (select string_agg(a.attname::text, ',' order by a.attname)
+   from pg_attribute a
+   where a.attrelid = 'public.goals'::regclass
+     and a.attnum > 0 and not a.attisdropped
+     and has_column_privilege('authenticated', a.attrelid, a.attnum, 'update')),
+  'archived_at,name,target_cents,target_date',
+  'authenticated may UPDATE exactly the 4 intended goals columns (id/user_id excluded)'
+);
+
+-- goal_contributions. `id` is grantable for the same client-minted-key
+-- reason as transactions.id and movements.id: two identical real
+-- contributions are legitimate distinct events, so only a stable key can
+-- tell a retry apart from a second one. `created_at` is excluded, like
+-- everywhere else it exists -- it takes its default. No UPDATE column at
+-- all: `string_agg` over an empty set is NULL, the column-level
+-- statement of "append-only" above.
+select is(
+  (select string_agg(a.attname::text, ',' order by a.attname)
+   from pg_attribute a
+   where a.attrelid = 'public.goal_contributions'::regclass
+     and a.attnum > 0 and not a.attisdropped
+     and has_column_privilege('authenticated', a.attrelid, a.attnum, 'insert')),
+  'amount_cents,goal_id,id,note,occurred_on,user_id',
+  'authenticated may INSERT exactly the 6 intended goal_contributions columns (created_at excluded)'
+);
+select is(
+  (select string_agg(a.attname::text, ',' order by a.attname)
+   from pg_attribute a
+   where a.attrelid = 'public.goal_contributions'::regclass
+     and a.attnum > 0 and not a.attisdropped
+     and has_column_privilege('authenticated', a.attrelid, a.attnum, 'update')),
+  null,
+  'authenticated may UPDATE no goal_contributions column whatsoever'
 );
 
 -- ============================================================
@@ -502,6 +599,55 @@ select throws_ok(
   'authenticated cannot UPDATE movements.kind -- an edit rewrites the pair, it does not retype the parent'
 );
 
+-- budgets' four excluded UPDATE columns: only limit_cents survives.
+-- Getting the category or the month wrong means delete-and-recreate, not
+-- an in-place edit.
+select throws_ok(
+  $$ update public.budgets set user_id = user_id where false $$,
+  '42501', null,
+  'authenticated cannot UPDATE budgets.user_id -- a budget can never be re-homed'
+);
+select throws_ok(
+  $$ update public.budgets set id = id where false $$,
+  '42501', null,
+  'authenticated cannot UPDATE budgets.id'
+);
+select throws_ok(
+  $$ update public.budgets set category_id = category_id where false $$,
+  '42501', null,
+  'authenticated cannot UPDATE budgets.category_id -- wrong category means delete and recreate'
+);
+select throws_ok(
+  $$ update public.budgets set period = period where false $$,
+  '42501', null,
+  'authenticated cannot UPDATE budgets.period -- wrong month means delete and recreate'
+);
+
+-- goals' two excluded UPDATE columns.
+select throws_ok(
+  $$ update public.goals set user_id = user_id where false $$,
+  '42501', null,
+  'authenticated cannot UPDATE goals.user_id -- a goal can never be re-homed'
+);
+select throws_ok(
+  $$ update public.goals set id = id where false $$,
+  '42501', null,
+  'authenticated cannot UPDATE goals.id'
+);
+
+select throws_ok(
+  $$ insert into public.goals (id, user_id, name, target_cents, target_date, archived_at)
+     values ('18000000-0000-4000-8000-0000000000c1', '18000000-0000-4000-8000-000000000001', 'x', 100, null, now()) $$,
+  '42501', null,
+  'authenticated cannot create an already-archived goal'
+);
+select throws_ok(
+  $$ insert into public.goal_contributions (id, user_id, goal_id, amount_cents, occurred_on, created_at)
+     values ('18000000-0000-4000-8000-0000000000c2', '18000000-0000-4000-8000-000000000001', '18000000-0000-4000-8000-0000000000c1', 100, '2026-01-01', now()) $$,
+  '42501', null,
+  'authenticated cannot backdate a goal_contributions.created_at on INSERT'
+);
+
 -- ============================================================
 -- Behavioral: anon cannot write either
 -- ============================================================
@@ -551,6 +697,15 @@ select throws_ok(
 select throws_ok(
   $$ delete from public.movements where false $$,
   '42501', null, 'anon DELETE on movements is denied at the GRANT layer'
+);
+select throws_ok(
+  $$ insert into public.budgets (user_id, category_id, period, limit_cents)
+     values ('18000000-0000-4000-8000-000000000001', '18000000-0000-4000-8000-0000000000c9', '2026-01', 1000) $$,
+  '42501', null, 'anon INSERT on budgets is denied at the GRANT layer'
+);
+select throws_ok(
+  $$ delete from public.budgets where false $$,
+  '42501', null, 'anon DELETE on budgets is denied at the GRANT layer -- CP6''s new grant, anon still excluded'
 );
 -- And the two RPCs are unreachable for anon at the privilege layer,
 -- before any argument is examined -- which is what makes "an anonymous

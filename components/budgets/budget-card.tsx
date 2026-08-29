@@ -1,3 +1,5 @@
+import { BudgetCardActions } from "@/components/budgets/budget-card-actions";
+import type { BudgetMutationActions } from "@/components/budgets/types";
 import { Meter } from "@/components/shared/meter";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import type { BudgetStatus } from "@/lib/finance/budgets";
@@ -5,7 +7,22 @@ import { formatCents } from "@/lib/format/currency";
 import { toCents } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
-export function BudgetCard({ status, categoryName }: { status: BudgetStatus; categoryName: string }) {
+/**
+ * `actions` is optional so this stays usable as a pure display component —
+ * the dashboard's budget section renders one with none, `/budgets` renders
+ * one with the full set. Existing calculations (`budgetStatus`) remain the
+ * sole authority on spend, over-budget state, and utilisation; nothing here
+ * recomputes any of it.
+ */
+export function BudgetCard({
+  status,
+  categoryName,
+  actions,
+}: {
+  status: BudgetStatus;
+  categoryName: string;
+  actions?: BudgetMutationActions;
+}) {
   const { budget, spentCents, remainingCents, utilization, isOverBudget } = status;
 
   return (
@@ -25,6 +42,7 @@ export function BudgetCard({ status, categoryName }: { status: BudgetStatus; cat
             ? `${formatCents(toCents(-remainingCents))} over budget`
             : `${formatCents(remainingCents)} remaining`}
         </p>
+        {actions && <BudgetCardActions budget={budget} actions={actions} />}
       </CardContent>
     </Card>
   );

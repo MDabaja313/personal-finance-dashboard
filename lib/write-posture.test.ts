@@ -404,15 +404,17 @@ describe("write-boundary source posture", () => {
   });
 });
 
-describe("CP5 write surface is exactly accounts + categories + transactions + movements + reconciliation", () => {
+describe("CP6 write surface is exactly accounts + categories + transactions + movements + reconciliation + budgets + goals + goal-contributions", () => {
   // CP1's version of this block asserted the application was still entirely
   // read-only; CP2's turned it into a two-domain allowlist; CP3 added the
-  // third; CP4 the fourth. CP5 adds reconciliation, which is deliberately NOT
-  // a fifth table — it writes `transactions` through an RPC and opens no new
-  // relation at all. The point is unchanged throughout: the set of writable
-  // things is a checked fact, and adding to it cannot happen quietly.
+  // third; CP4 the fourth; CP5 added reconciliation, deliberately NOT a fifth
+  // table (it writes `transactions` through an RPC and opens no new relation
+  // at all). CP6 adds three genuinely new tables — budgets, goals,
+  // goal_contributions. The point is unchanged throughout: the set of
+  // writable things is a checked fact, and adding to it cannot happen
+  // quietly.
 
-  it("has Server Actions only for auth, accounts, categories, transactions, movements, and reconciliation", () => {
+  it("has Server Actions only for auth, accounts, categories, transactions, movements, reconciliation, budgets, goals, and goal-contributions", () => {
     // 'use server' marks a file whose exports are independently reachable HTTP
     // endpoints. Every one of them is a new attack surface, so the list is
     // enumerated rather than bounded.
@@ -427,7 +429,10 @@ describe("CP5 write surface is exactly accounts + categories + transactions + mo
 
     expect(serverActionFiles).toEqual([
       "lib/actions/accounts.ts",
+      "lib/actions/budgets.ts",
       "lib/actions/categories.ts",
+      "lib/actions/goal-contributions.ts",
+      "lib/actions/goals.ts",
       "lib/actions/movements.ts",
       "lib/actions/reconciliation.ts",
       "lib/actions/transactions.ts",
@@ -435,7 +440,7 @@ describe("CP5 write surface is exactly accounts + categories + transactions + mo
     ]);
   });
 
-  it("has mutation DAL modules only for the five write domains plus the snapshot bridge", () => {
+  it("has mutation DAL modules only for the eight write domains plus the snapshot bridge", () => {
     const mutationModules = filesWithCode
       .map(({ repoPath }) => repoPath)
       .filter((repoPath) => repoPath.startsWith("lib/data/mutations/"))
@@ -443,7 +448,10 @@ describe("CP5 write surface is exactly accounts + categories + transactions + mo
 
     expect(mutationModules).toEqual([
       "lib/data/mutations/accounts.ts",
+      "lib/data/mutations/budgets.ts",
       "lib/data/mutations/categories.ts",
+      "lib/data/mutations/goal-contributions.ts",
+      "lib/data/mutations/goals.ts",
       "lib/data/mutations/movements.ts",
       "lib/data/mutations/reconciliation.ts",
       "lib/data/mutations/snapshots.ts",
@@ -451,14 +459,27 @@ describe("CP5 write surface is exactly accounts + categories + transactions + mo
     ]);
   });
 
-  it("has no budget, bill, goal, or contribution write surface — CP6 onward is not implemented", () => {
-    // The specific things CP5 must not have started. Each would also fail the
+  it("has no bill or bill-occurrence write surface — CP7 onward is not implemented", () => {
+    // The specific things CP6 must not have started. Each would also fail the
     // enumerations above, but failing here says which one and why.
     const modules = filesWithCode.map(({ repoPath }) => repoPath);
-    for (const domain of ["budgets", "bills", "bill-occurrences", "goals", "contributions"]) {
+    for (const domain of ["bills", "bill-occurrences"]) {
       expect(modules).not.toContain(`lib/data/mutations/${domain}.ts`);
       expect(modules).not.toContain(`lib/actions/${domain}.ts`);
     }
+  });
+
+  it("keeps goal_contributions strictly append-only in source", () => {
+    // The database backstop (no UPDATE/DELETE grant, ever) is
+    // 100-write-grants.sql; this is the source-side statement that the one
+    // module that could reach this table never even attempts either verb
+    // against it.
+    const goalContributionModule = filesWithCode.find(
+      ({ repoPath }) => repoPath === "lib/data/mutations/goal-contributions.ts"
+    );
+    expect(goalContributionModule).toBeDefined();
+    expect(goalContributionModule!.code).not.toMatch(/\.update\s*\(/);
+    expect(goalContributionModule!.code).not.toMatch(/\.delete\s*\(/);
   });
 
   it("names the net-worth snapshot from exactly one module", () => {
@@ -620,20 +641,23 @@ describe("CP5 write surface is exactly accounts + categories + transactions + mo
     expect(offenders).toEqual([]);
   });
 
-  it("issues a PostgREST delete from exactly three modules", () => {
+  it("issues a PostgREST delete from exactly four modules", () => {
     // CP3 added the first DELETE in this application; CP4 the second; CP5 the
-    // third. All three are deliberate and none generalizes: accounts,
-    // categories, bills and goals are *labels* that historical rows resolve
-    // through, so they are archived, while a transaction is the history
-    // itself, a movement is the only correct unit for removing a pair of legs,
-    // and an adjustment is removable precisely because it is not editable.
+    // third; CP6 the fourth (budgets). All four are deliberate and none
+    // generalizes: accounts, categories, bills and goals are *labels* that
+    // historical rows resolve through, so they are archived, while a
+    // transaction is the history itself, a movement is the only correct unit
+    // for removing a pair of legs, an adjustment is removable precisely
+    // because it is not editable, and a budget is planning metadata with no
+    // history to lose.
     //
-    // CP5 adds no privilege to make its delete possible — it reuses CP3's
+    // CP5 added no privilege to make its delete possible — it reuses CP3's
     // `DELETE` grant and `transactions_delete_own_non_movement`, which
-    // deliberately never excluded adjustments. This is the source-side half of
-    // that claim; the privilege-side half is
-    // supabase/tests/database/100-write-grants.sql, which still proves DELETE
-    // is granted on transactions and movements and on nothing else.
+    // deliberately never excluded adjustments. CP6's budgets delete *is* a new
+    // privilege, granted for the first time in
+    // `20260830120001_budget_goal_writes.sql`. This is the source-side half of
+    // both claims; the privilege-side half is
+    // supabase/tests/database/100-write-grants.sql.
     const deleters = filesWithCode
       .filter(({ repoPath }) => repoPath.startsWith("lib/data/mutations/"))
       .filter(({ code }) => /\.delete\s*\(/.test(code))
@@ -641,22 +665,24 @@ describe("CP5 write surface is exactly accounts + categories + transactions + mo
       .sort();
 
     expect(deleters).toEqual([
+      "lib/data/mutations/budgets.ts",
       "lib/data/mutations/movements.ts",
       "lib/data/mutations/reconciliation.ts",
       "lib/data/mutations/transactions.ts",
     ]);
   });
 
-  it("writes to no table other than accounts, categories, transactions, and movements", () => {
+  it("writes to no table other than accounts, categories, transactions, movements, budgets, and goals", () => {
     // Every `.from("...")` in the mutation layer, enumerated. The read probes
     // (budgets/bills for the category preflight, bill_occurrences for the
     // delete preflight, account_balances for the account and reconcile
-    // preflights) are legitimate and appear here too — this asserts the *set of
-    // relations the layer touches*, which is the number that must not grow
-    // silently. CP5 adds no name to it: reconciliation reads
-    // `account_balances` and reads/deletes `transactions`, both already here,
-    // and `net_worth_snapshots` is absent because application code never
-    // touches that table at all.
+    // preflights, goals for the contribution preflight) are legitimate and
+    // appear here too — this asserts the *set of relations the layer
+    // touches*, which is the number that must not grow silently. CP5 added no
+    // name to it: reconciliation reads `account_balances` and reads/deletes
+    // `transactions`, both already here. CP6 adds three: `budgets`, `goals`,
+    // and `goal_contributions`; `net_worth_snapshots` stays absent because
+    // application code never touches that table at all.
     const relations = new Set<string>();
 
     for (const { repoPath, code } of filesWithCode) {
@@ -671,6 +697,8 @@ describe("CP5 write surface is exactly accounts + categories + transactions + mo
       "bills",
       "budgets",
       "categories",
+      "goal_contributions",
+      "goals",
       "movements",
       "transactions",
     ]);

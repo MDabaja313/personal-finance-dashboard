@@ -1,7 +1,9 @@
 import { PiggyBank } from "lucide-react";
+import { AddBudget } from "@/components/budgets/add-budget";
 import { BudgetCard } from "@/components/budgets/budget-card";
 import { EmptyState } from "@/components/shared/empty-state";
 import { PageHeader } from "@/components/shared/page-header";
+import { createBudgetAction, deleteBudgetAction, updateBudgetAction } from "@/lib/actions/budgets";
 import { getBudgets } from "@/lib/data/budgets";
 import { getCategories } from "@/lib/data/categories";
 import { getToday } from "@/lib/data/clock";
@@ -10,6 +12,12 @@ import { budgetStatus } from "@/lib/finance/budgets";
 import { monthKey } from "@/lib/finance/dates";
 import { monthLabel } from "@/lib/format/date";
 
+/**
+ * Phase 7 CP6: `/budgets` becomes the current-month budget management
+ * surface. The Server Actions are imported here, in `app/**`, and handed to
+ * the client components as props — `components/**` may not value-import
+ * `lib/actions/**`, and may not reach `lib/data/mutations/**` at all.
+ */
 export default async function BudgetsPage() {
   const today = await getToday();
   const period = monthKey(today);
@@ -30,9 +38,23 @@ export default async function BudgetsPage() {
     return nameA.localeCompare(nameB);
   });
 
+  // Every active expense category this month does not already have a
+  // budget for — the create form's own category selector, computed here so
+  // it can never offer a choice the database would refuse with a unique
+  // conflict.
+  const budgetedCategoryIds = new Set(budgets.map((b) => b.categoryId));
+  const eligibleCategories = categories
+    .filter((c) => c.kind === "expense" && !c.isArchived && !budgetedCategoryIds.has(c.id))
+    .map((c) => ({ id: c.id, name: c.name }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  const actions = { update: updateBudgetAction, remove: deleteBudgetAction };
+
   return (
     <div className="flex flex-col gap-6">
       <PageHeader title="Budgets" description={`Category budgets for ${monthLabel(period)}.`} />
+
+      <AddBudget action={createBudgetAction} eligibleCategories={eligibleCategories} />
 
       {budgets.length === 0 ? (
         <EmptyState title="No budgets set for this month" icon={PiggyBank} />
@@ -43,6 +65,7 @@ export default async function BudgetsPage() {
               key={budget.id}
               status={budgetStatus(budget, transactions)}
               categoryName={categoryName.get(budget.categoryId) ?? budget.categoryId}
+              actions={actions}
             />
           ))}
         </div>

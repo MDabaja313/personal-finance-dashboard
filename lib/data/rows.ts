@@ -166,6 +166,31 @@ export interface NetWorthSnapshotRow {
 }
 
 /**
+ * `public.goal_balances`, widened with `archived_at` for the Phase 7 CP6
+ * management read (`getGoalsForManagement()`) — the ordinary `getGoals()`
+ * read stays on the narrower `GoalBalanceRow` above, since it deliberately
+ * never needs to know archive state.
+ */
+export interface GoalBalanceManagementRow extends GoalBalanceRow {
+  archived_at: string | null;
+}
+
+/**
+ * `public.goal_contributions`, projected for history display (Phase 7
+ * CP6). `created_at` is an ordering key only, like `TransactionRow`'s —
+ * PostgREST can order by a column that isn't selected, and it must never
+ * appear on the DTO.
+ */
+export interface GoalContributionRow {
+  id: string;
+  goal_id: string;
+  amount_cents: BigIntColumn;
+  /** DATE, 'YYYY-MM-DD'. */
+  occurred_on: string;
+  note: string | null;
+}
+
+/**
  * `public.movements` — the parent of exactly two transaction legs (Phase 7
  * CP4). `user_id` is filtered on but never selected, and `created_at` is not
  * read at all: a movement's date lives on its legs, not here.

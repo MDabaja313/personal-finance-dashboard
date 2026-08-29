@@ -242,6 +242,44 @@ export function isMovementKind(kind: TransactionKind): kind is MovementKind {
 }
 
 /**
+ * A goal contribution's user-facing action, and the TypeScript mirror of
+ * `signedAmountFor`'s pattern for `goal_contributions.amount_cents`: the form
+ * collects a non-negative magnitude and picks a direction, and the server
+ * derives the signed value that is actually stored. Nobody should have to
+ * reason about signed cents to log a deposit or a correction, and a signed
+ * field would let a well-formed submission contradict its own action.
+ *
+ * `add` deposits toward the goal (positive); `withdraw` records a withdrawal
+ * or a correction (negative). Both are legitimate, auditable events — a
+ * `goal_contributions` row is append-only, so a correction is always a new
+ * row, never an edit to an old one.
+ */
+export type ContributionAction = "add" | "withdraw";
+
+export const CONTRIBUTION_ACTIONS: readonly ContributionAction[] = ["add", "withdraw"];
+
+/**
+ * A non-negative magnitude plus a direction → the signed `Cents` actually
+ * stored on a `goal_contributions` row.
+ *
+ * Mirrors `signedAmountFor` exactly, including the `-0` normalization and the
+ * "throw on a negative magnitude" contract: the caller is
+ * `lib/validation/**`, which has already rejected a negative amount with a
+ * message a person can act on, so a value that bypassed validation must not
+ * silently produce a plausible-looking row here.
+ */
+export function signedContributionAmountFor(
+  action: ContributionAction,
+  magnitudeCents: Cents
+): Cents {
+  if (magnitudeCents < 0) {
+    throw new Error("signedContributionAmountFor requires a non-negative magnitude.");
+  }
+  if (action === "withdraw" && magnitudeCents !== 0) return toCents(-magnitudeCents);
+  return magnitudeCents;
+}
+
+/**
  * `public.bill_occurrence_status`. The `BillOccurrence` DTO itself does not
  * exist yet (DEVELOPMENT_PLAN.md defers it to the Phase 7 mark-as-paid work);
  * this is the label set that DTO and its validation will share.
