@@ -404,16 +404,21 @@ describe("write-boundary source posture", () => {
   });
 });
 
-describe("CP3 write surface is exactly accounts + categories + transactions", () => {
+describe("CP4 write surface is exactly accounts + categories + transactions + movements", () => {
   // CP1's version of this block asserted the application was still entirely
-  // read-only; CP2's turned it into a two-domain allowlist. CP3 adds the
-  // third. The point is unchanged throughout: the set of writable things is a
-  // checked fact, and adding a fourth cannot happen quietly.
+  // read-only; CP2's turned it into a two-domain allowlist; CP3 added the
+  // third. CP4 adds the fourth and last one this phase opens. The point is
+  // unchanged throughout: the set of writable things is a checked fact, and
+  // adding a fifth cannot happen quietly.
 
-  it("has Server Actions only for auth, accounts, categories, and transactions", () => {
+  it("has Server Actions only for auth, accounts, categories, transactions, and movements", () => {
     // 'use server' marks a file whose exports are independently reachable HTTP
     // endpoints. Every one of them is a new attack surface, so the list is
     // enumerated rather than bounded.
+    //
+    // `lib/actions/today.ts` is deliberately absent and must stay absent: it
+    // is an internal helper both dated-write action modules import, and
+    // marking it would publish an endpoint for something that is not one.
     const serverActionFiles = filesWithCode
       .filter(({ code }) => /^\s*["']use server["']/m.test(code))
       .map(({ repoPath }) => repoPath)
@@ -422,12 +427,13 @@ describe("CP3 write surface is exactly accounts + categories + transactions", ()
     expect(serverActionFiles).toEqual([
       "lib/actions/accounts.ts",
       "lib/actions/categories.ts",
+      "lib/actions/movements.ts",
       "lib/actions/transactions.ts",
       "lib/auth/actions.ts",
     ]);
   });
 
-  it("has mutation DAL modules only for accounts, categories, and transactions", () => {
+  it("has mutation DAL modules only for accounts, categories, transactions, and movements", () => {
     const mutationModules = filesWithCode
       .map(({ repoPath }) => repoPath)
       .filter((repoPath) => repoPath.startsWith("lib/data/mutations/"))
@@ -436,16 +442,66 @@ describe("CP3 write surface is exactly accounts + categories + transactions", ()
     expect(mutationModules).toEqual([
       "lib/data/mutations/accounts.ts",
       "lib/data/mutations/categories.ts",
+      "lib/data/mutations/movements.ts",
       "lib/data/mutations/transactions.ts",
     ]);
   });
 
-  it("has no movement mutation module — CP4 is not implemented", () => {
-    // The specific thing CP3 must not have started. A movements module would
-    // also fail the enumeration above, but failing here says why.
+  it("has no reconciliation surface — CP5 is not implemented", () => {
+    // The specific thing CP4 must not have started. An adjustments module
+    // would also fail the enumerations above, but failing here says why.
     const modules = filesWithCode.map(({ repoPath }) => repoPath);
-    expect(modules).not.toContain("lib/data/mutations/movements.ts");
-    expect(modules).not.toContain("lib/actions/movements.ts");
+    expect(modules).not.toContain("lib/data/mutations/adjustments.ts");
+    expect(modules).not.toContain("lib/actions/adjustments.ts");
+    expect(modules).not.toContain("lib/data/mutations/reconciliation.ts");
+    expect(modules).not.toContain("lib/actions/reconciliation.ts");
+  });
+
+  it("never writes a net-worth snapshot from application code — CP5 owns snapshots", () => {
+    // The snapshot writer is a `private` SECURITY DEFINER function owned by
+    // finance_snapshot_writer, and `authenticated` can neither execute it nor
+    // touch net_worth_snapshots. A movement moves two balances, which makes
+    // "refresh the snapshot afterwards" a tempting thing to add here; it is
+    // deliberately not CP4's to add.
+    //
+    // Scoped to the write layers. `lib/data/net-worth.ts` legitimately *reads*
+    // the table, which is the Phase 6 read path and has nothing to do with
+    // this.
+    const offenders = filesWithCode
+      .filter(
+        ({ repoPath }) =>
+          repoPath.startsWith("lib/data/mutations/") || repoPath.startsWith("lib/actions/")
+      )
+      .filter(({ code }) => /net_worth_snapshot/.test(code))
+      .map(({ repoPath }) => repoPath);
+
+    expect(offenders).toEqual([]);
+  });
+
+  it("calls a database function only from the mutation layer", () => {
+    // `.rpc(...)` is a second write path alongside `.insert`/`.update`/
+    // `.delete`, and CP4 is the first checkpoint to use one. It belongs in
+    // exactly the same place as every other write: the one layer where auth
+    // re-verification, owner predicates, and the write error mapper live.
+    const callers = filesWithCode
+      .filter(({ code }) => /\.rpc\s*\(/.test(code))
+      .map(({ repoPath }) => repoPath)
+      .sort();
+
+    expect(callers).toEqual(["lib/data/mutations/movements.ts"]);
+  });
+
+  it("names no RPC other than the two movement functions", () => {
+    // Enumerated rather than bounded, for the same reason the relation list
+    // below is: a function is a privilege surface, and `authenticated` holds
+    // EXECUTE on exactly two of them.
+    const invoked = new Set<string>();
+
+    for (const { code } of filesWithCode) {
+      for (const match of code.matchAll(/\.rpc\(\s*["'`]([a-z_]+)["'`]/g)) invoked.add(match[1]);
+    }
+
+    expect([...invoked].sort()).toEqual(["create_movement", "replace_movement"]);
   });
 
   it("never assigns `adjustment` as a kind in a write payload", () => {
@@ -469,11 +525,14 @@ describe("CP3 write surface is exactly accounts + categories + transactions", ()
     expect(offenders).toEqual([]);
   });
 
-  it("keeps the ordinary write path free of movement columns", () => {
-    // No mutation may set `movement_id` to anything but null. Creating a
-    // movement is a two-leg operation over a movement parent — CP4 — and a
-    // single-row write that assigned one would leave a movement with one leg,
-    // which validate_movement() rejects at COMMIT anyway. Refusing it here
+  it("keeps every PostgREST write path free of movement columns", () => {
+    // No mutation may set `movement_id` to anything but null — and CP4 does not
+    // relax this, it satisfies it. A movement is a parent plus two legs written
+    // in one transaction, which no PostgREST statement can express at all
+    // (`lib/data/mutations/movements.ts` explains why), so the legs are written
+    // by `public.create_movement` in SQL and this layer never names the column.
+    // A single-row write that assigned one would leave a movement with one leg,
+    // which validate_movement() rejects at COMMIT anyway; refusing it here
     // means the mistake is caught in review rather than in a failing integration
     // test.
     //
@@ -485,7 +544,14 @@ describe("CP3 write surface is exactly accounts + categories + transactions", ()
     // The lookahead absorbs the whitespace itself rather than sitting after a
     // separate `\s*`, which would let the pattern backtrack to a zero-width
     // match and defeat its own negation.
-    const assignsNonNullMovement = /movement_id\s*:(?!\s*null\s*,)[^;\n]*,/;
+    //
+    // The leading `(?<![A-Za-z0-9_])` is what keeps the *column* apart from the
+    // RPC parameter `p_movement_id`, which the movement module legitimately
+    // passes: that argument names a movements primary key for a function
+    // argument list, not a `transactions.movement_id` on a row this layer is
+    // writing. Without it this check would fire on exactly the code that is
+    // doing the right thing.
+    const assignsNonNullMovement = /(?<![A-Za-z0-9_])movement_id\s*:(?!\s*null\s*,)[^;\n]*,/;
 
     const offenders = filesWithCode
       .filter(({ repoPath }) => repoPath.startsWith("lib/data/mutations/"))
@@ -499,6 +565,8 @@ describe("CP3 write surface is exactly accounts + categories + transactions", ()
     expect(assignsNonNullMovement.test("movement_id: input.movementId,")).toBe(true);
     expect(assignsNonNullMovement.test("movement_id: null,")).toBe(false);
     expect(assignsNonNullMovement.test("  movement_id: string | null;")).toBe(false);
+    // And the exemption is exactly as narrow as it claims to be.
+    expect(assignsNonNullMovement.test("p_movement_id: input.id,")).toBe(false);
   });
 
   it("issues PostgREST writes only from lib/data/mutations/**", () => {
@@ -523,24 +591,29 @@ describe("CP3 write surface is exactly accounts + categories + transactions", ()
     expect(offenders).toEqual([]);
   });
 
-  it("issues a PostgREST delete from exactly one module", () => {
-    // CP3 adds the first DELETE in this application, and it is deliberately
-    // the only one: accounts, categories, bills and goals are *labels* that
-    // historical rows resolve through, so they are archived; a transaction is
-    // the history itself and has no correct archived state. This is the
-    // source-side half of that claim; the privilege-side half is
-    // supabase/tests/database/100-write-grants.sql, which still proves DELETE
-    // is granted on transactions and on nothing else.
+  it("issues a PostgREST delete from exactly two modules", () => {
+    // CP3 added the first DELETE in this application; CP4 adds the second and
+    // last. Both are deliberate and neither generalizes: accounts, categories,
+    // bills and goals are *labels* that historical rows resolve through, so
+    // they are archived, while a transaction is the history itself and a
+    // movement is the only correct unit for removing a pair of legs (deleting
+    // the parent cascades both; a leg is invisible to DELETE outright). This is
+    // the source-side half of that claim; the privilege-side half is
+    // supabase/tests/database/100-write-grants.sql, which proves DELETE is
+    // granted on transactions and movements and on nothing else.
     const deleters = filesWithCode
       .filter(({ repoPath }) => repoPath.startsWith("lib/data/mutations/"))
       .filter(({ code }) => /\.delete\s*\(/.test(code))
       .map(({ repoPath }) => repoPath)
       .sort();
 
-    expect(deleters).toEqual(["lib/data/mutations/transactions.ts"]);
+    expect(deleters).toEqual([
+      "lib/data/mutations/movements.ts",
+      "lib/data/mutations/transactions.ts",
+    ]);
   });
 
-  it("writes to no table other than accounts, categories, and transactions", () => {
+  it("writes to no table other than accounts, categories, transactions, and movements", () => {
     // Every `.from("...")` in the mutation layer, enumerated. The read probes
     // (budgets/bills for the category preflight, bill_occurrences for the
     // delete preflight, account_balances for the account preflight) are
@@ -560,11 +633,34 @@ describe("CP3 write surface is exactly accounts + categories + transactions", ()
       "bills",
       "budgets",
       "categories",
+      "movements",
       "transactions",
     ]);
 
-    // Stated separately because it is the one name whose absence is a CP4
-    // boundary rather than an accident.
-    expect(relations.has("movements")).toBe(false);
+    // Stated separately because it is the one name whose *use* must stay
+    // narrow: `movements` appears here for the parent delete only. The legs are
+    // written inside `public.create_movement`, never by a statement from this
+    // layer, which is why `transactions` is not reachable from the movement
+    // module at all.
+    const movementModule = filesWithCode.find(
+      ({ repoPath }) => repoPath === "lib/data/mutations/movements.ts"
+    );
+    expect(movementModule).toBeDefined();
+    expect(movementModule!.code).not.toMatch(/\.from\(\s*["'`]transactions["'`]/);
+  });
+
+  it("keeps the movement surface and the ordinary transaction surface disjoint", () => {
+    // The property CP4 exists to preserve, checked from both directions:
+    // nothing in the movement mutation module writes a transaction row, and
+    // nothing in the transaction mutation module writes a movement row or calls
+    // a movement RPC. The database enforces the same split independently — both
+    // ordinary write policies carry `movement_id IS NULL` — so this is the
+    // source-side statement of a rule that holds regardless.
+    const transactionModule = filesWithCode.find(
+      ({ repoPath }) => repoPath === "lib/data/mutations/transactions.ts"
+    );
+    expect(transactionModule).toBeDefined();
+    expect(transactionModule!.code).not.toMatch(/\.from\(\s*["'`]movements["'`]/);
+    expect(transactionModule!.code).not.toMatch(/\.rpc\s*\(/);
   });
 });

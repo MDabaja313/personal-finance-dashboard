@@ -90,7 +90,7 @@ naming precisely, since "leaks every row" and "returns zero rows" call for very 
 | Role | Table/view access | INSERT | UPDATE | DELETE |
 |---|---|---|---|---|
 | `anon` | **None** on any user-financial table or view. | ❌ | ❌ | ❌ |
-| `authenticated` | `SELECT` on the tables/views the application actually reads, plus **column-scoped** `INSERT`/`UPDATE` on `accounts`, `categories` and `transactions` only, and `DELETE` on `transactions` only. | accounts, categories, transactions | accounts, categories, transactions | **transactions only** |
+| `authenticated` | `SELECT` on every table (`movements` included as of CP4), plus **column-scoped** `INSERT` on `accounts`, `categories`, `transactions` and `movements`, `UPDATE` on the first three only, and `DELETE` on `transactions` and `movements` only. | accounts, categories, transactions, movements | accounts, categories, transactions | **transactions, movements** |
 
 Through Phases 4, 5, and 6 this was `SELECT` only, without exception: there was no mutation UI, no
 Server Action, and no application code path that wrote to the database, so there was no reason for
@@ -163,6 +163,66 @@ Four things about that row carry the design:
   resolve through — it *is* the history, a mistyped one has no correct archived state, and a
   "voided" flag would mean every balance, budget, KPI and chart growing a clause to exclude it.
 
+### What Phase 7 CP4 added
+
+`supabase/migrations/20260828120003_movement_writes.sql` — one table, `movements`, and the
+first two functions `authenticated` may `EXECUTE` anywhere in this schema:
+
+| Table | `SELECT` | `INSERT` columns | `UPDATE` | `DELETE` |
+|---|---|---|---|---|
+| `movements` | ✅ **CP4** | `id`, `user_id`, `kind` | ❌ **never** | ✅ table-level, narrowed by policy |
+
+- **`SELECT` arrives now because the *edit* surface is the first thing that needs the parent.**
+  Through Phase 6 there was deliberately no grant at all: `Transaction.movementId` is a plain
+  column on the leg and nothing joined to `movements`. An edit form has to show the movement —
+  a kind, a date, two accounts, one magnitude — rather than a leg, and it has to work when the
+  two legs straddle the `/transactions` reveal window, so it reads the pair **by movement id**
+  rather than by pairing two rendered rows. `SELECT` is also what lets `replace_movement`'s
+  ownership check see a row at all, since a `SECURITY INVOKER` function has exactly the
+  caller's visibility.
+- **`id` is grantable on `INSERT`, for two reasons.** Movement creation is idempotent by a
+  client-generated UUID, exactly as ordinary transaction creation is — and additionally,
+  `replace_movement` re-creates the movement under its *original* id, so a movement id is
+  stable for the movement's whole life and an edit never re-identifies the thing being edited.
+- **There is no `UPDATE` grant and no `UPDATE` policy — permanently.** A `movements` row is
+  `(id, user_id, kind)` and nothing else. `id` is its identity, `user_id` its owner, and `kind`
+  is what every leg's own kind must equal (`validate_movement()` assert 3), so changing `kind`
+  in place would either fail that assert or require rewriting both legs in the same breath.
+  That is exactly what `replace_movement` does, by delete-and-recreate. Leaving `UPDATE`
+  ungranted means there is no second, partial way to do it.
+- **`DELETE` is the second and last `DELETE` grant in this schema**, and it is the *only*
+  correct way to remove a transfer or card payment: `transactions_delete_own_non_movement`
+  carries `movement_id IS NULL`, so a leg is invisible to `DELETE` outright, and deleting the
+  parent cascades both legs through `transactions_movement_fk`.
+
+**Why CP4 needs functions at all — and why they are not a convenience layer.** A movement is a
+parent plus exactly two legs, and the database refuses every partial form of it: a childless
+movement fails `movements_validate_movement` at `COMMIT`, and a leg naming a movement that does
+not exist yet fails the **non-deferrable** composite FK immediately. PostgREST issues one
+statement per request, each in its own transaction, so **no sequence of PostgREST calls can
+produce a movement at all.** `public.create_movement` and `public.replace_movement` are
+therefore the only reachable creation path, which is what makes the checks inside them a real
+boundary rather than an application-layer suggestion. `140-movement-writes.sql` proves each half
+of that claim directly.
+
+Both are `SECURITY INVOKER` (§11), take **no owner parameter** — the owner comes from
+`auth.uid()` inside the body — use `set search_path = ''` with every object schema-qualified,
+have `EXECUTE` revoked from `PUBLIC` and `anon`, and are granted to `authenticated` alone.
+`replace_movement` composes `create_movement` rather than sharing a helper in `private`,
+because a `SECURITY INVOKER` body runs with the *caller's* privileges and `authenticated` has no
+`USAGE` on `private` — a fact 090-privileges.sql now asserts for exactly this reason.
+
+Deleting deliberately gets **no** function: it is genuinely one statement, and wrapping it would
+add a privilege surface and no guarantee.
+
+One account-type rule lives inside the RPCs, and it is no broader than the repository already
+commits to: **a credit-card payment's destination must be a `credit` account**
+(`lib/types/index.ts` states the convention — "source (checking) leg negative, destination (card)
+leg positive" — and `lib/finance/accounts.ts` classifies `credit` as a liability stored
+negative, so a payment is the movement that raises that balance toward zero). Nothing is
+enforced about the *source*'s type: paying a card from cash, savings, or another card are all
+things a person may legitimately record.
+
 Functions/RPCs (the snapshot writer, the timezone-validation trigger function) get `EXECUTE`
 revoked from `PUBLIC` by default — see §11.
 
@@ -185,7 +245,7 @@ Combined with §3's grants, this table is the intended eventual policy matrix �
 | `accounts` | own rows | ✅ **CP2** (`accounts_insert_own`) | ✅ **CP2**, incl. archive (`accounts_update_own`) | ❌ prefer archive (`is_archived`) over delete |
 | `categories` | own rows | ✅ **CP2** (`categories_insert_own`) | ✅ **CP2**, including archive (`categories_update_own`) | ❌ no routine hard delete while referenced |
 | `transactions` | own rows | ✅ **CP3** (`transactions_insert_own`) | ✅ **CP3**, own **ordinary non-adjustment** rows only (`transactions_update_own_ordinary`) | ✅ **CP3**, own **non-movement** rows only (`transactions_delete_own_non_movement`) |
-| `movements` | own rows | Phase 7 | ❌ never | Phase 7 — cascades both legs |
+| `movements` | ✅ **CP4** (`movements_select_own`) | ✅ **CP4** (`movements_insert_own`) | ❌ **never** — no grant and no policy; an edit rewrites the pair through `replace_movement` | ✅ **CP4** (`movements_delete_own`) — cascades both legs |
 | `budgets` | own rows | Phase 7 | Phase 7 | Phase 7, only if deliberately needed |
 | `bills` | own rows | Phase 7 | Phase 7, including archive | ❌ prefer archive |
 | `bill_occurrences` | own rows | ❌ — system-generated only | Phase 7, **narrowly scoped to `status`/payment fields only** | ❌ no unrestricted authenticated delete |
@@ -468,6 +528,33 @@ The snapshot writer needs no `authenticated` or `anon` `EXECUTE` grant under the
 design; if the documented on-demand fallback (`database-schema.md §14`) is ever exposed as a
 callable RPC instead, that is a **separate, deliberate grant decision** to make explicitly at
 that time — not a default extension of the cron writer's existing privilege.
+
+### The two CP4 RPCs — the only `EXECUTE` grant to an application role
+
+`public.create_movement` and `public.replace_movement` are the first and, so far, only
+functions `authenticated` may call directly. That is the "intentional and explicitly granted for
+a stated application reason" case the rule above anticipates, and the reason is structural
+rather than ergonomic: a valid movement cannot be assembled by any sequence of PostgREST
+statements (§3), so a function is the only thing that can write one.
+
+Three properties make that grant narrow rather than a widening:
+
+- **`SECURITY INVOKER`, despite doing an atomic multi-table write.** That is the shape people
+  normally reach for `SECURITY DEFINER` to implement, and it is not needed here: the caller
+  already holds every privilege the bodies use (`SELECT` on `accounts` and `movements`, the
+  column-scoped `INSERT`s, `DELETE` on `movements`), and under `FORCE ROW LEVEL SECURITY` the
+  invoker sees exactly its own accounts and movements — which is precisely the scope every
+  lookup wants. A definer's context would not add a check; it would remove the RLS backing
+  every statement inside. `090-privileges.sql` asserts `prosecdef = false` on both.
+- **No owner parameter.** Neither function takes a `user_id`. A caller-supplied owner is an
+  authorization decision made by untrusted input, and no amount of policy work downstream
+  repairs it. `auth.uid()` is read inside each body, and a null one raises.
+- **`EXECUTE` revoked from `PUBLIC` and `anon`, granted to `authenticated` alone.** An
+  unauthenticated request is `anon`, so "an anonymous request cannot create a movement" is a
+  privilege-layer fact rather than something the function body has to notice —
+  `100-write-grants.sql` proves it by actually calling both as `anon` and asserting 42501.
+  `090-privileges.sql` additionally asserts that these two are the *entire* set of
+  `public`-schema functions `authenticated` may execute, as a sorted list rather than a count.
 
 ---
 

@@ -5,8 +5,8 @@ import { redirect } from "next/navigation";
 import { z } from "zod";
 
 import { attempt, failed, invalid, submittedValues, succeeded } from "@/lib/actions/result";
-import type { ActionState, SubmittedValues } from "@/lib/actions/types";
-import { getToday } from "@/lib/data/clock";
+import { resolveToday } from "@/lib/actions/today";
+import type { ActionState } from "@/lib/actions/types";
 import {
   createTransaction,
   deleteTransaction,
@@ -34,20 +34,11 @@ import {
  * ## Why `today` is fetched here, and how its own failures are handled
  *
  * A transaction has a date, and "not in the future" has to mean the future
- * where the *person* is — an owner in Auckland entering today's coffee would be
- * refused for several hours a day against a UTC ceiling. `getToday()` derives
- * the date from `profiles.timezone`, which is the same source
- * `assert_transaction_refs()` reads, so the form's message and the database's
- * refusal can never disagree.
- *
- * `getToday()` is a database read behind a verified `getOwnerId()`, so it can
- * fail exactly as any other read can: an ended session, a missing profile row,
- * an unreachable database. It is therefore run through `attempt()` like the
- * mutation itself, and its outcome is branched on identically —
- * `unauthenticated` becomes `redirect("/login")`, everything else becomes a
- * safe `ActionState`. What it must never do is throw past this layer into the
- * error boundary: a form that vanishes into a full-page error because a
- * timezone lookup blipped is strictly worse than one that says "try again".
+ * where the *person* is. `resolveToday()` (`lib/actions/today.ts`) resolves the
+ * owner's own calendar day through `getToday()` and turns that read's own
+ * failures into a redirect decision or a safe `ActionState` — see that module
+ * for the full rationale. It is shared with `lib/actions/movements.ts`, because
+ * a movement is dated by the same rule and must fail the same way.
  *
  * `redirect()` stays outside `attempt()` in every case, because it signals by
  * throwing and `attempt()` catches everything. Nothing here inspects a `NEXT_*`
@@ -126,28 +117,6 @@ const TARGETS_UNUSABLE =
 const DUPLICATE_SUBMISSION =
   "A different transaction was already saved from this form. Refresh the page and try again.";
 const BILL_LINKED = "Unmark that bill as paid first, then delete the transaction.";
-
-/**
- * The owner's calendar day, or the `ActionState` to return instead.
- *
- * Factored out because all three actions need it and all three must handle its
- * failure identically. It returns the redirect *decision* rather than
- * performing it, so `redirect()` stays at the top level of the action where its
- * control flow is visible at the call site.
- */
-async function resolveToday(
-  values?: SubmittedValues
-): Promise<
-  { readonly ok: true; readonly today: string } | { readonly ok: false; readonly state: ActionState; readonly redirectToLogin: boolean }
-> {
-  const outcome = await attempt(() => getToday(), values);
-  if (outcome.ok) return { ok: true, today: outcome.value };
-  return {
-    ok: false,
-    state: outcome.state,
-    redirectToLogin: outcome.reason === "unauthenticated",
-  };
-}
 
 export async function createTransactionAction(
   _previousState: ActionState,

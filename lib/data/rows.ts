@@ -24,10 +24,13 @@
  * - **Enum columns are typed `string`.** The wire gives text; narrowing to the
  *   DTO union is a runtime validation step in the mapper, not an assertion.
  *
- * Only relations Phase 6 actually reads appear here. In particular there is no
- * `MovementRow`: `authenticated` has no SELECT grant on `movements` and needs
- * none — `Transaction.movementId` is a plain `transactions.movement_id`
- * column and nothing joins to the parent.
+ * Phase 7 CP4 added `MovementRow` and `MovementLegRow`. Through Phase 6 there
+ * was deliberately no such shape — `authenticated` held no SELECT grant on
+ * `movements` and needed none, since `Transaction.movementId` is a plain
+ * `transactions.movement_id` column and nothing joined to the parent. The
+ * movement *edit* surface is the first thing that has to read the pair as one
+ * object rather than as two independently listed legs, so the grant and the
+ * row shape arrive together with it.
  */
 
 /** A `BIGINT` column as it arrives over the wire — see the note above. */
@@ -160,4 +163,36 @@ export interface NetWorthSnapshotRow {
   assets_cents: BigIntColumn;
   liabilities_cents: BigIntColumn;
   net_worth_cents: BigIntColumn;
+}
+
+/**
+ * `public.movements` — the parent of exactly two transaction legs (Phase 7
+ * CP4). `user_id` is filtered on but never selected, and `created_at` is not
+ * read at all: a movement's date lives on its legs, not here.
+ */
+export interface MovementRow {
+  id: string;
+  /** `public.movement_kind` — narrower than `transaction_kind` by design. */
+  kind: string;
+}
+
+/**
+ * One leg of a movement, projected for reconstructing the pair.
+ *
+ * A narrower selection than `TransactionRow` on purpose: `merchant` is derived
+ * by `public.create_movement` from the movement's kind and the other account's
+ * name, so it is never read back into an edit form, and `kind`/`category_id`
+ * are fixed by the movement (`validate_movement()` assert 3, and
+ * `transactions_movement_no_category_ck`) rather than being per-leg facts.
+ *
+ * `movement_id` is typed nullable to match the column, even though the query
+ * that produces these rows filters it to a non-null set.
+ */
+export interface MovementLegRow {
+  id: string;
+  movement_id: string | null;
+  account_id: string;
+  /** DATE, 'YYYY-MM-DD'. */
+  date: string;
+  amount_cents: BigIntColumn;
 }

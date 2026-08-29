@@ -1,3 +1,4 @@
+import type { MovementEditRow } from "@/components/movements/types";
 import type { ActionState, FormAction } from "@/lib/actions/types";
 import type { CalendarDate, Cents, TransactionKind } from "@/lib/types";
 
@@ -36,17 +37,34 @@ export interface TransactionRow extends TransactionDisplayRow {
    * Whether the ordinary edit/delete controls apply to this row.
    *
    * False for movement legs — a transfer or card payment is a *pair* of rows
-   * and editing one alone would leave the movement invalid, so CP4 supplies
-   * its own controls over the movement parent — and false for `adjustment`
-   * rows, which the database refuses to let any UPDATE target and which only
-   * CP5's reconciliation may write. Both kinds stay fully visible in history;
-   * what they lack is a control that would not work.
+   * and editing one alone would leave the movement invalid, so the movement's
+   * own controls act on the parent instead (see `movement` below) — and false
+   * for `adjustment` rows, which the database refuses to let any UPDATE target
+   * and which only CP5's reconciliation may write. Both kinds stay fully
+   * visible in history; what they lack is a control that would not work.
    *
    * Computed on the server from the kind, never inferred in the component, so
    * the rule has one definition (`isOrdinaryTransactionKind`) rather than a
    * copy per view.
    */
   editable: boolean;
+  /**
+   * The movement this row represents — present on **exactly one** of a
+   * movement's two legs, and absent everywhere else.
+   *
+   * A transfer is two ledger rows and one editable thing, so exactly one row
+   * carries the controls: the source (negative) leg. Rendering them on both
+   * would offer two buttons that do the same thing to the same pair, and
+   * rendering them on neither would leave a movement uneditable whenever its
+   * partner fell outside the page's reveal window.
+   *
+   * Resolved on the server by `getMovements()`, by movement id rather than by
+   * pairing two rendered rows — so an edit works even when the other leg is
+   * thousands of rows further back in history. `editable` is always false
+   * wherever this is present: the two are mutually exclusive by construction,
+   * and the row renders one control set or neither, never both.
+   */
+  movement?: MovementEditRow;
 }
 
 /** An account the entry form may post to — active accounts only. */

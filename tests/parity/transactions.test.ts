@@ -523,16 +523,31 @@ describe("getRecentTransactions parity", () => {
   });
 });
 
-describe("movements stays inaccessible to authenticated", () => {
-  it("SELECT on public.movements fails at the privilege layer (42501)", async () => {
-    const { data, error } = await context.client.from("movements").select("id").limit(1);
+describe("movements is readable, but no read path here joins to it", () => {
+  it("SELECT on public.movements succeeds, and returns only the owner's rows", async () => {
+    // Through Phase 6 this assertion was the opposite: `movements` had no grant
+    // at all and this query failed at the privilege layer with 42501. Phase 7
+    // CP4 added `SELECT` plus `movements_select_own`, because the movement
+    // *edit* surface is the first thing that has to read the pair as one
+    // object. The parity claim below is unaffected — see the next case.
+    const { data, error } = await context.client.from("movements").select("id, user_id");
 
-    expect(data).toBeNull();
-    expect(error).not.toBeNull();
-    expect(error!.code).toBe("42501");
+    expect(error).toBeNull();
+    expect(data).not.toBeNull();
+    // The full seeded set, and nothing belonging to anyone else.
+    expect(data!.length).toBe(12);
+    expect(
+      (data as { user_id: string }[]).every((row) => row.user_id === context.ownerId)
+    ).toBe(true);
   });
 
-  it("...yet every movement leg still carries its movementId", async () => {
+  it("...and getTransactions still reads movementId off the leg, never through a join", async () => {
+    // The parity-relevant half, and the one that must not change: the
+    // `Transaction` DTO's `movementId` is the plain `transactions.movement_id`
+    // column. `lib/data/transactions.ts` issues no query against `movements`
+    // and never has — the CP4 grant is consumed by `lib/data/movements.ts`
+    // alone, which the fixture oracle has no counterpart for and which this
+    // suite therefore does not cover.
     const legs = await getTransactions({ kind: "transfer" });
     expect(legs.length).toBeGreaterThan(0);
     expect(legs.every((leg) => typeof leg.movementId === "string" && leg.movementId.length > 0)).toBe(true);

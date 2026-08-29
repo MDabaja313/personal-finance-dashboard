@@ -485,6 +485,30 @@ precisely what distinguishes the legitimate cascade case from the two illegitima
 deletion cases above: in both of those, the parent is still present, so the leg-count check still
 fires and still fails.
 
+**Phase 7 CP4 — what this invariant turned out to imply for writes.** The rules above were
+written as validation. Taken together with `transactions_movement_fk` being **`ON DELETE CASCADE`
+but not `DEFERRABLE`**, they also decide the *only shape a movement write can take*, and that
+consequence was not obvious until CP4 tried to build one:
+
+- A parent inserted alone cannot commit (zero legs).
+- A leg naming a movement that does not exist yet fails immediately, at the statement (23503).
+- A parent with one leg cannot commit.
+
+PostgREST issues one statement per request, each in its own transaction, so **no sequence of
+PostgREST calls can produce a movement.** Creating and editing one therefore had to become
+`SECURITY INVOKER` functions — `public.create_movement` and `public.replace_movement`
+([rls-policies.md §3](rls-policies.md)) — and that is not a layering preference, it is the only
+reachable path. Editing is delete-and-recreate under the movement's *original* id rather than an
+`UPDATE`, because an edit can change the amount, the date, the kind and either account, and every
+one of those has to land on both legs at once: two sequential updates would pass through a state
+where the pair does not sum to zero, and there is no statement that could rewrite one leg anyway
+(the ordinary `UPDATE` policy makes legs invisible). Since the delete and the re-creation are one
+transaction, a refused replacement leg aborts everything and leaves the original pair byte-for-
+byte intact.
+
+Deleting stays exactly the cascade case above: one statement on the parent, which is the sole
+supported deletion path and now also the only one `authenticated` can express.
+
 Document the intended failure message and require that it never include transaction amounts —
 see the error taxonomy in [DEVELOPMENT_PLAN.md](../DEVELOPMENT_PLAN.md) (Phase 3, decision A).
 
@@ -947,6 +971,18 @@ column on the `transactions` row itself (§4) — no Phase 6 query joins to `mov
 table's Phase 4 posture (no `authenticated` grant, no RLS policy — §1, `rls-policies.md`) is
 unchanged by the DAL swap. A transfer/credit-card-payment pair's two legs remain independently
 visible wherever their own `account_id` puts them, through the ordinary `getTransactions()` path.
+
+**Phase 7 CP4 changed that, for the edit surface only.** `lib/data/movements.ts` adds
+`getMovements(ids)` and a `Movement` DTO — kind, date, source account, destination account, both
+leg ids, and one **positive magnitude**. Which leg is the source is derived here, once, from the
+legs' signs, rather than re-derived by each consumer; the signed amounts are not on the DTO at
+all. The reason it reads by *movement id* rather than by pairing two rendered rows is the
+`/transactions` reveal window: a movement's two legs routinely straddle its edge, so a form
+reconstructed from the rows on screen would work by accident and would offer no edit control on
+exactly the pairs that are hardest to find by hand. Ordering is `id ASC` — a technical order
+only, since the caller looks these up by id and never renders them as a list. Anything that is
+not a well-formed pair is `data_integrity`: `validate_movement()` guarantees the shape, so a
+violation means the database contradicted its own invariant.
 
 **Ten of the eleven existing DTOs are unchanged.** That's the direct payoff of deriving values
 into the same shape rather than exposing normalized rows to the UI — and it's why

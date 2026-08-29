@@ -53,6 +53,18 @@ export const TRANSACTION_ROUTES = [
 ];
 
 /**
+ * The routes a movement write must invalidate.
+ *
+ * One narrower than a transaction write, and the omission is the point:
+ * `/budgets` renders utilisation, which is `spendingByCategory` over rows
+ * `countsAsSpending` admits — an allowlist of `expense` and `refund`. A
+ * movement leg is excluded **by kind**, so no movement write can change any
+ * figure that page renders. Listed as an exact array so adding `/budgets` out
+ * of habit fails the assertion rather than passing quietly.
+ */
+export const MOVEMENT_ROUTES = ["/transactions", "/dashboard", "/accounts", "/analytics"];
+
+/**
  * The calendar day `delta` days from `date`, as 'YYYY-MM-DD'.
  *
  * `Date.UTC` rather than local-midnight construction, for the same reason

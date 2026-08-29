@@ -1,5 +1,10 @@
 import { ArrowLeftRight } from "lucide-react";
 import Link from "next/link";
+import { AddMovement } from "@/components/movements/add-movement";
+import type {
+  MovementAccountOption,
+  MovementEditRow,
+} from "@/components/movements/types";
 import { AddTransaction } from "@/components/transactions/add-transaction";
 import { TransactionFilters } from "@/components/transactions/transaction-filters";
 import { TransactionList } from "@/components/transactions/transaction-list";
@@ -11,6 +16,11 @@ import type {
 } from "@/components/transactions/types";
 import { EmptyState } from "@/components/shared/empty-state";
 import { PageHeader } from "@/components/shared/page-header";
+import {
+  createMovementAction,
+  deleteMovementAction,
+  updateMovementAction,
+} from "@/lib/actions/movements";
 import {
   createTransactionAction,
   deleteTransactionAction,
@@ -24,6 +34,7 @@ import {
   iterateFetchWindows,
   resolveRevealPage,
 } from "@/lib/data/filters";
+import { getMovements } from "@/lib/data/movements";
 import { getTransactions } from "@/lib/data/transactions";
 import { addMonths, listMonths, monthKey } from "@/lib/finance/dates";
 import { monthLabel } from "@/lib/format/date";
@@ -146,25 +157,79 @@ export default async function TransactionsPage({ searchParams }: TransactionsPag
   const hasMore = fetched.length > revealed;
   const transactions = hasMore ? fetched.slice(0, revealed) : fetched;
 
+  /**
+   * The movements behind whatever legs this page happens to be rendering.
+   *
+   * Read by movement id, in one batched query, rather than by pairing two
+   * rendered rows — and that distinction is the whole reason this exists.
+   * `/transactions` renders a bounded reveal window, so a movement's two legs
+   * routinely straddle its edge: reconstructing "from account", "to account"
+   * and "amount" from the rows on screen would work by accident, and would
+   * offer no edit control at all on exactly the pairs that are hardest to find
+   * by hand.
+   *
+   * A second roundtrip after the ledger read, because it depends on which rows
+   * came back. It is skipped entirely when the window contains no legs, and it
+   * costs two bounded queries when it does — not two per row.
+   */
+  const movements = await getMovements(
+    transactions.filter((t) => t.movementId !== undefined).map((t) => t.movementId!)
+  );
+  const movementById = new Map(movements.map((m) => [m.id, m]));
+
   const accountName = new Map(accounts.map((a) => [a.id, a.name]));
   const categoryName = new Map(categories.map((c) => [c.id, c.name]));
 
-  const rows: TransactionRow[] = transactions.map((t) => ({
-    id: t.id,
-    date: t.date,
-    merchant: t.merchant,
-    accountId: t.accountId,
-    accountName: accountName.get(t.accountId) ?? t.accountId,
-    categoryId: t.categoryId ?? null,
-    categoryName: t.categoryId ? (categoryName.get(t.categoryId) ?? t.categoryId) : null,
-    kind: t.kind,
-    amountCents: t.amountCents,
-    // Ordinary rows only. A movement leg cannot be edited or deleted on its own
-    // without leaving a movement with one leg (CP4 supplies controls over the
-    // movement parent), and an adjustment is a CP5 reconciliation outcome the
-    // database refuses to let an UPDATE target. Both stay fully visible here.
-    editable: isOrdinaryTransactionKind(t.kind),
-  }));
+  const rows: TransactionRow[] = transactions.map((t) => {
+    /**
+     * Attached to the source (negative) leg and to nothing else.
+     *
+     * A movement is two rows in the ledger and one editable thing, so exactly
+     * one of its rows carries the controls. Which one is decided here, on the
+     * server, from `getMovements()`'s own source/destination resolution — never
+     * inferred in a component — so the rule has one definition and a pair can
+     * never grow two sets of buttons.
+     */
+    const movement =
+      t.movementId !== undefined && movementById.get(t.movementId)?.sourceLegId === t.id
+        ? movementById.get(t.movementId)
+        : undefined;
+
+    return {
+      id: t.id,
+      date: t.date,
+      merchant: t.merchant,
+      accountId: t.accountId,
+      accountName: accountName.get(t.accountId) ?? t.accountId,
+      categoryId: t.categoryId ?? null,
+      categoryName: t.categoryId ? (categoryName.get(t.categoryId) ?? t.categoryId) : null,
+      kind: t.kind,
+      amountCents: t.amountCents,
+      // Ordinary rows only. A movement leg is never editable *as a row* — one
+      // leg cannot be edited or deleted without leaving the movement invalid —
+      // and an adjustment is a CP5 reconciliation outcome the database refuses
+      // to let an UPDATE target. Both stay fully visible here.
+      editable: isOrdinaryTransactionKind(t.kind),
+      ...(movement
+        ? {
+            movement: {
+              id: movement.id,
+              kind: movement.kind,
+              date: movement.date,
+              fromAccountId: movement.fromAccountId,
+              toAccountId: movement.toAccountId,
+              sourceLegId: movement.sourceLegId,
+              destinationLegId: movement.destinationLegId,
+              amountCents: movement.amountCents,
+              // The label a screen reader hears on "Edit"/"Delete" — the leg's
+              // own rendered merchant, which the database composed from the
+              // movement's kind and the other account's name.
+              label: t.merchant,
+            } satisfies MovementEditRow,
+          }
+        : {}),
+    };
+  });
 
   /**
    * What the entry form may post to: active accounts and active categories
@@ -184,6 +249,19 @@ export default async function TransactionsPage({ searchParams }: TransactionsPag
     .filter((c) => !c.isArchived)
     .map((c) => ({ id: c.id, name: c.name, kind: c.kind }));
 
+  /**
+   * The same active accounts, plus each one's `type`.
+   *
+   * A movement form needs the type and an ordinary transaction form does not:
+   * a credit-card payment must be paid *into* a `credit` account, so the
+   * destination picker narrows itself to those. Kept as its own option shape
+   * rather than widening `AccountOption`, so the extra field travels only to
+   * the surface that has a use for it.
+   */
+  const movementAccountOptions: MovementAccountOption[] = accounts
+    .filter((a) => !a.isArchived)
+    .map((a) => ({ id: a.id, name: a.name, type: a.type }));
+
   // Imported here, in app/**, and handed to the client components as props:
   // components/** may not value-import lib/actions/**, and may not reach
   // lib/data/mutations/** at all. The route is the seam.
@@ -191,6 +269,12 @@ export default async function TransactionsPage({ searchParams }: TransactionsPag
     create: createTransactionAction,
     update: updateTransactionAction,
     remove: deleteTransactionAction,
+  };
+
+  const movementActions = {
+    create: createMovementAction,
+    update: updateMovementAction,
+    remove: deleteMovementAction,
   };
 
   // Next URL carries every active filter forward unchanged and increments only
@@ -216,11 +300,20 @@ export default async function TransactionsPage({ searchParams }: TransactionsPag
     <div className="flex flex-col gap-6">
       <PageHeader title="Transactions" description="Full transaction history across all accounts." />
 
-      <div>
+      {/* Two entry points, deliberately. An ordinary transaction is one row in
+          one account with a merchant and a category; a movement is a pair of
+          rows across two accounts with neither. The ordinary form still offers
+          income/expense/refund only. */}
+      <div className="flex flex-wrap items-center gap-2">
         <AddTransaction
           action={createTransactionAction}
           accounts={accountOptions}
           categories={categoryOptions}
+          today={today}
+        />
+        <AddMovement
+          action={createMovementAction}
+          accounts={movementAccountOptions}
           today={today}
         />
       </div>
@@ -234,14 +327,18 @@ export default async function TransactionsPage({ searchParams }: TransactionsPag
           <TransactionTable
             rows={rows}
             actions={mutationActions}
+            movementActions={movementActions}
             accounts={accountOptions}
+            movementAccounts={movementAccountOptions}
             categories={categoryOptions}
             today={today}
           />
           <TransactionList
             rows={rows}
             actions={mutationActions}
+            movementActions={movementActions}
             accounts={accountOptions}
+            movementAccounts={movementAccountOptions}
             categories={categoryOptions}
             today={today}
           />

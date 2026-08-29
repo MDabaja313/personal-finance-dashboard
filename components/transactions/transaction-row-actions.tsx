@@ -2,6 +2,11 @@
 
 import { useActionState, useId, useState } from "react";
 
+import { MovementRowActions } from "@/components/movements/movement-row-actions";
+import type {
+  MovementAccountOption,
+  MovementMutationActions,
+} from "@/components/movements/types";
 import { TransactionSheet } from "@/components/transactions/transaction-sheet";
 import type {
   AccountOption,
@@ -16,59 +21,83 @@ import type { CalendarDate } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 /**
- * The per-row Edit and Delete controls.
+ * The per-row controls, for whichever kind of row this is.
  *
- * Rendered only for rows the page marked `editable` — that is, ordinary
- * income/expense/refund rows. Movement legs and adjustments get no controls at
- * all rather than disabled ones, because a disabled button invites the question
- * "why?" without answering it, and both cases are explained where they are
- * decided (`TransactionRow.editable`). Neither is hidden from *history*: both
- * still render, with their amounts, dates and badges, exactly as before.
+ * Exactly one of three things renders, and they are mutually exclusive by
+ * construction rather than by ordering luck:
  *
- * The database enforces the same two exclusions independently of anything here:
- * `transactions_update_own_ordinary` makes a movement leg or an adjustment
- * invisible to UPDATE, and `transactions_delete_own_non_movement` makes a leg
- * invisible to DELETE. Removing this component would not open a path to either.
+ * - **A movement's source leg** gets the movement controls, which act on the
+ *   *parent*: editing replaces both legs atomically under the movement's
+ *   original id, deleting removes the parent and cascades both legs. The page
+ *   attaches `row.movement` to that one leg and to nothing else, so a pair
+ *   never grows two sets of buttons.
+ * - **An ordinary income/expense/refund row** gets the transaction controls.
+ * - **Everything else** — a movement's destination leg, an `adjustment` — gets
+ *   nothing at all rather than disabled buttons, because a disabled button
+ *   invites the question "why?" without answering it. Neither is hidden from
+ *   *history*: both still render, with their amounts, dates and badges, exactly
+ *   as before.
+ *
+ * The database enforces every one of these exclusions independently of
+ * anything here: `transactions_update_own_ordinary` makes a movement leg or an
+ * adjustment invisible to UPDATE, and `transactions_delete_own_non_movement`
+ * makes a leg invisible to DELETE. Removing this component would not open a
+ * path to any of them.
  */
 export function TransactionRowActions({
   row,
   actions,
+  movementActions,
   accounts,
+  movementAccounts,
   categories,
   today,
   className,
 }: {
   row: TransactionRow;
   actions: TransactionMutationActions;
+  movementActions: MovementMutationActions;
   accounts: readonly AccountOption[];
+  movementAccounts: readonly MovementAccountOption[];
   categories: readonly CategoryOption[];
   today: CalendarDate;
   className?: string;
 }) {
   const [editing, setEditing] = useState(false);
 
-  if (!row.editable) return null;
+  if (row.movement === undefined && !row.editable) return null;
 
   return (
     <div className={cn("flex flex-wrap items-center justify-end gap-1", className)}>
-      <Button type="button" variant="ghost" size="sm" onClick={() => setEditing(true)}>
-        Edit
-        <span className="sr-only"> {row.merchant}</span>
-      </Button>
+      {row.movement !== undefined ? (
+        <MovementRowActions
+          movement={row.movement}
+          actions={movementActions}
+          accounts={movementAccounts}
+          today={today}
+        />
+      ) : (
+        <>
+          <Button type="button" variant="ghost" size="sm" onClick={() => setEditing(true)}>
+            Edit
+            <span className="sr-only"> {row.merchant}</span>
+          </Button>
 
-      <DeleteControl action={actions.remove} row={row} />
+          <DeleteControl action={actions.remove} row={row} />
 
-      <TransactionSheet
-        open={editing}
-        onOpenChange={setEditing}
-        title="Edit transaction"
-        description="Changes take effect on every balance and total that includes this row."
-        action={actions.update}
-        accounts={accounts}
-        categories={categories}
-        today={today}
-        transaction={row}
-      />
+          <TransactionSheet
+            open={editing}
+            onOpenChange={setEditing}
+            title="Edit transaction"
+            description="Changes take effect on every balance and total that includes this row."
+            action={actions.update}
+            accounts={accounts}
+            categories={categories}
+            today={today}
+            transaction={row}
+          />
+        </>
+      )}
     </div>
   );
 }

@@ -420,7 +420,7 @@ cumulative "Load more" reveal window described above resolves this — no route 
 
 ## Phase 7 — Mutations 🚧 in progress
 
-Checkpoints 1, 2 and 3 are complete. **CP4 has not started.**
+Checkpoints 1, 2, 3 and 4 are complete. **CP5 has not started.**
 
 ### CP1 — Write foundation ✅ (no migration, no write grant, no mutating code)
 
@@ -534,13 +534,85 @@ became writable.**
   recorded in `lib/data/mutations/transactions.ts` rather than implied. It is the one CP3 rule
   without a database backstop.
 
-### Remaining — CP4 onward, not started
+### CP4 — Transfers + credit-card payments ✅
+
+**The owner can now create, edit and delete transfers and credit-card payments, atomically, as
+movements. Nothing else became writable, and the ordinary transaction surface is unchanged.**
+
+- **One additive migration**, `20260828120003_movement_writes.sql`. No earlier migration was
+  edited and nothing was dropped or replaced — `validate_movement()` (Phase 4) and
+  `assert_transaction_refs()` (CP3) are used exactly as they were left, and everything here is
+  built to satisfy them rather than to work around them.
+- **Grants.** `SELECT`, column-scoped `INSERT` (`id`, `user_id`, `kind`) and `DELETE` on
+  `movements`. **No `UPDATE` grant and no `UPDATE` policy, permanently** — a `movements` row is
+  `(id, user_id, kind)`, and changing `kind` in place would contradict every leg's own kind
+  (`validate_movement()` assert 3). `SELECT` arrives now because the *edit* surface is the first
+  thing that needs the parent; `id` is grantable because creation is idempotent by a
+  client-generated UUID *and* because `replace_movement` re-creates the movement under its
+  original id. `anon` is not named once. Three operation-specific policies,
+  `movements_{select,insert,delete}_own`.
+- **Two `SECURITY INVOKER` RPCs, and they are the *only* path — a structural fact, not a
+  convention.** A movement is a parent plus exactly two legs, and the database refuses every
+  partial form: a childless movement fails the deferred trigger at `COMMIT`, and a leg naming a
+  movement that does not exist yet fails the **non-deferrable** composite FK immediately.
+  PostgREST issues one statement per request, each in its own transaction, so no sequence of
+  PostgREST calls can produce a movement at all. `public.create_movement` and
+  `public.replace_movement` take no owner (it comes from `auth.uid()`), use `search_path = ''`
+  with qualified names, and have `EXECUTE` revoked from `PUBLIC`/`anon` and granted to
+  `authenticated` alone — the first and only such grant in this schema.
+  `140-movement-writes.sql` proves each half of the impossibility claim directly.
+- **Editing is delete-and-recreate under the original id, inside one transaction.** An edit can
+  change the amount, the date, the kind and either account, and every one of those must land on
+  both legs at once — two sequential updates would pass through a state where the pair does not
+  sum to zero, and no statement can rewrite one leg anyway. A refused replacement leg aborts the
+  whole transaction, so the original pair survives byte for byte. Deleting deliberately gets no
+  function: it is one statement on the parent, and the cascade takes both legs.
+- **`SECURITY DEFINER` was never needed**, and `replace_movement` composes `create_movement`
+  rather than sharing a helper in `private` for exactly that reason: a `SECURITY INVOKER` body
+  runs with the caller's privileges, and `authenticated` has no `USAGE` on `private`.
+- **Sign, merchant and category are all derived, never submitted.** The form posts a positive
+  magnitude and two account *roles*; the RPC writes `-magnitude`/`+magnitude`, so
+  legs-sum-to-zero is true by construction. Leg labels ("Transfer to High-Yield Savings" /
+  "Transfer from Everyday Checking") are composed in SQL from the movement's kind and the other
+  account's name, so the pair is consistent by construction and no free text reaches a row a
+  person cannot edit directly. Category is written as an explicit `null`. `movementLegAmountsFor`
+  (`lib/types/enums.ts`) mirrors the sign rule in TypeScript, for the idempotency comparison only.
+- **One account-type rule, no broader than the repository already states:** a credit-card
+  payment's destination must be a `credit` account. Nothing constrains the *source*'s type —
+  paying a card from cash, savings or another card are all legitimate.
+- **Creation is idempotent by three client-generated UUIDs** (movement + both legs), minted once
+  per mounted form. A retry collides on the movements primary key; `createMovement` re-reads its
+  own movement and compares the **complete** normalized payload — kind, date, both accounts in
+  their roles, both leg ids, and the magnitude. Exact match is a successful retry, same key with a
+  different payload is a `conflict`, and a key belonging to another owner falls through as the
+  ordinary unique conflict. `replaceMovement` short-circuits when the persisted state already
+  equals the request, which matters beyond efficiency: a needless rewrite would give both legs a
+  new `created_at` and silently reorder same-day history.
+- **Revalidation is exactly `/transactions`, `/dashboard`, `/accounts`, `/analytics`.**
+  `/budgets` is deliberately absent — `countsAsSpending` is an allowlist of `expense` and
+  `refund`, so a movement leg is excluded **by kind**, not by sign and not by lacking a category.
+- **Read side:** `lib/data/movements.ts` adds `getMovements(ids)` and a `Movement` DTO (kind,
+  date, source/destination accounts, both leg ids, positive magnitude). It reads by *movement id*
+  rather than by pairing two rendered rows, because `/transactions` renders a bounded reveal
+  window and a movement's legs routinely straddle its edge — so an edit works even when the
+  partner leg is thousands of rows further back.
+- **UI:** a separate "Move money" sheet on `/transactions`, beside the unchanged "Add
+  transaction". Edit and two-step Delete render on **exactly one** leg — the source (negative)
+  one, chosen on the server from `getMovements()`'s own resolution — so a pair never grows two
+  sets of controls and the destination leg gets none rather than disabled ones. The ordinary form
+  still offers income/expense/refund only. URL filtering, search and "Load more" are untouched.
+- **Deliberate limitation:** deleting a movement that touches an archived account is refused by
+  the mutation layer only — the `DELETE` policy is about *rows*, not account state — the same
+  single-layer rule `deleteTransaction` carries, and recorded in
+  `lib/data/mutations/movements.ts` rather than implied.
+
+### Remaining — CP5 onward, not started
 
 Every other finance domain is still read-only, and its grants and policies land only alongside the
-feature that needs them: transfers/credit-card payments over a `movements` parent (CP4),
-reconciliation/adjustments (CP5), budgets, bills/occurrences (including the `BillOccurrence` DTO
-and mark-as-paid UI), and goals/contributions (INSERT only, respecting the append-only model). The
-same rules hold throughout — Server Actions are independently reachable endpoints, so the
-unconditional `getOwnerId()` pattern Phase 6 established for reads applies to every write;
-narrowly-scoped write RLS policies and object grants are added per mutation as it's built; §3/§4 of
-`docs/rls-policies.md` records the intended eventual policy matrix.
+feature that needs them: reconciliation/adjustments (CP5, which owns net-worth snapshot
+refreshing — CP4 deliberately writes none), budgets, bills/occurrences (including the
+`BillOccurrence` DTO and mark-as-paid UI), and goals/contributions (INSERT only, respecting the
+append-only model). The same rules hold throughout — Server Actions are independently reachable
+endpoints, so the unconditional `getOwnerId()` pattern Phase 6 established for reads applies to
+every write; narrowly-scoped write RLS policies and object grants are added per mutation as it's
+built; §3/§4 of `docs/rls-policies.md` records the intended eventual policy matrix.

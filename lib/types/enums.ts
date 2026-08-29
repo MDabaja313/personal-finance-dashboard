@@ -19,8 +19,9 @@
  * labels.
  *
  * `MOVEMENT_KINDS` and `BILL_OCCURRENCE_STATUSES` are here even though no read
- * path needed them originally (`movements` is unreadable by `authenticated`,
- * and `bill_occurrences.status` drives a query filter rather than a DTO field).
+ * path needed them originally (`movements` was unreadable by `authenticated`
+ * until Phase 7 CP4, and `bill_occurrences.status` drives a query filter rather
+ * than a DTO field).
  *
  * `TRANSACTION_KINDS` gained `adjustment` in Phase 7 CP3, appended last because
  * `alter type ... add value` with no BEFORE/AFTER appends. Membership in this
@@ -163,6 +164,49 @@ export function signedAmountFor(kind: OrdinaryTransactionKind, magnitudeCents: C
 export type MovementKind = Extract<TransactionKind, "transfer" | "credit_card_payment">;
 
 export const MOVEMENT_KINDS: readonly MovementKind[] = ["transfer", "credit_card_payment"];
+
+export function isMovementKindLabel(kind: string): kind is MovementKind {
+  return (MOVEMENT_KINDS as readonly string[]).includes(kind);
+}
+
+/**
+ * The two signed leg amounts of one movement, derived from a non-negative
+ * magnitude.
+ *
+ * The TypeScript mirror of what `public.create_movement` does in SQL, and the
+ * movement counterpart of `signedAmountFor`: the entry form collects "how
+ * much" and picks two accounts, and the *roles* of those accounts — source and
+ * destination — decide the signs. A signed field would let a well-formed
+ * submission contradict itself (a "transfer" whose two legs both credit), and
+ * the only way to resolve that is to pick one and discard the other. Deriving
+ * removes the contradiction, and makes `legs sum to zero` true by construction
+ * rather than by the caller getting it right.
+ *
+ * The database derives the same pair independently — this function's result is
+ * never posted. It exists so the mutation layer can compare a *stored*
+ * movement against the payload a retry would have written, which is what tells
+ * an idempotent retry apart from a conflicting resubmission.
+ *
+ * Throws on a magnitude that is not strictly positive, rather than coercing
+ * one. Zero is legal for an ordinary transaction (a waived fee) and illegal
+ * for a movement leg (`transactions_movement_nonzero_ck`) — a transfer of
+ * nothing is not an event — and `lib/validation/movements.ts` has already
+ * rejected it with a message a person can act on.
+ */
+export interface MovementLegAmounts {
+  readonly sourceCents: Cents;
+  readonly destinationCents: Cents;
+}
+
+export function movementLegAmountsFor(magnitudeCents: Cents): MovementLegAmounts {
+  if (magnitudeCents <= 0) {
+    throw new Error("movementLegAmountsFor requires a positive magnitude.");
+  }
+  return {
+    sourceCents: toCents(-magnitudeCents),
+    destinationCents: magnitudeCents,
+  };
+}
 
 /**
  * Whether this row is one leg of a movement.

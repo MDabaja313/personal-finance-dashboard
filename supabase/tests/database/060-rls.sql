@@ -1,8 +1,9 @@
--- Row Level Security: ownership isolation on the 10 grant-bearing
--- tables, movements' deliberate GRANT-layer exclusion, anon's total
--- exclusion, write-denial for authenticated on every table Phase 7 CP2
--- did NOT open (accounts and categories are covered by 100/110/120/130
--- instead), and both security_invoker views. All fixture setup runs as
+-- Row Level Security: ownership isolation on the grant-bearing tables,
+-- movements' CP4 read grant (and its still-absent UPDATE), anon's total
+-- exclusion, write-denial for authenticated on every table Phase 7 has
+-- NOT opened (accounts, categories, transactions and movements are
+-- covered by 100/110/120/130/140 instead), and both security_invoker
+-- views. All fixture setup runs as
 -- the migration owner (postgres has
 -- BYPASSRLS, so it bypasses FORCE ROW LEVEL SECURITY entirely -- the
 -- same reason 020/030/040/050 could seed rows directly). Role/claim
@@ -18,7 +19,7 @@
 -- 42501 before RLS is ever consulted; a granted-but-unmatched SELECT
 -- returns zero rows, not an error.
 begin;
-select plan(41);
+select plan(43);
 
 -- ============================================================
 -- Fixture: two users, one row in each of the 10 grant-bearing tables,
@@ -111,14 +112,40 @@ select is(
   'A explicitly sees zero account rows filtered to B''s user_id'
 );
 
--- movements: no GRANT exists for authenticated at all -- fails at the
--- privilege layer (42501), before RLS (which has no policy on this
--- table either) is ever consulted.
-select throws_ok(
+-- movements: readable as of Phase 7 CP4, and own-rows-only like every
+-- other table. Through Phase 6 this assertion was the opposite -- no
+-- GRANT existed at all and the query failed at the privilege layer --
+-- because nothing read the parent (`Transaction.movementId` is a plain
+-- column on the leg). The movement *edit* surface is the first thing
+-- that has to read the pair as one object, so the grant and the policy
+-- arrived with it.
+--
+-- Asserted by row count rather than by "no error": a granted table with
+-- a missing policy returns zero rows silently, so a bare success check
+-- could not tell a working policy from an absent one. A's fixture below
+-- has no movement, and B's is invisible, so the count is 0 -- which is
+-- why the *positive* half is proved in 140-movement-writes.sql against
+-- a movement the caller actually owns.
+select lives_ok(
   $$ select count(*) from public.movements $$,
+  'authenticated may now SELECT movements (Phase 7 CP4 grant + movements_select_own)'
+);
+select is(
+  (select count(*)::int from public.movements),
+  0,
+  'and sees none of B''s movements -- movements_select_own filters to the caller'
+);
+
+-- The one operation that stayed shut: there is no UPDATE grant on
+-- movements and no UPDATE policy, so this fails at the privilege layer.
+-- A movements row is (id, user_id, kind); changing `kind` in place would
+-- contradict every leg's own kind (validate_movement() assert 3), and
+-- rewriting the pair together is what replace_movement() is for.
+select throws_ok(
+  $$ update public.movements set kind = 'transfer' where false $$,
   '42501',
   null,
-  'authenticated querying movements fails with permission denied (GRANT layer, not RLS)'
+  'authenticated still cannot UPDATE movements -- no grant, no policy'
 );
 
 -- Both security_invoker views respect ownership: A sees only A's own
@@ -142,11 +169,12 @@ select is(
 -- regardless of ownership.
 -- Phase 7 CP2 gave `authenticated` column-scoped INSERT/UPDATE on
 -- accounts and categories; CP3 added transactions (INSERT/UPDATE/
--- DELETE). So this file no longer asserts blanket write-denial on those
--- three -- their full grant, RLS, and trigger behavior is
--- 100/110/120/130/135. Every *other* table is still read-only for this
--- role, which is what the spread below covers. budgets and bills stand
--- in here for the tables these assertions used to name.
+-- DELETE); CP4 added movements (SELECT/INSERT/DELETE, never UPDATE). So
+-- this file no longer asserts blanket write-denial on those four --
+-- their full grant, RLS, trigger and RPC behavior is
+-- 100/110/120/130/135/140. Every *other* table is still read-only for
+-- this role, which is what the spread below covers. budgets and bills
+-- stand in here for the tables these assertions used to name.
 select throws_ok(
   $$ insert into public.budgets (id, user_id, category_id, period, limit_cents) values ('14000000-0000-4000-8000-0000000000b3', '14000000-0000-4000-8000-000000000001', '14000000-0000-4000-8000-0000000000c1', '2026-02', 1000) $$,
   '42501', null,

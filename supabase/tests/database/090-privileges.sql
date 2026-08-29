@@ -13,7 +13,7 @@
 -- a missing policy on a granted table would silently return zero rows,
 -- which a bare success check could not distinguish from an empty table.
 begin;
-select plan(39);
+select plan(42);
 
 insert into auth.users (id, aud, role, email) values
   ('17000000-0000-4000-8000-000000000001', 'authenticated', 'authenticated', 'priv-test@local.test');
@@ -77,10 +77,53 @@ select is(
        'private.next_bill_occurrence_date(date,public.bill_frequency,date)'::regprocedure,
        -- Phase 7 CP2.
        'public.accounts_guard_update()'::regprocedure,
-       'public.guard_category_kind_change()'::regprocedure
+       'public.guard_category_kind_change()'::regprocedure,
+       -- Phase 7 CP3.
+       'public.assert_transaction_refs()'::regprocedure,
+       -- Phase 7 CP4. These two are the only functions in this schema
+       -- `authenticated` may EXECUTE, and they are SECURITY INVOKER
+       -- despite doing an atomic multi-table write -- which is the shape
+       -- people normally reach for SECURITY DEFINER to implement. They do
+       -- not need it: the caller already holds every privilege the bodies
+       -- use, and under FORCE RLS the invoker sees exactly its own
+       -- accounts and movements. A definer's context would not add a
+       -- check, it would remove the RLS backing every statement inside.
+       'public.create_movement(uuid,public.movement_kind,date,uuid,uuid,bigint,uuid,uuid)'::regprocedure,
+       'public.replace_movement(uuid,public.movement_kind,date,uuid,uuid,bigint,uuid,uuid)'::regprocedure
      )),
-  7,
-  'all 7 invoker functions are SECURITY INVOKER (prosecdef = false)'
+  10,
+  'all 10 invoker functions are SECURITY INVOKER (prosecdef = false) -- the CP4 RPCs included'
+);
+
+-- The two CP4 RPCs are the *only* functions `authenticated` may execute
+-- anywhere in this schema, and neither PUBLIC nor anon may reach them.
+-- An unauthenticated caller is `anon`, so this is what makes "an
+-- anonymous request cannot create a movement" a privilege-layer fact
+-- rather than something the function body has to notice.
+select ok(
+  has_function_privilege('authenticated', 'public.create_movement(uuid,public.movement_kind,date,uuid,uuid,bigint,uuid,uuid)'::regprocedure, 'execute')
+  and has_function_privilege('authenticated', 'public.replace_movement(uuid,public.movement_kind,date,uuid,uuid,bigint,uuid,uuid)'::regprocedure, 'execute'),
+  'authenticated may EXECUTE both movement RPCs'
+);
+select ok(
+  not has_function_privilege('anon', 'public.create_movement(uuid,public.movement_kind,date,uuid,uuid,bigint,uuid,uuid)'::regprocedure, 'execute')
+  and not has_function_privilege('anon', 'public.replace_movement(uuid,public.movement_kind,date,uuid,uuid,bigint,uuid,uuid)'::regprocedure, 'execute')
+  and not has_function_privilege('public', 'public.create_movement(uuid,public.movement_kind,date,uuid,uuid,bigint,uuid,uuid)'::regprocedure, 'execute')
+  and not has_function_privilege('public', 'public.replace_movement(uuid,public.movement_kind,date,uuid,uuid,bigint,uuid,uuid)'::regprocedure, 'execute'),
+  'neither anon nor the PUBLIC pseudo-role may EXECUTE either movement RPC'
+);
+
+-- The set of `authenticated`-executable functions in public is exactly
+-- those two. Enumerated as a sorted list rather than a count, because a
+-- function swapped for another would pass a count.
+select is(
+  (select string_agg(p.proname::text, ',' order by p.proname)
+   from pg_proc p
+   join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname = 'public'
+     and has_function_privilege('authenticated', p.oid, 'execute')),
+  'create_movement,replace_movement',
+  'authenticated may EXECUTE exactly the two movement RPCs in public and nothing else'
 );
 
 -- The two CP2 guards are trigger functions and are never called
@@ -120,8 +163,20 @@ select ok(
 -- ============================================================
 
 select ok(not has_schema_privilege('anon', 'private', 'usage'), 'private schema has no USAGE grant for anon');
+-- Load-bearing for Phase 7 CP4, not merely tidy: `public.create_movement`
+-- and `public.replace_movement` are SECURITY INVOKER, so their bodies run
+-- with the caller's privileges. That is exactly why neither may reach a
+-- helper in `private` -- and why replace_movement composes
+-- create_movement instead. If this ever became true, a private helper
+-- would look callable from a public RPC and the whole schema's
+-- "authenticated cannot reach private" posture would be gone.
 select ok(not has_schema_privilege('authenticated', 'private', 'usage'), 'private schema has no USAGE grant for authenticated');
-select ok(not has_table_privilege('authenticated', 'public.movements', 'select'), 'movements has no SELECT grant for authenticated');
+-- movements gained SELECT/INSERT/DELETE in Phase 7 CP4 (the edit surface
+-- needs to read the pair as one object). UPDATE is the one that stayed
+-- shut, permanently: a movements row is (id, user_id, kind), and changing
+-- `kind` in place would contradict every leg's own kind. Rewriting the
+-- pair together is replace_movement()'s job.
+select ok(not has_table_privilege('authenticated', 'public.movements', 'update'), 'movements has no UPDATE grant for authenticated');
 
 select is(
   (select count(*)::int from (values

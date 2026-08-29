@@ -1,3 +1,7 @@
+import type {
+  MovementAccountOption,
+  MovementMutationActions,
+} from "@/components/movements/types";
 import { KindBadge } from "@/components/transactions/kind-badge";
 import { TransactionRowActions } from "@/components/transactions/transaction-row-actions";
 import type {
@@ -16,13 +20,17 @@ import { cn } from "@/lib/utils";
 export function TransactionList({
   rows,
   actions,
+  movementActions,
   accounts,
+  movementAccounts,
   categories,
   today,
 }: {
   rows: TransactionRow[];
   actions: TransactionMutationActions;
+  movementActions: MovementMutationActions;
   accounts: readonly AccountOption[];
+  movementAccounts: readonly MovementAccountOption[];
   categories: readonly CategoryOption[];
   today: CalendarDate;
 }) {
@@ -65,7 +73,9 @@ export function TransactionList({
               <TransactionRowActions
                 row={row}
                 actions={actions}
+                movementActions={movementActions}
                 accounts={accounts}
+                movementAccounts={movementAccounts}
                 categories={categories}
                 today={today}
               />
