@@ -1,12 +1,18 @@
 import { sumCents } from "@/lib/finance/money";
 import { toCents, type Account, type AccountType, type Cents } from "@/lib/types";
+import { isLiabilityAccountType } from "@/lib/types/enums";
 
 export type AccountKind = "asset" | "liability";
 
-const LIABILITY_TYPES: readonly AccountType[] = ["credit", "loan"];
-
+/**
+ * The list itself moved to `lib/types/enums.ts` in Phase 7 CP5: reconciliation
+ * validation and the reconcile form both have to know which types store a
+ * negative balance, and neither may import `lib/finance/**`. This stays the
+ * display layer's way of asking the question, and no longer holds a second
+ * copy of the answer.
+ */
 export function accountKind(type: AccountType): AccountKind {
-  return LIABILITY_TYPES.includes(type) ? "liability" : "asset";
+  return isLiabilityAccountType(type) ? "liability" : "asset";
 }
 
 function activeAccounts(accounts: readonly Account[]): Account[] {

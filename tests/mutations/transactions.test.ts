@@ -58,6 +58,12 @@ vi.mock("next/navigation", () => ({
 }));
 
 const actions = await import("@/lib/actions/transactions");
+// The one cross-surface import in this file. An adjustment cannot be produced
+// by anything here — that is the property under test — so proving it is
+// excluded from every economic figure requires the surface that *can* produce
+// one. See "keeps adjustments out of income, spending and cash flow" below for
+// why it is created there rather than assumed to exist.
+const reconciliationActions = await import("@/lib/actions/reconciliation");
 const { getAccounts } = await import("@/lib/data/accounts");
 const { getCategories } = await import("@/lib/data/categories");
 const { getToday } = await import("@/lib/data/clock");
@@ -638,18 +644,58 @@ describe("balances and derived figures move with the ledger", () => {
     ).toBe(groceriesBefore + 8_000);
   });
 
-  it("keeps an adjustment out of income and spending if one ever exists", async () => {
-    // Nothing in the application can create one — the ordinary form refuses the
-    // kind and the database refuses the UPDATE — so this asserts the read-side
-    // handling holds for a row this checkpoint deliberately cannot produce.
+  it("keeps adjustments out of income, spending and cash flow", async () => {
+    // CP3's version of this asserted that no adjustment existed at all, because
+    // nothing in the application could create one. CP5 can — reconciliation
+    // writes them, and this suite's own reconciliation file leaves several
+    // behind — so the assertion becomes the one that actually matters and holds
+    // at every checkpoint: however many adjustments the month contains,
+    // removing them changes not one economic figure.
+    //
+    // The ordinary surface still cannot produce one, in either direction: the
+    // create/edit schemas narrow `kind` to income/expense/refund, and
+    // `transactions_update_own_ordinary` refuses both to target an adjustment
+    // and to produce one. Those are asserted directly elsewhere in this file
+    // and in tests/mutations/reconciliation.test.ts.
     const month = monthKey(today);
-    const rows = await getTransactions({ month });
-    const adjustments = rows.filter((t) => t.kind === "adjustment");
+    const account = await accountByName("Everyday Checking");
 
-    expect(adjustments).toHaveLength(0);
-    // And the finance layer would exclude one regardless: the assertion above
-    // documents that CP3 writes none, while lib/finance/transactions.test.ts
-    // covers the exclusion itself.
+    // The adjustment is created here rather than assumed, because Vitest does
+    // not guarantee the order test *files* run in — so whether
+    // tests/mutations/reconciliation.test.ts has already left one behind is not
+    // something this file may rely on. Reconciling is also the only way to
+    // produce one: the assertions further down prove the ordinary surface
+    // cannot.
+    const target = account.balanceCents - 4_321;
+    const reconciled = await reconciliationActions.reconcileAccountAction(
+      IDLE,
+      formData({
+        accountId: account.id,
+        asOf: today,
+        balance: `${Math.trunc(target / 100)}.${String(Math.abs(target) % 100).padStart(2, "0")}`,
+      })
+    );
+    expect(reconciled.status).toBe("success");
+
+    const rows = await getTransactions({ month });
+    const withoutAdjustments = rows.filter((t) => t.kind !== "adjustment");
+
+    // The comparison only means something if there is something to remove.
+    expect(rows.length).toBeGreaterThan(withoutAdjustments.length);
+
+    expect(monthlyIncome(rows, month)).toBe(monthlyIncome(withoutAdjustments, month));
+    expect(monthlySpending(rows, month)).toBe(monthlySpending(withoutAdjustments, month));
+    expect(monthlyCashFlow(rows, month)).toBe(monthlyCashFlow(withoutAdjustments, month));
+    expect(spendingByCategory(rows, month)).toEqual(
+      spendingByCategory(withoutAdjustments, month)
+    );
+
+    // And each one is structurally what reconciliation writes: no category, no
+    // movement. Both are database constraints, checked here on real rows.
+    for (const adjustment of rows.filter((t) => t.kind === "adjustment")) {
+      expect(adjustment.categoryId).toBeUndefined();
+      expect(adjustment.movementId).toBeUndefined();
+    }
   });
 });
 

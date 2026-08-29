@@ -65,6 +65,23 @@ export const TRANSACTION_ROUTES = [
 export const MOVEMENT_ROUTES = ["/transactions", "/dashboard", "/accounts", "/analytics"];
 
 /**
+ * The routes a reconciliation write must invalidate.
+ *
+ * The same four as a movement write, and `/budgets` is absent for the same
+ * reason: `countsAsSpending` is an allowlist of `expense` and `refund`, so an
+ * `adjustment` is excluded **by kind** — not by carrying no category, and not
+ * by its sign. No reconciliation can change a figure that page renders.
+ * Listed as an exact array so adding `/budgets` out of habit fails the
+ * assertion rather than passing quietly.
+ */
+export const RECONCILIATION_ROUTES = [
+  "/transactions",
+  "/dashboard",
+  "/accounts",
+  "/analytics",
+];
+
+/**
  * The calendar day `delta` days from `date`, as 'YYYY-MM-DD'.
  *
  * `Date.UTC` rather than local-midnight construction, for the same reason

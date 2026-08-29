@@ -2,6 +2,7 @@ import "server-only";
 
 import { mapWriteError } from "@/lib/data/db-errors";
 import { centsFrom } from "@/lib/data/mappers";
+import { refreshCurrentSnapshotAfter } from "@/lib/data/mutations/snapshots";
 import { getDataClient, getOwnerId } from "@/lib/data/supabase";
 import { conflict, notFound } from "@/lib/errors";
 import type { AccountType, Cents } from "@/lib/types";
@@ -150,6 +151,12 @@ export async function createAccount(input: AccountCreateInput): Promise<string> 
   const row = data as { id: string } | null;
   if (!row) throw mapWriteError(new Error("insert returned no row"), "the account");
 
+  // A new account arrives with an opening balance, which lands in the current
+  // month's assets or liabilities immediately. See
+  // `lib/data/mutations/snapshots.ts` for why this is best-effort and why it
+  // runs after the write rather than inside it.
+  await refreshCurrentSnapshotAfter("the account");
+
   return row.id;
 }
 
@@ -205,6 +212,13 @@ export async function updateAccount(input: AccountUpdateInput): Promise<void> {
     .eq("user_id", ownerId);
 
   if (error) throw mapWriteError(error, "the account");
+
+  // Only the opening balance can move a snapshot figure. A rename, an
+  // institution, a credit limit and an interest rate are all metadata the
+  // snapshot writer never reads, so a refresh after one would be a whole-user
+  // aggregate recomputation for a change that cannot alter a single number in
+  // it.
+  if (changesOpeningBalance) await refreshCurrentSnapshotAfter("the account");
 }
 
 /**
@@ -237,6 +251,24 @@ export async function setAccountArchived(accountId: string, archived: boolean): 
     .eq("user_id", ownerId);
 
   if (error) throw mapWriteError(error, "the account");
+
+  // The snapshot writer's account inclusion rule is `is_archived = false`, so
+  // this flag is one of the inputs to every figure it computes — which makes a
+  // refresh correct in both directions, and it is not symmetric.
+  //
+  // *Archiving* usually changes nothing: it requires a derived balance of
+  // exactly zero, and a zero balance contributes zero to assets and to
+  // liabilities alike. But "zero *now*" is not "zero as of this month's last
+  // calendar day" — an account whose history nets to zero today can hold a
+  // nonzero as-of balance at a month-end the writer computes against.
+  // *Unarchiving* changes things routinely: an account archived with history
+  // (or seeded archived, as `Old Checking (Closed)` is) rejoins every total the
+  // moment the flag flips.
+  //
+  // Deriving which of those applies would mean reimplementing the writer's
+  // as-of query here to decide whether to call the writer. Refreshing
+  // unconditionally is both cheaper and correct.
+  await refreshCurrentSnapshotAfter("the account");
 }
 
 /**

@@ -64,6 +64,26 @@ export function allowsInterestRate(type: AccountType): boolean {
   return type === "credit" || type === "loan";
 }
 
+/**
+ * The account types whose balance is stored negative — the one place this
+ * list is written down.
+ *
+ * It used to live in `lib/finance/accounts.ts` (as `LIABILITY_TYPES`, behind
+ * `accountKind()`), which was the right home while only the display layer
+ * cared. Phase 7 CP5 gave it two more consumers that cannot reach
+ * `lib/finance/**`: `lib/validation/reconciliation.ts` (fenced off from
+ * everything but Zod and `lib/types`) needs it to decide whether a typed
+ * balance may be negative, and the reconcile form needs it to decide which
+ * question to ask. `accountKind()` still exists and now derives from this, so
+ * the classification has exactly one definition and the snapshot writer's own
+ * SQL (`type in ('credit','loan')`) has exactly one thing to mirror.
+ */
+export const LIABILITY_ACCOUNT_TYPES: readonly AccountType[] = ["credit", "loan"];
+
+export function isLiabilityAccountType(type: AccountType): boolean {
+  return LIABILITY_ACCOUNT_TYPES.includes(type);
+}
+
 /** `public.category_kind`. */
 export const CATEGORY_KINDS: readonly Category["kind"][] = ["income", "expense"];
 

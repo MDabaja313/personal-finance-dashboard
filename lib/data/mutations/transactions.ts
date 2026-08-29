@@ -2,6 +2,7 @@ import "server-only";
 
 import { mapWriteError } from "@/lib/data/db-errors";
 import { centsFrom } from "@/lib/data/mappers";
+import { refreshCurrentSnapshotAfter } from "@/lib/data/mutations/snapshots";
 import { getDataClient, getOwnerId } from "@/lib/data/supabase";
 import { conflict, invalidInput, notFound } from "@/lib/errors";
 import type { Cents } from "@/lib/types";
@@ -296,7 +297,13 @@ export async function createTransaction(
     movement_id: null,
   });
 
-  if (error === null) return { id: input.id, deduplicated: false };
+  if (error === null) {
+    // A ledger row moves its account's derived balance, and therefore the
+    // current month's assets or liabilities. Best-effort and after the write,
+    // for the reasons `lib/data/mutations/snapshots.ts` sets out.
+    await refreshCurrentSnapshotAfter("the transaction");
+    return { id: input.id, deduplicated: false };
+  }
 
   const mapped = mapWriteError(error, "the transaction");
   // Anything but a unique violation is a real failure — a check violation from
@@ -313,6 +320,9 @@ export async function createTransaction(
     throw conflict("A different transaction was already saved with that submission.");
   }
 
+  // No refresh on the deduplicated path: nothing was written this time, so the
+  // snapshot the refresh would recompute is the snapshot the *first* attempt
+  // already produced.
   return { id: input.id, deduplicated: true };
 }
 
@@ -379,6 +389,11 @@ export async function updateTransaction(input: TransactionUpdateInput): Promise<
     .eq("user_id", ownerId);
 
   if (error) throw mapWriteError(error, "the transaction");
+
+  // An edit can change the amount, the date or the account — all three move a
+  // snapshot figure, and the date can move it into or out of the current
+  // month's as-of window.
+  await refreshCurrentSnapshotAfter("the transaction");
 }
 
 /**
@@ -436,6 +451,8 @@ export async function deleteTransaction(transactionId: string): Promise<void> {
     .eq("user_id", ownerId);
 
   if (error) throw mapWriteError(error, "the transaction");
+
+  await refreshCurrentSnapshotAfter("the transaction");
 }
 
 /**

@@ -21,6 +21,7 @@ import {
   deleteMovementAction,
   updateMovementAction,
 } from "@/lib/actions/movements";
+import { deleteAdjustmentAction } from "@/lib/actions/reconciliation";
 import {
   createTransactionAction,
   deleteTransactionAction,
@@ -210,6 +211,14 @@ export default async function TransactionsPage({ searchParams }: TransactionsPag
       // and an adjustment is a CP5 reconciliation outcome the database refuses
       // to let an UPDATE target. Both stay fully visible here.
       editable: isOrdinaryTransactionKind(t.kind),
+      // The one row kind that is removable without being editable. Computed
+      // here beside `editable` so the two rules — and their mutual exclusion —
+      // have one definition rather than a copy per view. `movementId` is
+      // always undefined on an adjustment
+      // (transactions_movement_biconditional_ck); it is checked anyway so the
+      // exclusion is true by inspection rather than by a constraint someone
+      // has to recall.
+      removableAdjustment: t.kind === "adjustment" && t.movementId === undefined,
       ...(movement
         ? {
             movement: {
@@ -277,6 +286,13 @@ export default async function TransactionsPage({ searchParams }: TransactionsPag
     remove: deleteMovementAction,
   };
 
+  // Undo only. An adjustment is *created* on `/accounts`, where the balance
+  // being reconciled actually lives; what belongs here is removing one,
+  // because this is where the row is. There is no adjustment edit action to
+  // hand down — `transactions_update_own_ordinary` refuses to target one, and
+  // the supported correction is remove-and-reconcile-again.
+  const adjustmentActions = { remove: deleteAdjustmentAction };
+
   // Next URL carries every active filter forward unchanged and increments only
   // `page`, so revealing more never silently widens or drops a filter.
   const nextParams = new URLSearchParams();
@@ -328,6 +344,7 @@ export default async function TransactionsPage({ searchParams }: TransactionsPag
             rows={rows}
             actions={mutationActions}
             movementActions={movementActions}
+            adjustmentActions={adjustmentActions}
             accounts={accountOptions}
             movementAccounts={movementAccountOptions}
             categories={categoryOptions}
@@ -337,6 +354,7 @@ export default async function TransactionsPage({ searchParams }: TransactionsPag
             rows={rows}
             actions={mutationActions}
             movementActions={movementActions}
+            adjustmentActions={adjustmentActions}
             accounts={accountOptions}
             movementAccounts={movementAccountOptions}
             categories={categoryOptions}

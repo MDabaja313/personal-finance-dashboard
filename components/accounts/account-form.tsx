@@ -12,7 +12,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import type { ActionState, FormAction } from "@/lib/actions/types";
-import type { Account, AccountType } from "@/lib/types";
+import { formatCentsForInput } from "@/lib/format/currency";
+import type { Account, AccountType, Cents } from "@/lib/types";
 import { allowsCreditLimit, allowsInterestRate } from "@/lib/types/enums";
 
 /**
@@ -56,16 +57,17 @@ const ACCOUNT_TYPE_OPTIONS: { value: AccountType; label: string }[] = [
 const ACCOUNT_TYPE_LABEL = new Map(ACCOUNT_TYPE_OPTIONS.map((option) => [option.value, option.label]));
 
 /**
- * Cents → the decimal string a money input should start with.
+ * Cents → the decimal string a money input should start with, or `""` when
+ * there is no stored value to prefill.
  *
- * Integer division and a padded remainder, never `cents / 100` — the same
- * reason `lib/validation/money.ts` refuses to build a float on the way in.
+ * The conversion itself is `formatCentsForInput` in `lib/format/currency.ts`,
+ * which is the one place a `Cents` value becomes a decimal (and the one place
+ * that keeps the float out of it). All that is left here is the
+ * "nothing to prefill" case, which is a form concern rather than a formatting
+ * one.
  */
-function centsToInput(cents: number | undefined): string {
-  if (cents === undefined) return "";
-  const sign = cents < 0 ? "-" : "";
-  const magnitude = Math.abs(cents);
-  return `${sign}${Math.trunc(magnitude / 100)}.${String(magnitude % 100).padStart(2, "0")}`;
+function centsToInput(cents: Cents | undefined): string {
+  return cents === undefined ? "" : formatCentsForInput(cents);
 }
 
 /** Basis points → the percentage string the rate input should start with. */

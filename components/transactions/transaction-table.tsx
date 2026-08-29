@@ -6,6 +6,7 @@ import { KindBadge } from "@/components/transactions/kind-badge";
 import { TransactionRowActions } from "@/components/transactions/transaction-row-actions";
 import type {
   AccountOption,
+  AdjustmentMutationActions,
   CategoryOption,
   TransactionMutationActions,
   TransactionRow,
@@ -29,6 +30,7 @@ export function TransactionTable({
   rows,
   actions,
   movementActions,
+  adjustmentActions,
   accounts,
   movementAccounts,
   categories,
@@ -37,6 +39,7 @@ export function TransactionTable({
   rows: TransactionRow[];
   actions: TransactionMutationActions;
   movementActions: MovementMutationActions;
+  adjustmentActions: AdjustmentMutationActions;
   accounts: readonly AccountOption[];
   movementAccounts: readonly MovementAccountOption[];
   categories: readonly CategoryOption[];
@@ -91,6 +94,7 @@ export function TransactionTable({
                     row={row}
                     actions={actions}
                     movementActions={movementActions}
+                    adjustmentActions={adjustmentActions}
                     accounts={accounts}
                     movementAccounts={movementAccounts}
                     categories={categories}

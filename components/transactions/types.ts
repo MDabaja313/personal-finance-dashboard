@@ -49,6 +49,24 @@ export interface TransactionRow extends TransactionDisplayRow {
    */
   editable: boolean;
   /**
+   * Whether this row is a balance adjustment, and therefore whether the
+   * reconciliation Remove control applies to it.
+   *
+   * Mutually exclusive with `editable` and with `movement`, by construction:
+   * an adjustment is never an ordinary kind and never carries a movement id
+   * (`transactions_movement_biconditional_ck`). It is a separate flag rather
+   * than a `kind === "adjustment"` test in the component for the same reason
+   * `editable` is: the rule has one definition, on the server, next to the
+   * others it has to stay exclusive with.
+   *
+   * An adjustment is deliberately removable but never editable. Editing its
+   * amount would restate the balance a reconciliation produced without the
+   * observation that justified it — `transactions_update_own_ordinary` refuses
+   * it outright — so correcting a bad reconciliation means removing the
+   * adjustment and reconciling again.
+   */
+  removableAdjustment: boolean;
+  /**
    * The movement this row represents — present on **exactly one** of a
    * movement's two legs, and absent everywhere else.
    *
@@ -87,6 +105,20 @@ export interface CategoryOption {
 export interface TransactionMutationActions {
   readonly create: FormAction;
   readonly update: FormAction;
+  readonly remove: FormAction;
+}
+
+/**
+ * The one reconciliation action this surface needs.
+ *
+ * Its own type rather than a fourth field on `TransactionMutationActions`,
+ * because it is not a transaction action: it posts to
+ * `lib/actions/reconciliation.ts`, whose mutation layer refuses anything that
+ * is not an owned adjustment. Creating an adjustment happens on `/accounts`,
+ * where the balance being reconciled actually lives; only the undo is here,
+ * because this is where the row is.
+ */
+export interface AdjustmentMutationActions {
   readonly remove: FormAction;
 }
 

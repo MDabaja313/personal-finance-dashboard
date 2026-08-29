@@ -228,6 +228,129 @@ revoked from `PUBLIC` by default — see §11.
 
 ---
 
+### What Phase 7 CP5 added
+
+`supabase/migrations/20260829120001_reconciliation.sql` and
+`supabase/migrations/20260829120002_current_snapshot.sql` — and the headline is what they
+*don't* contain: **no new table grant for `authenticated`, and no widening of an existing one.**
+The table matrix above is byte-for-byte what CP4 left, and
+`supabase/tests/database/100-write-grants.sql` still asserts it column by column.
+
+Reconciliation is a new *operation over CP3's existing privileges*. CP3 already granted a
+column-scoped `INSERT` covering `kind`, already made `adjustment` a legal stored kind
+(`transactions_sign_by_kind_ck`'s unconstrained adjustment branch), and already left `DELETE`
+possible on an adjustment — `transactions_delete_own_non_movement` carries only
+`movement_id IS NULL` and says nothing about kind, which was deliberate so CP5 could reconcile
+by remove-and-rewrite. What CP3 withheld was a *path* to writing one. CP5 adds exactly that
+path, and it is a function.
+
+| Function | Security | Parameters | `EXECUTE` |
+|---|---|---|---|
+| `public.reconcile_account(uuid, date, bigint)` | `INVOKER` | account, as-of date, desired internal balance | `authenticated` only |
+| `public.refresh_current_net_worth_snapshot()` | **`DEFINER`**, owned by `finance_snapshot_writer` | **none** | `authenticated` only |
+| `private.request_owner_id()` | `INVOKER` | none | `finance_snapshot_writer` only |
+
+#### `reconcile_account` — why a function, given the `INSERT` grant already exists
+
+A reconciliation is not "insert an adjustment". It is
+
+```
+delta := desired_internal_balance - (opening_balance_cents + SUM(transactions.amount_cents))
+```
+
+and *then* an insert of exactly `delta`, or of nothing at all when `delta` is zero. Computing
+the current balance in the client and posting the difference would mean the number written to
+the ledger was chosen from a balance read at some earlier moment, so a transaction entered in
+another tab in between would leave the account reconciled to the wrong figure — with an
+adjustment row that looks perfectly well-formed and simply is not. Deriving the delta inside
+the database, in the same statement that writes the row, removes that window.
+
+It is `SECURITY INVOKER` and needs nothing more: the caller already holds `SELECT` on accounts
+and transactions and `INSERT` on transactions, and under FORCE RLS the invoker sees exactly its
+own rows. The owner comes from `auth.uid()` and is never a parameter. `set search_path = ''`,
+every name qualified, `EXECUTE` revoked from `PUBLIC` and `anon`.
+
+Three rules are deliberately **left to the database rather than restated** inside it: the
+posted-date ceiling in the owner's own timezone, the archived-account refusal (both
+`assert_transaction_refs()`, CP3), and "an adjustment carries no category"
+(`transactions_adjustment_no_category_ck`). Re-deriving the date ceiling here would mean two
+expressions that must agree forever, and the trigger's is the one that also covers every other
+write path.
+
+**Liability input is normalized above the database, not inside it.** The parameter has exactly
+one meaning — the desired *internal signed* balance — because a parameter whose interpretation
+flipped based on a row it looked up would be a parameter no caller could reason about, and an
+overpaid credit card (a legitimately positive balance on a `credit` account) is a real state
+such a rule would make unreachable. Turning the UI's non-negative "amount currently owed" into
+`-magnitude` happens in `lib/data/mutations/reconciliation.ts`, from the account's *stored*
+type, never from anything the client sent.
+
+**Idempotent without an idempotency key.** CP3 and CP4 both needed a client-minted UUID because
+two identical coffees on the same day are a legitimate pair of rows. Reconciliation does not:
+the second submission computes its delta against a balance the first already corrected, so the
+delta is zero and no row is written.
+
+#### `refresh_current_net_worth_snapshot` — the one `SECURITY DEFINER` this phase adds
+
+Everything else in CP2–CP5 is `SECURITY INVOKER` because the caller already held what the body
+used. This one cannot be: `private.write_net_worth_snapshot` is owned by
+`finance_snapshot_writer`, `authenticated` has no `USAGE` on `private` at all, and
+`net_worth_snapshots` has no `INSERT`/`UPDATE` grant for `authenticated` and never will. So the
+bridge takes the writer's identity — and is kept as narrow as a bridge can be:
+
+- **Zero parameters.** The caller can address neither another owner nor another month, not
+  because a check rejects those arguments but because there are none. `pronargs = 0` is asserted
+  in `090-privileges.sql`, so a defaulted parameter added later fails a test rather than
+  quietly accepting a value.
+- **Owned by `finance_snapshot_writer`**, never `postgres` — whose `BYPASSRLS` attribute would
+  turn a browser-reachable function into an RLS bypass. The role keeps its Phase 4 attributes:
+  `NOLOGIN`, `NOSUPERUSER`, `NOBYPASSRLS`, no application role a member.
+- **`ALTER FUNCTION … OWNER TO` requires the incoming owner to hold `CREATE` on the schema**, so
+  the migration grants `CREATE ON SCHEMA public` to the writer for that one statement and
+  revokes it immediately. The ownership is permanent; the privilege is not, and
+  `090-privileges.sql` asserts the role ends with no `CREATE` on `public`.
+- **One new table privilege, column-scoped:** `SELECT (id, timezone)` on `profiles`, plus
+  `profiles_select_writer` — narrower than the writer's other policies (`using (true)`), because
+  here a tighter predicate is available for free: `using (id = private.request_owner_id())`. The
+  writer sees the calling request's own profile row and no other, and a session with no claim
+  (a cron job, a psql shell) sees none.
+- **The month comes from that profile's timezone**, via
+  `to_char((now() at time zone <the owner's zone>)::date, 'YYYY-MM')` — the same expression
+  `assert_transaction_refs()` uses for its date ceiling and the same calendar day
+  `lib/data/clock.ts` derives. Never server UTC.
+
+**Why the owner is read from the JWT GUC rather than from `auth.uid()`.** Inside a
+`SECURITY DEFINER` body the current role is the *owner*, so every function the body calls runs
+as `finance_snapshot_writer` — including `auth.uid()`. That role has no `USAGE` on schema
+`auth` (`set role finance_snapshot_writer; select auth.uid();` → *permission denied for schema
+auth*), and the grant cannot be made from a migration either: schema `auth` is owned by
+`supabase_auth_admin`, and the migration role does not hold `USAGE … WITH GRANT OPTION`, so
+`grant usage on schema auth to finance_snapshot_writer` reports *"no privileges were granted"*
+and changes nothing. Both facts were verified directly against the local Postgres 17.6 image.
+The claim itself is not privileged — it is a GUC, readable through `pg_catalog` by any role — so
+`private.request_owner_id()` reads it exactly as `auth.uid()` does.
+`160-current-snapshot.sql` asserts the two agree, for a set claim, for an empty one, and for the
+JSON `request.jwt.claims` form PostgREST actually uses, so the duplication cannot drift
+silently.
+
+**There is no historical rebuild surface.** `private.write_net_worth_snapshots_for_range` keeps
+its Phase 4 posture — unreachable by `authenticated`, with no public wrapper of any kind — and
+`160-current-snapshot.sql` asserts that `public` exposes exactly one function whose name
+mentions a snapshot, and that it is the zero-argument bridge. Backfill stays an operator action.
+
+**Deliberate limitation, recorded rather than implied:** Phase 4's
+`private.write_net_worth_snapshot` carries **two** sign guards — `v_assets_cents < 0` and
+`v_liabilities_cents < 0` — and raises `data_exception` (SQLSTATE 22000) before writing anything
+rather than storing either magnitude negative. CP4 and CP5 together make both states reachable
+through ordinary supported writes: an owner whose whole *asset* position is negative (one
+overdrawn account and no savings), and an owner with an overpaid card and no other debt. In both
+cases the application degrades correctly — the refresh is best-effort, so the ledger write still
+commits, the action reports success, one sanitized classification is logged, and the existing
+snapshot row is left untouched — and CP5 does not alter the Phase 4 writer. See
+[database-schema.md §14](database-schema.md) for the full statement.
+
+---
+
 ## 4. Operation-specific RLS policies
 
 **A single blanket `FOR ALL TO authenticated` policy is rejected for this schema.** It would
@@ -529,10 +652,11 @@ design; if the documented on-demand fallback (`database-schema.md §14`) is ever
 callable RPC instead, that is a **separate, deliberate grant decision** to make explicitly at
 that time — not a default extension of the cron writer's existing privilege.
 
-### The two CP4 RPCs — the only `EXECUTE` grant to an application role
+### The four RPCs — the only `EXECUTE` grants to an application role
 
-`public.create_movement` and `public.replace_movement` are the first and, so far, only
-functions `authenticated` may call directly. That is the "intentional and explicitly granted for
+`public.create_movement` and `public.replace_movement` (CP4), plus `public.reconcile_account`
+and `public.refresh_current_net_worth_snapshot` (CP5), are the only functions `authenticated`
+may call directly. That is the "intentional and explicitly granted for
 a stated application reason" case the rule above anticipates, and the reason is structural
 rather than ergonomic: a valid movement cannot be assembled by any sequence of PostgREST
 statements (§3), so a function is the only thing that can write one.
@@ -553,8 +677,16 @@ Three properties make that grant narrow rather than a widening:
   unauthenticated request is `anon`, so "an anonymous request cannot create a movement" is a
   privilege-layer fact rather than something the function body has to notice —
   `100-write-grants.sql` proves it by actually calling both as `anon` and asserting 42501.
-  `090-privileges.sql` additionally asserts that these two are the *entire* set of
-  `public`-schema functions `authenticated` may execute, as a sorted list rather than a count.
+  `090-privileges.sql` additionally asserts that these are the *entire* set of `public`-schema
+  functions `authenticated` may execute, as a sorted list rather than a count.
+
+Three of the four are `SECURITY INVOKER`, for the reasons above.
+`refresh_current_net_worth_snapshot` is the single `SECURITY DEFINER` exception in the whole
+application, and the reason is a hard boundary rather than a preference — see §3, *What Phase 7
+CP5 added*, for why an invoker wrapper could reach nothing it needs, and for the properties that
+keep the definer's identity narrow: zero parameters, a `NOLOGIN`/`NOBYPASSRLS` owner, one
+column-scoped `profiles` grant behind a request-scoped policy, no standing `CREATE` on `public`,
+and no route of any kind to the range writer.
 
 ---
 

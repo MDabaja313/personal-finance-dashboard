@@ -4,7 +4,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { availableCredit } from "@/lib/finance/accounts";
 import { formatCents } from "@/lib/format/currency";
-import type { Account, AccountType } from "@/lib/types";
+import type { Account, AccountType, CalendarDate } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const ACCOUNT_TYPE_LABEL: Record<AccountType, string> = {
@@ -24,13 +24,21 @@ function formatInterestRate(bps: number): string {
  * `actions` is optional so the card stays usable as a pure display component.
  * `/accounts` is the management surface and passes them; anywhere else that
  * renders an account can omit them and get read-only output.
+ *
+ * `today` travels with them, and only with them: it is the reconcile form's
+ * date default and ceiling, so it is needed exactly when the controls are
+ * rendered. The route resolves it once (`getToday()`, from the owner's
+ * `profiles.timezone`) rather than each card reading a clock — a page that
+ * straddled midnight would otherwise render two different "today"s.
  */
 export function AccountCard({
   account,
   actions,
+  today,
 }: {
   account: Account;
   actions?: AccountMutationActions;
+  today?: CalendarDate;
 }) {
   const credit = availableCredit(account);
 
@@ -65,7 +73,9 @@ export function AccountCard({
             {formatInterestRate(account.interestRateBps)}
           </p>
         )}
-        {actions && <AccountCardActions account={account} actions={actions} />}
+        {actions && today !== undefined && (
+          <AccountCardActions account={account} actions={actions} today={today} />
+        )}
       </CardContent>
     </Card>
   );

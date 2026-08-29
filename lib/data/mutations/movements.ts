@@ -2,6 +2,7 @@ import "server-only";
 
 import { mapWriteError } from "@/lib/data/db-errors";
 import { getMovements, type Movement } from "@/lib/data/movements";
+import { refreshCurrentSnapshotAfter } from "@/lib/data/mutations/snapshots";
 import { getDataClient, getOwnerId } from "@/lib/data/supabase";
 import { conflict, invalidInput, notFound } from "@/lib/errors";
 import type { MovementInput } from "@/lib/validation/movements";
@@ -261,7 +262,15 @@ export async function createMovement(input: MovementInput): Promise<MovementWrit
 
   const { error } = await supabase.rpc("create_movement", rpcArgs(input));
 
-  if (error === null) return { id: input.id, deduplicated: false };
+  if (error === null) {
+    // Both legs land in the same transaction, and a card payment in particular
+    // moves an asset down and a liability toward zero at once — so the current
+    // month's assets/liabilities *composition* changes even where net worth is
+    // unchanged. Best-effort and after the write, per
+    // `lib/data/mutations/snapshots.ts`.
+    await refreshCurrentSnapshotAfter("the transfer");
+    return { id: input.id, deduplicated: false };
+  }
 
   const mapped = mapWriteError(error, "the transfer");
   // Anything but a unique violation is a real failure — a check violation from
@@ -279,6 +288,7 @@ export async function createMovement(input: MovementInput): Promise<MovementWrit
     throw conflict("A different transfer was already saved with that submission.");
   }
 
+  // No refresh on the deduplicated path: nothing was written this time.
   return { id: input.id, deduplicated: true };
 }
 
@@ -328,6 +338,8 @@ export async function replaceMovement(input: MovementInput): Promise<MovementWri
 
   if (error) throw mapWriteError(error, "the transfer");
 
+  await refreshCurrentSnapshotAfter("the transfer");
+
   return { id: input.id, deduplicated: false };
 }
 
@@ -373,4 +385,6 @@ export async function deleteMovement(movementId: string): Promise<void> {
     .eq("user_id", ownerId);
 
   if (error) throw mapWriteError(error, "the transfer");
+
+  await refreshCurrentSnapshotAfter("the transfer");
 }

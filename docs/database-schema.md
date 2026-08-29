@@ -414,6 +414,47 @@ out in full in the migration: under RLS the only invisible profile belongs to a 
 `authenticated`, and `INSERT`/`UPDATE` only — never `DELETE` — so the whole-user teardown cascade
 (§5) is unaffected. Tests: `supabase/tests/database/135-posted-ledger.sql`.
 
+### `reconcile_account()` (Phase 7 CP5) — the only path that writes an `adjustment`
+
+`public.reconcile_account(p_account_id, p_as_of, p_desired_balance_cents)`
+(`20260829120001_reconciliation.sql`) takes a *desired internal signed balance*, derives the
+account's current balance in SQL as `opening_balance_cents + SUM(transactions.amount_cents)` —
+the same expression `account_balances` computes (§11), including movement legs and earlier
+adjustments — and inserts one row for the difference:
+
+```
+kind        = 'adjustment'
+amount_cents= desired - derived        (either sign; see the CHECK below)
+date        = p_as_of
+merchant    = 'Balance adjustment'     (a fixed literal, never caller text)
+category_id = null                     (transactions_adjustment_no_category_ck)
+movement_id = null                     (transactions_movement_biconditional_ck)
+```
+
+A zero difference writes **no row** and reports success, which is also what makes reconciliation
+idempotent with no idempotency key: a resubmission computes its delta against a balance the first
+submission already corrected. **Reconciliation never rewrites history** — no existing transaction
+is touched, and `opening_balance_cents` is deliberately *not* the mechanism (editing it would
+restate every balance the account ever reported, which is why `accounts_guard_update()` freezes
+it once the account has any transaction at all).
+
+The sign is unconstrained because `transactions_sign_by_kind_ck`'s `adjustment` branch is
+unconstrained — a correction's direction is whatever the correction requires. The row moves the
+account's derived balance and net worth while appearing in **no** economic total:
+`countsAsSpending`/`countsAsIncome` (`lib/finance/transactions.ts`) are allowlists, so an
+adjustment is excluded *by kind*, not by its sign and not by lacking a category.
+
+`SECURITY INVOKER` with `search_path = ''`, the owner from `auth.uid()` and never a parameter,
+`EXECUTE` revoked from `PUBLIC`/`anon` and granted to `authenticated`. It deliberately re-checks
+nothing that already has an owner: the posted-date ceiling and the archived-account refusal are
+`assert_transaction_refs()`'s, above. Tests:
+`supabase/tests/database/150-reconciliation.sql`.
+
+An adjustment is **never editable** (`transactions_update_own_ordinary` carries
+`kind <> 'adjustment'` in both `USING` and `WITH CHECK`) and **always deletable by its owner**
+(`transactions_delete_own_non_movement` carries only `movement_id IS NULL`). That asymmetry is
+the correction path: remove the adjustment and reconcile again.
+
 ### Deliberately absent constraints
 
 - **No global `amount_cents <> 0` on `transactions`.** Would reject the legal zero-amount fixture
@@ -947,6 +988,57 @@ repeated invocation.
 
 `authenticated` never writes this table directly under any circumstance — see
 [rls-policies.md](rls-policies.md).
+
+### Phase 7 CP5 — the current month, and only the current month
+
+`pg_cron` is still not scheduled, and the fallback above is now real:
+`public.refresh_current_net_worth_snapshot()` (`20260829120002_current_snapshot.sql`) is a
+zero-parameter `SECURITY DEFINER` bridge, owned by `finance_snapshot_writer`, that
+`authenticated` may `EXECUTE`. It derives the caller from the request's own JWT claim, reads
+that owner's `profiles.timezone`, takes `to_char((now() at time zone <that zone>)::date,
+'YYYY-MM')`, and calls the **unchanged** Phase 4 `private.write_net_worth_snapshot` with both.
+Neither the owner nor the month is a parameter, so the bridge cannot become a general
+snapshot-writing API; `private.write_net_worth_snapshots_for_range` keeps its Phase 4 posture
+with no wrapper of any kind, and backfill remains an operator action. Full privilege rationale
+in [rls-policies.md §3](rls-policies.md), *What Phase 7 CP5 added*.
+
+`lib/data/mutations/snapshots.ts` is the only module in the application that names it, and every
+balance-affecting mutation calls it **after** its own write has committed, best-effort: the
+refresh is a separate PostgREST request and therefore a separate transaction, so it can fail on
+its own, and reporting an already-committed ledger write as failed because a derived aggregate
+did not refresh would be a lie that invites a duplicate entry. Live derived balances are
+authoritative; the snapshot series is a secondary trend, and the next balance-affecting write
+brings it current because the writer recomputes the whole month from current state rather than
+applying a delta.
+
+**What CP5 deliberately does not do**, and the limitations that follow are accepted rather than
+worked around: no `opened_on` column, no archived-at lifecycle reconstruction, no prior-month
+rebuild control, and no repair of an old monthly snapshot after a backdated edit. A backdated
+transaction moves the *current* month's snapshot (the as-of window ends at this month's last
+day, so it includes every earlier row) but leaves the month it was dated into as it was.
+
+**Two further limitations, inherited from Phase 4 and worth stating explicitly.**
+`private.write_net_worth_snapshot` carries two sign guards and *raises* `data_exception`
+(SQLSTATE 22000) **before writing anything** rather than storing either magnitude negative — the
+`assets_cents >= 0 AND liabilities_cents >= 0` `CHECK` above is the same rule at the column level.
+Both states are now reachable through ordinary supported writes:
+
+- **`v_assets_cents < 0`** — the sum of every active non-`credit`/`loan` account is negative.
+  Reachable by opening an account at a negative balance (`opening_balance_cents` is a plain signed
+  `BIGINT` with no per-type sign constraint, and the validation layer accepts a signed figure for
+  every type), by overdrawing one with an ordinary expense, by transferring out of one, or by
+  reconciling one to a negative observed balance — which the reconcile form invites explicitly for
+  asset accounts. The aggregate only goes negative when the owner's whole asset position does, so
+  the realistic case is one overdrawn current account and no savings.
+- **`v_liabilities_cents < 0`** — the aggregate `credit`/`loan` balance is *positive*: an overpaid
+  card with no other debt offsetting it.
+
+In both cases the ledger write still commits and the current-month snapshot goes **stale rather
+than wrong** — the raise happens before the `INSERT … ON CONFLICT`, so an existing row is left
+byte for byte — and the next balance-affecting write that returns the aggregate to a valid sign
+recomputes the whole month. The underlying behavior is Phase 4's and CP5 does not alter it;
+`supabase/tests/database/160-current-snapshot.sql` characterizes both guards at the database
+layer and `tests/mutations/snapshots.test.ts` does the same at the action layer.
 
 ---
 

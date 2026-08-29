@@ -420,7 +420,8 @@ cumulative "Load more" reveal window described above resolves this — no route 
 
 ## Phase 7 — Mutations 🚧 in progress
 
-Checkpoints 1, 2, 3 and 4 are complete. **CP5 has not started.**
+Checkpoints 1 through 5 are complete. **CP5 was the REAL-FINANCE GATE, and it passes** — see
+its section below. **CP6 has not started.**
 
 ### CP1 — Write foundation ✅ (no migration, no write grant, no mutating code)
 
@@ -463,7 +464,9 @@ writable.**
   means "unchanged". `Account` exposes the *derived* balance, not the stored opening figure, and
   widening the DTO would force the fixture oracle to invent the seed's back-computed opening
   balances. Prefilling with the derived balance would be worse: it would silently restate an
-  account's history on any save. Revisit alongside the balance-adjustment/reconciliation work.
+  account's history on any save. **Revisited in CP5, and the conclusion held:** reconciliation is
+  the right mechanism for "this balance is wrong", because it appends a dated correction instead of
+  restating history, so the opening-balance field stays exactly as CP2 left it.
 - **UI:** account management on `/accounts` (create disclosure, per-card edit, archive/unarchive);
   category management as one section of the existing `/settings` page — no new route and no settings
   sub-system, since a route built for one list would be dismantled the moment budgets and bills need
@@ -606,13 +609,120 @@ movements. Nothing else became writable, and the ordinary transaction surface is
   single-layer rule `deleteTransaction` carries, and recorded in
   `lib/data/mutations/movements.ts` rather than implied.
 
-### Remaining — CP5 onward, not started
+### CP5 — Reconciliation + current-month snapshots ✅ **REAL-FINANCE GATE**
+
+**The owner can now reconcile any active account's balance to an observed figure, and remove a
+reconciliation to redo it. The current month's net-worth snapshot is maintained after every
+balance-affecting write. Nothing else became writable.**
+
+- **Two additive migrations**, `20260829120001_reconciliation.sql` and
+  `20260829120002_current_snapshot.sql`. No earlier migration was edited, and — the headline —
+  **no table grant for `authenticated` changed at all.** `100-write-grants.sql` still asserts the
+  CP4 matrix column by column, unaltered. Reconciliation is a new *operation over CP3's existing
+  privileges*: CP3 already granted `INSERT (…, kind, …)`, already made `adjustment` a legal
+  stored kind, and already left adjustment `DELETE` possible on purpose. What it withheld was a
+  path to writing one.
+- **Reconciliation never rewrites history.** The person states what an account's balance
+  actually is; `public.reconcile_account` derives `delta = desired − (opening + SUM(ledger))` **in
+  SQL** and writes one `adjustment` row for exactly that delta, dated as of the day the
+  observation was true. `opening_balance_cents` is deliberately *not* the mechanism — editing it
+  restates every balance the account ever reported, which is why `accounts_guard_update()` freezes
+  it. A zero delta writes **no row** and reports success.
+- **The delta is computed in the database, not the client**, and that is correctness rather than
+  tidiness: reading the balance in one request and posting the difference in another leaves a
+  window where a transaction entered in another tab makes the adjustment silently wrong, with a
+  row that looks perfectly well-formed. It is also what makes reconciliation **idempotent with no
+  idempotency key** — unlike CP3 and CP4, a resubmission computes its delta against the balance
+  the first submission already corrected, so it writes nothing.
+- **Liability input is a magnitude, normalized server-side.** Credit and loan accounts ask
+  "Amount currently owed" and take a non-negative figure; `lib/data/mutations/reconciliation.ts`
+  negates it into the internal balance from the account's **stored** type, never from anything the
+  client sent. Asset accounts take a signed actual balance, because an overdrawn current account is
+  a real state. The RPC's parameter keeps exactly one meaning — the desired internal signed
+  balance — so an overpaid card (a legitimately positive `credit` balance) stays expressible.
+- **An adjustment is permanently uneditable and always removable by its owner.**
+  `transactions_update_own_ordinary` refuses both to target one and to produce one;
+  `transactions_delete_own_non_movement` never excluded them. So the correction path is
+  remove-and-reconcile-again, and `deleteAdjustment` is a reconciliation-specific mutation that
+  refuses anything that is not an owned, non-movement adjustment — it adds **no privilege**.
+- **`public.refresh_current_net_worth_snapshot()` — the single `SECURITY DEFINER` in this whole
+  application.** Everything CP2–CP5 added is otherwise `SECURITY INVOKER`. This one cannot be:
+  `private.write_net_worth_snapshot` is owned by `finance_snapshot_writer`, `authenticated` has no
+  `USAGE` on `private`, and `net_worth_snapshots` has no write grant for `authenticated` and never
+  will. It is kept narrow by construction — **zero parameters** (so no owner and no month can be
+  addressed), owned by the existing `NOLOGIN`/`NOSUPERUSER`/`NOBYPASSRLS` writer rather than by
+  `postgres`, `search_path = ''`, `EXECUTE` revoked from `PUBLIC`/`anon`, and exactly one new
+  privilege: column-scoped `SELECT (id, timezone)` on `profiles` behind a policy narrowed to the
+  calling request's own row. The `CREATE ON SCHEMA public` that `ALTER FUNCTION … OWNER TO`
+  requires is granted for that one statement and revoked immediately.
+- **The month comes from the owner's profile timezone, never server UTC** — the same expression
+  `assert_transaction_refs()` and `getToday()` use. The bridge reads the JWT `sub` through
+  `private.request_owner_id()` rather than `auth.uid()`, because inside a definer body the current
+  role is `finance_snapshot_writer`, which has no `USAGE` on schema `auth` — and that grant cannot
+  be made from a migration at all (schema `auth` belongs to `supabase_auth_admin`; the migration
+  role holds no `WITH GRANT OPTION`, and the statement reports *"no privileges were granted"*).
+  Both facts were verified directly against the local image. `160-current-snapshot.sql` asserts
+  `request_owner_id()` and `auth.uid()` agree for a set claim, an empty claim, and the JSON
+  `request.jwt.claims` form, so the duplication cannot drift silently.
+- **The refresh is a secondary failure, always.** It is a separate PostgREST request and therefore
+  a separate transaction, so it is awaited *after* the primary write commits, and a failure is
+  caught, logged as a sanitized noun plus an `AppErrorCode`, and swallowed — never allowed to
+  report an already-committed ledger write as failed. `lib/data/mutations/snapshots.ts` is the
+  only module in the codebase that names the bridge, and `lib/write-posture.test.ts` asserts that.
+- **Which writes refresh, and which deliberately do not.** Refresh: account create, an
+  opening-balance edit, archive/unarchive (the writer's inclusion rule is `is_archived = false`),
+  ordinary transaction create/update/delete, movement create/replace/delete, reconciliation, and
+  adjustment removal. No refresh: any category write, a metadata-only account edit (name,
+  institution, credit limit, interest rate), a deduplicated create, a no-op movement replace, and a
+  zero-delta reconciliation — all of which write nothing a snapshot column reads.
+- **Revalidation** is exactly `/transactions`, `/dashboard`, `/accounts`, `/analytics`.
+  `/budgets` is absent for the same reason it is absent from the movement routes: `countsAsSpending`
+  is an allowlist of `expense` and `refund`, so an adjustment is excluded **by kind**.
+- **UI:** "Reconcile balance" is a per-account disclosure on `/accounts`, beside Edit and mutually
+  exclusive with it (the two ask contradictory questions about the same number — one restates
+  history, the other appends a dated correction). It shows the current derived balance, defaults
+  the date to the owner's today, asks the right question for the account's type, and says plainly
+  that it creates a balance adjustment rather than spending. An archived account gets a sentence
+  ("unarchive first to reconcile"), not a disabled button. On `/transactions`, an adjustment row
+  gets a two-step **Remove** control whose confirmation says it changes the account's balance —
+  and no Edit control at all.
+- **Deliberate historical limitations, accepted rather than worked around:** no `opened_on`, no
+  archived-at lifecycle reconstruction, no prior-month rebuild control, and no repair of an old
+  monthly snapshot after a backdated edit. Live derived balances are authoritative; the snapshot
+  series is a secondary trend. There is no historical rebuild *surface* either —
+  `private.write_net_worth_snapshots_for_range` keeps its Phase 4 posture with no wrapper of any
+  kind, and `160-current-snapshot.sql` asserts `public` exposes exactly one snapshot function.
+- **Two inherited limitations, now reachable and therefore recorded.** Phase 4's
+  `private.write_net_worth_snapshot` carries **two** sign guards — `v_assets_cents < 0` and
+  `v_liabilities_cents < 0` — and raises `data_exception` (SQLSTATE 22000) **before writing
+  anything** rather than storing either magnitude negative. Both were unreachable when they were
+  written, because nothing could produce either state and nothing called the writer; CP4 and CP5
+  changed both halves of that.
+  - **Aggregate assets below zero** — the sum of every active non-`credit`/`loan` account. Reached
+    by opening an account at a negative balance (the create form's own hint says the figure is
+    signed, and no constraint restricts sign by type), by overdrawing one with an ordinary CP3
+    expense, by transferring out of one, or by reconciling one to a negative observed balance,
+    which CP5's asset form invites explicitly. The *aggregate* goes negative only when the owner's
+    whole asset position does — one overdrawn current account and no savings, which is an ordinary
+    personal-finance situation and the more likely of the two.
+  - **Aggregate liabilities above zero internally** — a CP4 card payment larger than the card owes,
+    with no other debt to offset it, or CP5 zeroing the debts that were offsetting one.
+
+  In both cases the primary write **commits**, the action reports success, exactly one sanitized
+  line is logged (`[invalid_input]` — 22000 is class 22; no figures and no raise text), and the
+  existing snapshot row is left **byte for byte unchanged**: stale, never wrong. The next
+  balance-affecting write that returns the aggregate to a valid sign recomputes the whole month, so
+  the stale window is bounded by ordinary use. CP5 does not alter the Phase 4 writer; a future
+  checkpoint that wants a signed aggregate must decide whether the `net_worth_snapshots`
+  `CHECK (assets_cents >= 0 AND liabilities_cents >= 0)` is still the rule it wants — and that is a
+  schema decision about what a snapshot *means*, not a bug fix.
+
+### Remaining — CP6 onward, not started
 
 Every other finance domain is still read-only, and its grants and policies land only alongside the
-feature that needs them: reconciliation/adjustments (CP5, which owns net-worth snapshot
-refreshing — CP4 deliberately writes none), budgets, bills/occurrences (including the
-`BillOccurrence` DTO and mark-as-paid UI), and goals/contributions (INSERT only, respecting the
-append-only model). The same rules hold throughout — Server Actions are independently reachable
+feature that needs them: budgets, bills/occurrences (including the `BillOccurrence` DTO and
+mark-as-paid UI), and goals/contributions (INSERT only, respecting the append-only model). The
+same rules hold throughout — Server Actions are independently reachable
 endpoints, so the unconditional `getOwnerId()` pattern Phase 6 established for reads applies to
 every write; narrowly-scoped write RLS policies and object grants are added per mutation as it's
 built; §3/§4 of `docs/rls-policies.md` records the intended eventual policy matrix.

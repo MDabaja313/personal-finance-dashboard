@@ -13,7 +13,7 @@
 -- a missing policy on a granted table would silently return zero rows,
 -- which a bare success check could not distinguish from an empty table.
 begin;
-select plan(42);
+select plan(48);
 
 insert into auth.users (id, aud, role, email) values
   ('17000000-0000-4000-8000-000000000001', 'authenticated', 'authenticated', 'priv-test@local.test');
@@ -60,10 +60,17 @@ select is(
      and oid in (
        'private.generate_bill_occurrences(uuid,date)'::regprocedure,
        'private.write_net_worth_snapshot(uuid,text)'::regprocedure,
-       'private.write_net_worth_snapshots_for_range(uuid,text,text)'::regprocedure
+       'private.write_net_worth_snapshots_for_range(uuid,text,text)'::regprocedure,
+       -- Phase 7 CP5. The one SECURITY DEFINER function this phase adds, and
+       -- the only one of the four that lives in `public` and is reachable by
+       -- `authenticated` -- which is precisely why its owner matters. It is
+       -- finance_snapshot_writer (NOLOGIN, NOSUPERUSER, NOBYPASSRLS, no
+       -- members) and never postgres, whose BYPASSRLS attribute would turn a
+       -- browser-reachable function into an RLS bypass.
+       'public.refresh_current_net_worth_snapshot()'::regprocedure
      )),
-  3,
-  'all 3 system functions are owned by finance_snapshot_writer AND SECURITY DEFINER'
+  4,
+  'all 4 SECURITY DEFINER functions are owned by finance_snapshot_writer'
 );
 
 select is(
@@ -89,41 +96,71 @@ select is(
        -- accounts and movements. A definer's context would not add a
        -- check, it would remove the RLS backing every statement inside.
        'public.create_movement(uuid,public.movement_kind,date,uuid,uuid,bigint,uuid,uuid)'::regprocedure,
-       'public.replace_movement(uuid,public.movement_kind,date,uuid,uuid,bigint,uuid,uuid)'::regprocedure
+       'public.replace_movement(uuid,public.movement_kind,date,uuid,uuid,bigint,uuid,uuid)'::regprocedure,
+       -- Phase 7 CP5. reconcile_account is SECURITY INVOKER for the same
+       -- reason the CP4 RPCs are: the caller already holds SELECT on accounts
+       -- and transactions and INSERT on transactions, and under FORCE RLS the
+       -- invoker sees exactly its own rows. request_owner_id is invoker
+       -- because it reads two GUCs and needs no privilege at all.
+       'public.reconcile_account(uuid,date,bigint)'::regprocedure,
+       'private.request_owner_id()'::regprocedure
      )),
-  10,
-  'all 10 invoker functions are SECURITY INVOKER (prosecdef = false) -- the CP4 RPCs included'
+  12,
+  'all 12 invoker functions are SECURITY INVOKER (prosecdef = false) -- CP5 reconciliation included'
 );
 
--- The two CP4 RPCs are the *only* functions `authenticated` may execute
--- anywhere in this schema, and neither PUBLIC nor anon may reach them.
--- An unauthenticated caller is `anon`, so this is what makes "an
--- anonymous request cannot create a movement" a privilege-layer fact
--- rather than something the function body has to notice.
+-- The four RPCs are the *only* functions `authenticated` may execute
+-- anywhere in this schema, and neither PUBLIC nor anon may reach any of
+-- them. An unauthenticated caller is `anon`, so this is what makes "an
+-- anonymous request cannot create a movement, cannot reconcile an
+-- account, and cannot write a snapshot" a privilege-layer fact rather
+-- than something each function body has to notice.
 select ok(
   has_function_privilege('authenticated', 'public.create_movement(uuid,public.movement_kind,date,uuid,uuid,bigint,uuid,uuid)'::regprocedure, 'execute')
-  and has_function_privilege('authenticated', 'public.replace_movement(uuid,public.movement_kind,date,uuid,uuid,bigint,uuid,uuid)'::regprocedure, 'execute'),
-  'authenticated may EXECUTE both movement RPCs'
+  and has_function_privilege('authenticated', 'public.replace_movement(uuid,public.movement_kind,date,uuid,uuid,bigint,uuid,uuid)'::regprocedure, 'execute')
+  and has_function_privilege('authenticated', 'public.reconcile_account(uuid,date,bigint)'::regprocedure, 'execute')
+  and has_function_privilege('authenticated', 'public.refresh_current_net_worth_snapshot()'::regprocedure, 'execute'),
+  'authenticated may EXECUTE all four public RPCs'
 );
 select ok(
   not has_function_privilege('anon', 'public.create_movement(uuid,public.movement_kind,date,uuid,uuid,bigint,uuid,uuid)'::regprocedure, 'execute')
   and not has_function_privilege('anon', 'public.replace_movement(uuid,public.movement_kind,date,uuid,uuid,bigint,uuid,uuid)'::regprocedure, 'execute')
+  and not has_function_privilege('anon', 'public.reconcile_account(uuid,date,bigint)'::regprocedure, 'execute')
+  and not has_function_privilege('anon', 'public.refresh_current_net_worth_snapshot()'::regprocedure, 'execute')
   and not has_function_privilege('public', 'public.create_movement(uuid,public.movement_kind,date,uuid,uuid,bigint,uuid,uuid)'::regprocedure, 'execute')
-  and not has_function_privilege('public', 'public.replace_movement(uuid,public.movement_kind,date,uuid,uuid,bigint,uuid,uuid)'::regprocedure, 'execute'),
-  'neither anon nor the PUBLIC pseudo-role may EXECUTE either movement RPC'
+  and not has_function_privilege('public', 'public.replace_movement(uuid,public.movement_kind,date,uuid,uuid,bigint,uuid,uuid)'::regprocedure, 'execute')
+  and not has_function_privilege('public', 'public.reconcile_account(uuid,date,bigint)'::regprocedure, 'execute')
+  and not has_function_privilege('public', 'public.refresh_current_net_worth_snapshot()'::regprocedure, 'execute'),
+  'neither anon nor the PUBLIC pseudo-role may EXECUTE any of the four RPCs'
 );
 
 -- The set of `authenticated`-executable functions in public is exactly
--- those two. Enumerated as a sorted list rather than a count, because a
+-- those four. Enumerated as a sorted list rather than a count, because a
 -- function swapped for another would pass a count.
+--
+-- Note what is NOT here and must never be: any wrapper that takes a user
+-- id or a month. refresh_current_net_worth_snapshot() takes neither, so
+-- "the caller can address only its own current month" is a property of
+-- the signature rather than of a check inside the body.
 select is(
   (select string_agg(p.proname::text, ',' order by p.proname)
    from pg_proc p
    join pg_namespace n on n.oid = p.pronamespace
    where n.nspname = 'public'
      and has_function_privilege('authenticated', p.oid, 'execute')),
-  'create_movement,replace_movement',
-  'authenticated may EXECUTE exactly the two movement RPCs in public and nothing else'
+  'create_movement,reconcile_account,refresh_current_net_worth_snapshot,replace_movement',
+  'authenticated may EXECUTE exactly the four RPCs in public and nothing else'
+);
+
+-- The bridge takes no arguments at all. Asserted against the catalog
+-- rather than inferred from the signature above, because "zero
+-- parameters" is the entire mechanism by which a caller cannot choose an
+-- owner or a month -- and a defaulted parameter added later would still
+-- be callable with no arguments while quietly accepting one.
+select is(
+  (select pronargs::int from pg_proc where oid = 'public.refresh_current_net_worth_snapshot()'::regprocedure),
+  0,
+  'refresh_current_net_worth_snapshot takes zero parameters'
 );
 
 -- The two CP2 guards are trigger functions and are never called
@@ -142,25 +179,46 @@ select ok(
 select ok(
   not has_function_privilege('public', 'private.generate_bill_occurrences(uuid,date)'::regprocedure, 'execute')
   and not has_function_privilege('public', 'private.write_net_worth_snapshot(uuid,text)'::regprocedure, 'execute')
-  and not has_function_privilege('public', 'private.write_net_worth_snapshots_for_range(uuid,text,text)'::regprocedure, 'execute'),
-  'the PUBLIC pseudo-role cannot EXECUTE any of the 3 system functions'
+  and not has_function_privilege('public', 'private.write_net_worth_snapshots_for_range(uuid,text,text)'::regprocedure, 'execute')
+  and not has_function_privilege('public', 'private.request_owner_id()'::regprocedure, 'execute'),
+  'the PUBLIC pseudo-role cannot EXECUTE any of the 4 private functions'
 );
 select ok(
   not has_function_privilege('anon', 'private.generate_bill_occurrences(uuid,date)'::regprocedure, 'execute')
   and not has_function_privilege('anon', 'private.write_net_worth_snapshot(uuid,text)'::regprocedure, 'execute')
-  and not has_function_privilege('anon', 'private.write_net_worth_snapshots_for_range(uuid,text,text)'::regprocedure, 'execute'),
-  'anon cannot EXECUTE any of the 3 system functions'
+  and not has_function_privilege('anon', 'private.write_net_worth_snapshots_for_range(uuid,text,text)'::regprocedure, 'execute')
+  and not has_function_privilege('anon', 'private.request_owner_id()'::regprocedure, 'execute'),
+  'anon cannot EXECUTE any of the 4 private functions'
 );
 select ok(
   not has_function_privilege('authenticated', 'private.generate_bill_occurrences(uuid,date)'::regprocedure, 'execute')
   and not has_function_privilege('authenticated', 'private.write_net_worth_snapshot(uuid,text)'::regprocedure, 'execute')
-  and not has_function_privilege('authenticated', 'private.write_net_worth_snapshots_for_range(uuid,text,text)'::regprocedure, 'execute'),
-  'authenticated cannot EXECUTE any of the 3 system functions'
+  and not has_function_privilege('authenticated', 'private.write_net_worth_snapshots_for_range(uuid,text,text)'::regprocedure, 'execute')
+  and not has_function_privilege('authenticated', 'private.request_owner_id()'::regprocedure, 'execute'),
+  'authenticated cannot EXECUTE any of the 4 private functions'
 );
 
 -- ============================================================
 -- Schema/table reachability
 -- ============================================================
+
+-- M14 grants finance_snapshot_writer CREATE on public for exactly one
+-- statement -- ALTER FUNCTION ... OWNER TO requires the incoming owner to
+-- be able to have created the object -- and revokes it immediately. The
+-- ownership is permanent; the privilege must not be. A standing CREATE
+-- here would let anything running as the writer add objects to the
+-- schema the Data API exposes.
+select ok(
+  not has_schema_privilege('finance_snapshot_writer', 'public', 'create'),
+  'finance_snapshot_writer holds no standing CREATE on schema public'
+);
+-- It does still own CREATE on private (migration 7), which is what lets
+-- it own the functions that live there. Stated so the assertion above
+-- reads as "narrowed", not as "the role owns nothing anywhere".
+select ok(
+  has_schema_privilege('finance_snapshot_writer', 'private', 'create'),
+  'finance_snapshot_writer still holds CREATE on schema private'
+);
 
 select ok(not has_schema_privilege('anon', 'private', 'usage'), 'private schema has no USAGE grant for anon');
 -- Load-bearing for Phase 7 CP4, not merely tidy: `public.create_movement`
@@ -260,13 +318,58 @@ select throws_ok(
   '42501', null, 'writer DELETE on net_worth_snapshots is denied -- no DELETE grant'
 );
 
--- No access at all to the remaining six tables.
+-- No access at all to the remaining five tables.
 select throws_ok($$ select count(*) from public.categories $$, '42501', null, 'writer has no SELECT grant on categories');
 select throws_ok($$ select count(*) from public.movements $$, '42501', null, 'writer has no SELECT grant on movements');
 select throws_ok($$ select count(*) from public.budgets $$, '42501', null, 'writer has no SELECT grant on budgets');
 select throws_ok($$ select count(*) from public.goals $$, '42501', null, 'writer has no SELECT grant on goals');
 select throws_ok($$ select count(*) from public.goal_contributions $$, '42501', null, 'writer has no SELECT grant on goal_contributions');
-select throws_ok($$ select count(*) from public.profiles $$, '42501', null, 'writer has no SELECT grant on profiles');
+
+-- ============================================================
+-- profiles: the one privilege Phase 7 CP5 added to the writer
+-- ============================================================
+-- Through Phase 6 the writer had nothing on profiles at all, and this
+-- file asserted exactly that. CP5's snapshot bridge has to know which
+-- calendar month the *owner* is in, which means reading that owner's
+-- timezone, so the grant arrives with the feature that needs it -- and
+-- it arrives as narrowly as the privilege system allows, which the three
+-- assertions below pin from three different directions.
+--
+-- 1. Column-scoped. `created_at` was not granted, so reading it is
+--    refused at the privilege layer rather than merely unused.
+select throws_ok(
+  $$ select created_at from public.profiles $$,
+  '42501', null,
+  'writer cannot read a profiles column outside the (id, timezone) grant'
+);
+
+-- 2. Row-scoped, to the *calling request's* own profile. With no JWT
+--    claim in the session there is no caller, so profiles_select_writer
+--    matches nothing -- a psql shell or a cron job running as this role
+--    enumerates no owners at all. Asserted as a count rather than as an
+--    error, because a policy that matched everything would also "not
+--    error".
+select is(
+  (select count(*)::int from public.profiles),
+  0,
+  'writer sees zero profiles when the session carries no JWT claim'
+);
+
+-- 3. …and exactly one when it does. Without this the assertion above
+--    would pass just as well for a grant that was silently broken, and
+--    the bridge would fail closed in production with a "no profile"
+--    error nobody could explain.
+set local request.jwt.claim.sub = '17000000-0000-4000-8000-000000000001';
+select is(
+  (select count(*)::int from public.profiles),
+  1,
+  'writer sees exactly the calling claim''s own profile, and no other'
+);
+select is(
+  (select p.timezone from public.profiles p where p.id = '17000000-0000-4000-8000-000000000001'),
+  'UTC',
+  'writer can actually read the timezone the snapshot bridge needs'
+);
 
 reset role;
 
