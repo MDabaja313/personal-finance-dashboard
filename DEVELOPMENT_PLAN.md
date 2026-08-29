@@ -420,8 +420,9 @@ cumulative "Load more" reveal window described above resolves this — no route 
 
 ## Phase 7 — Mutations 🚧 in progress
 
-Checkpoints 1 through 5 are complete. **CP5 was the REAL-FINANCE GATE, and it passes** — see
-its section below. **CP6 has not started.**
+Checkpoints 1 through 7 are complete. **CP5 was the REAL-FINANCE GATE, and it passes** — see its
+section below. **CP7 completed the finance domains: every table except `profiles` and
+`net_worth_snapshots` is now writable by its owner.**
 
 ### CP1 — Write foundation ✅ (no migration, no write grant, no mutating code)
 
@@ -717,12 +718,132 @@ balance-affecting write. Nothing else became writable.**
   `CHECK (assets_cents >= 0 AND liabilities_cents >= 0)` is still the rule it wants — and that is a
   schema decision about what a snapshot *means*, not a bug fix.
 
-### Remaining — CP6 onward, not started
+### CP6 — Budgets + goals + goal contributions ✅
 
-Every other finance domain is still read-only, and its grants and policies land only alongside the
-feature that needs them: budgets, bills/occurrences (including the `BillOccurrence` DTO and
-mark-as-paid UI), and goals/contributions (INSERT only, respecting the append-only model). The
-same rules hold throughout — Server Actions are independently reachable
-endpoints, so the unconditional `getOwnerId()` pattern Phase 6 established for reads applies to
-every write; narrowly-scoped write RLS policies and object grants are added per mutation as it's
-built; §3/§4 of `docs/rls-policies.md` records the intended eventual policy matrix.
+**The owner can now manage current-month budgets, create/edit/archive goals, and append goal
+contributions.**
+
+- **One additive migration**, `20260830120001_budget_goal_writes.sql`. Three tables, three
+  deliberately different write shapes: `budgets` gets column-scoped `INSERT`/`UPDATE`/`DELETE`
+  (planning metadata, not ledger history — `category_id` and `period` are `INSERT`-only, so a
+  wrong one is deleted and recreated, which is what the `DELETE` grant exists for); `goals` gets
+  the CP2 accounts/categories treatment (soft-delete via `archived_at`, no `DELETE` grant at
+  all); `goal_contributions` gets `INSERT` only, permanently, because append-only is the entire
+  point of that table — a correction is a new signed row.
+- **Two `BEFORE INSERT` guard triggers**, both `SECURITY INVOKER` with `search_path = ''`:
+  `assert_budget_category_active_expense()` and `assert_goal_contribution_refs()` (the
+  owner-timezone `occurred_on` ceiling, plus "no new contribution to an archived goal").
+- **Sign is derived, never submitted** — `signedContributionAmountFor(action, magnitude)`,
+  mirroring `signedAmountFor`'s pattern: the form picks "add funds" or
+  "withdrawal / correction" and types a magnitude.
+- **Revalidation** is `/budgets` + `/dashboard`, and `/goals` + `/dashboard` — no goal or budget
+  write moves a balance or creates a transaction.
+- **Read side:** `getGoalsForManagement()` and `getGoalContributions()` were added alongside the
+  unchanged `getGoals()`, which `/dashboard` still depends on.
+
+### CP7 — Bills + bill occurrences ✅
+
+**The owner can now create, edit and archive/unarchive recurring bills, and mark any occurrence
+paid, skipped, or back to scheduled. Bill tracking creates no ledger activity of any kind, and
+this is the last finance domain — every table except `profiles` and `net_worth_snapshots` is now
+writable.**
+
+- **One additive migration**, `20260831120001_bill_writes.sql`. No earlier migration was edited.
+  `bills` gets column-scoped `INSERT`/`UPDATE` and **no `DELETE`, ever** (soft-delete only, and
+  `bill_occurrences_bill_fk` is `NO ACTION DEFERRABLE` rather than `CASCADE`, so a hard delete of
+  a bill with any occurrence would fail at `COMMIT` regardless). `bill_occurrences` gets a
+  three-column `UPDATE` — `status`, `transaction_id`, `paid_on` — and **no `INSERT` and no
+  `DELETE`, ever.** It is the only relation in this schema `authenticated` may `UPDATE` without
+  being able to `INSERT`, and both halves are structural: an occurrence is a system-derived fact
+  rather than something a person types, and PostgreSQL has no predicate-scoped `DELETE` that
+  could tell a `scheduled` row from a `paid` one.
+- **`amount_cents` and `due_date` are absent from every grant**, which is the point. They are the
+  historical facts `docs/database-schema.md` §13 protects — what an instance was due for, and
+  when — and neither the owner nor the scheduler may rewrite them.
+- **Three `SECURITY INVOKER` RPCs**, because a bill and its schedule are only ever correct
+  together. `public.create_bill` writes the bill and generates its first schedule in one
+  transaction (a bill with no occurrence has no projected due date, is omitted by `getBills()`,
+  and reads exactly like the create having failed). `public.replace_bill` updates and — **only
+  when the amount, frequency or anchor date changed** — rebuilds the future schedule in the same
+  transaction, so a refused regeneration rolls the edit back and the old bill *and* its old
+  schedule survive byte for byte. `public.set_bill_archived` restores a usable horizon on the way
+  back. PostgREST issues one statement per request, so none of the three is expressible as a
+  sequence of PostgREST calls.
+- **One `SECURITY DEFINER` bridge, `public.maintain_bill_schedule(uuid, boolean)`** — the second
+  in the application, after CP5's snapshot bridge, and built to the same rules. Owned by the
+  existing `NOLOGIN`/`NOSUPERUSER`/`NOBYPASSRLS` `finance_snapshot_writer`, `search_path = ''`,
+  the owner read from the request's own JWT claim via `private.request_owner_id()`, and **no
+  owner, month, date range or horizon parameter** — its arguments are an owned bill id and a
+  rebuild flag, which `090-privileges.sql` asserts exactly, the same way it asserts the snapshot
+  bridge takes zero. The one privilege it adds to the role is `DELETE` on `bill_occurrences`,
+  behind the narrowest policy in this schema: `status = 'scheduled' AND user_id =
+  private.request_owner_id()`. Paid and skipped history is unreachable at the policy layer,
+  before Phase 4's `guard_bill_occurrence_delete()` is consulted; a claimless session deletes
+  nothing at all; and the role has no `UPDATE` on the table and never will.
+- **`authenticated` gained no `USAGE` on `private` and no `EXECUTE` on any generator.**
+  `private.generate_bill_occurrences_for_bill` reuses Phase 4's
+  `private.next_bill_occurrence_date` rather than re-implementing the month-end and leap-year
+  arithmetic; it differs from Phase 4's owner-wide generator by walking **one bill**, and from
+  **the anchor** rather than from `max(due_date)` — the second matters because
+  `next_bill_occurrence_date` advances in whole periods from the anchor's own month, so a due
+  date from the old series can skip the first occurrence of a new one outright.
+- **The rolling horizon is one year from the owner's own calendar day**, widened to the bill's
+  anchor when that anchor lies further out — a constant in the bridge, unreachable by any client.
+  The widening is not a rounding detail: a bill deliberately anchored more than a year out would
+  otherwise generate nothing and vanish from `/bills`. Generation is mutation-time maintenance,
+  never a render-time side effect; no read path calls the scheduler.
+- **Generation starts at the anchor only when the bill has no occurrence at all** — true exactly
+  once, at creation, which is what lets someone track a bill whose first due date has already
+  passed. Every later call starts at the owner's today, so no rebuild can manufacture a
+  past-dated obligation, and already-overdue `scheduled` occurrences are preserved alongside
+  every paid and skipped one.
+- **Two guard triggers.** `assert_bill_refs()` (`BEFORE INSERT OR UPDATE`) requires an active
+  category and an active account when either is named — and runs **each half only when
+  its own column actually changes**, so a bill whose category was archived later can still be
+  renamed, repriced and unarchived. **A bill's category `kind` is deliberately unconstrained** at
+  every layer — no approved pre-CP7 requirement makes it an expense category
+  (`bills.category_id` carries no `CHECK` and no document states a kind rule), CP6's budgets rule
+  is not transferable, and `guard_category_kind_change()` naming `bills` proves only that a
+  referenced kind becomes immutable. `180-bill-writes.sql` asserts the acceptance positively.
+  `guard_bill_occurrence_transition()` (`BEFORE UPDATE`) is the
+  state machine (`scheduled → paid`, `scheduled → skipped`, either back to `scheduled`; a direct
+  `paid ↔ skipped` conversion is refused, and a same-status update is an idempotent no-op), the
+  owner-timezone `paid_on` ceiling, and the row-level restatement — for *every* role, not just
+  the one the grant constrains — that nothing outside the state machine may move.
+- **Marking a bill paid is not a ledger event.** No CP7 action writes a transaction, a movement,
+  an account or a budget, and none refreshes the net-worth snapshot — there is no figure for it
+  to recompute. Linking one of the owner's existing transactions records "this payment settled
+  this obligation" and alters nothing about that transaction; the bill's amount and the
+  transaction's are free to differ. `tests/mutations/bill-occurrences.test.ts` reads every
+  balance, total, cash-flow figure, net worth and snapshot back before and after each operation
+  and asserts they are identical.
+- **The link protects the transaction, and the FK was not weakened.**
+  `bill_occurrences_transaction_fk` (`NO ACTION DEFERRABLE`) refuses to let a linked transaction
+  be deleted; `deleteTransaction` (CP3) already preflighted that, and CP7 added the same
+  preflight to `deleteMovement`, since a movement delete cascades both legs. Both surface
+  "Unmark that bill as paid first."
+- **Revalidation is exactly `/bills` and `/dashboard`** — the only two routes that read a bill.
+- **UI:** `/bills` becomes the management surface — Add bill; per-card Edit, Mark paid, Skip,
+  History and Archive/Unarchive; a separate Archived section whose history stays visible and
+  whose Edit/Mark paid/Skip are replaced by a sentence rather than disabled buttons. The mark-paid
+  form defaults to the owner's own today, caps the input at it, offers a **bounded**,
+  deterministically-ordered picker of recent transactions (date, merchant, amount, account), and
+  says plainly that marking a bill paid does not record spending. History shows each occurrence's
+  **own** amount, its status, its linked payment if any, and Unmark paid / Unskip — and **no
+  Delete control**, because there is no action behind one.
+- **Deliberate limitation:** the recurrence horizon extends only when a bill is written or one of
+  its occurrences changes status. A bill left completely untouched for a year would eventually
+  run out of scheduled occurrences. That is accepted rather than worked around — the alternative
+  is generation on render, which this checkpoint deliberately refuses — and ordinary use (marking
+  each cycle paid) keeps the horizon rolling.
+
+### Remaining — CP8 onward, not started
+
+Every finance domain is now writable. `profiles` and `net_worth_snapshots` remain the two tables
+`authenticated` may not write, and both should stay that way: the first is provisioning, the
+second is a derived artifact written only by the Phase 4 writer behind CP5's zero-parameter
+bridge. The outstanding item carried forward is the **snapshot sign-guard limitation** recorded in
+CP5 — two reachable states in which `private.write_net_worth_snapshot` raises rather than writing,
+leaving the current month's snapshot stale but never wrong. Addressing it is a schema decision
+about what a snapshot *means* (whether `CHECK (assets_cents >= 0 AND liabilities_cents >= 0)` is
+still the right rule), not a bug fix.

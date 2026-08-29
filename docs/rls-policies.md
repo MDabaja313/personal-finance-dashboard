@@ -90,7 +90,7 @@ naming precisely, since "leaks every row" and "returns zero rows" call for very 
 | Role | Table/view access | INSERT | UPDATE | DELETE |
 |---|---|---|---|---|
 | `anon` | **None** on any user-financial table or view. | ❌ | ❌ | ❌ |
-| `authenticated` | `SELECT` on every table (`movements` included as of CP4), plus **column-scoped** `INSERT` on `accounts`, `categories`, `transactions` and `movements`, `UPDATE` on the first three only, and `DELETE` on `transactions` and `movements` only. | accounts, categories, transactions, movements | accounts, categories, transactions | **transactions, movements** |
+| `authenticated` | `SELECT` on every table (`movements` included as of CP4), plus **column-scoped** `INSERT` on `accounts`, `categories`, `transactions`, `movements`, `budgets`, `goals`, `goal_contributions` and `bills`; `UPDATE` on all of those except `movements` and `goal_contributions`, plus `bill_occurrences`; and `DELETE` on `transactions`, `movements` and `budgets` only. | accounts, categories, transactions, movements, budgets, goals, goal_contributions, bills | accounts, categories, transactions, budgets, goals, bills, **bill_occurrences** | **transactions, movements, budgets** |
 
 Through Phases 4, 5, and 6 this was `SELECT` only, without exception: there was no mutation UI, no
 Server Action, and no application code path that wrote to the database, so there was no reason for
@@ -337,6 +337,119 @@ silently.
 its Phase 4 posture — unreachable by `authenticated`, with no public wrapper of any kind — and
 `160-current-snapshot.sql` asserts that `public` exposes exactly one function whose name
 mentions a snapshot, and that it is the zero-argument bridge. Backfill stays an operator action.
+
+### What Phase 7 CP6 added
+
+`supabase/migrations/20260830120001_budget_goal_writes.sql` opened three more tables, each with
+a deliberately different shape: `budgets` got ordinary column-scoped `INSERT`/`UPDATE`/`DELETE`
+(planning metadata, not ledger history — `category_id` and `period` are `INSERT`-only, so a
+wrong one is deleted and recreated); `goals` got the CP2 accounts/categories treatment
+(soft-delete via `archived_at`, no `DELETE` grant at all); and `goal_contributions` got `INSERT`
+only, permanently, because append-only is the entire point of that table. Two `BEFORE INSERT`
+guard triggers came with them — `assert_budget_category_active_expense()` and
+`assert_goal_contribution_refs()`.
+
+### What Phase 7 CP7 added
+
+`supabase/migrations/20260831120001_bill_writes.sql` — the last two relations, and the one
+checkpoint whose *write shape differs per relation for a structural reason*:
+
+| Table | `INSERT` columns | `UPDATE` columns | `DELETE` |
+|---|---|---|---|
+| `bills` | `id`, `user_id`, `name`, `amount_cents`, `frequency`, `anchor_date`, `category_id`, `account_id` | `name`, `amount_cents`, `frequency`, `anchor_date`, `category_id`, `account_id`, `is_archived` | ❌ ever |
+| `bill_occurrences` | ❌ ever | `status`, `transaction_id`, `paid_on` | ❌ ever |
+
+`bill_occurrences` is the only relation in this schema `authenticated` may `UPDATE` without
+being able to `INSERT`, and both halves of that are deliberate:
+
+- **No `INSERT`.** An occurrence is a system-derived fact ("this obligation falls due on this
+  date, for this amount"), not something a person types. A direct grant would let a hand-crafted
+  request invent one on any date for any amount, for a bill whose terms say otherwise — and the
+  amount is precisely the value [database-schema.md §13](database-schema.md) protects by copying
+  it at generation time.
+- **No `DELETE`.** Removing a `scheduled` row is safe; removing a `paid` or `skipped` one
+  destroys payment history. PostgreSQL has no column- or predicate-scoped `DELETE`, so a
+  table-level grant could not tell the two apart. Only a policy can — and a policy on a role that
+  never holds the grant is unreachable.
+- **The three columns that *are* granted are exactly the state machine.** `amount_cents` and
+  `due_date` are absent, which is the whole point: neither the owner nor the scheduler may
+  rewrite what an instance was due for or when.
+
+`bills` gets no `DELETE` either, matching §4's "prefer archive" row — and
+`bill_occurrences_bill_fk` is `NO ACTION DEFERRABLE` rather than `CASCADE`, so a hard delete of a
+bill with any occurrence would fail at `COMMIT` regardless.
+
+Two new guard triggers. `assert_bill_refs()` (`BEFORE INSERT OR UPDATE`) requires that a named
+category not be archived and a named account not be archived, and **each half runs only when its
+own column actually changes** — so a bill whose category was archived later can still be renamed,
+repriced and unarchived.
+
+**A bill's category `kind` is deliberately unconstrained**, at every layer: the trigger, the
+validation schema, the mutation preflight and the form's picker all accept an income category.
+No approved pre-CP7 requirement makes a bill's category an expense category — `bills.category_id`
+is a plain nullable composite FK with no `CHECK`, and neither this document nor
+[database-schema.md](database-schema.md) §4/§13 states a kind rule for it. CP6's budgets rule is
+not transferable: for a budget, `expense` is what the row *means*, whereas for a bill the category
+is a label on a recurring obligation. And `guard_category_kind_change()` (CP2) naming `bills`
+proves only that a *referenced* category's kind becomes immutable, not that the kind must be
+`expense`. `180-bill-writes.sql` asserts the acceptance positively, so a later checkpoint cannot
+introduce the narrower rule quietly.
+
+`guard_bill_occurrence_transition()` (`BEFORE UPDATE`) is the
+four supported transitions, the owner-timezone `paid_on` ceiling, and the row-level restatement
+that nothing outside the state machine may move, for *every* role rather than only the one the
+grant constrains).
+
+#### The scheduler bridge — one `SECURITY DEFINER`, and how narrow it is
+
+Generating and rebuilding occurrences needs privileges `authenticated` deliberately does not
+have, and the recurrence machinery lives in `private`, which `authenticated` has no `USAGE` on
+and must never get (§9, and CP4's invoker RPCs depend on it). So CP7 adds exactly one bridge,
+built to CP5's rules:
+
+| Function | Security | Parameters | `EXECUTE` |
+|---|---|---|---|
+| `public.create_bill(uuid, text, bigint, bill_frequency, date, uuid, uuid)` | `INVOKER` | bill id, name, amount, frequency, anchor, category, account | `authenticated` only |
+| `public.replace_bill(...)` | `INVOKER` | same | `authenticated` only |
+| `public.set_bill_archived(uuid, boolean)` | `INVOKER` | bill id, archive flag | `authenticated` only |
+| `public.maintain_bill_schedule(uuid, boolean)` | **`DEFINER`**, owned by `finance_snapshot_writer` | owned bill id, rebuild flag | `authenticated` only |
+| `private.generate_bill_occurrences_for_bill(uuid, uuid, date, date)` | `INVOKER` | — | `finance_snapshot_writer` only |
+
+The three bill RPCs are `SECURITY INVOKER` for CP4's reason: the caller already holds every
+privilege their bodies use. They exist because a bill and its schedule must commit *together* —
+a created bill with no occurrence has no projected due date and is invisible on `/bills`, and an
+edited bill whose future schedule failed to rebuild would disagree with its own terms
+permanently. PostgREST issues one statement per request in its own transaction, so neither is
+expressible as a sequence of PostgREST calls.
+
+`maintain_bill_schedule` is the definer, and it is narrow by construction:
+
+- **No owner parameter.** The owner is read from the request's own JWT claim via
+  `private.request_owner_id()`, exactly as CP5's snapshot bridge does, and the bill is then
+  scoped `where id = p_bill_id and user_id = <that owner>`.
+- **No horizon, no date range, no month.** The rolling horizon — **one year from the owner's own
+  calendar day**, widened to the bill's anchor when that anchor is further out — is a constant
+  inside the function body that no client can reach. `090-privileges.sql` asserts the argument
+  list is exactly `(uuid, boolean)`, the same way it asserts the snapshot bridge takes zero
+  arguments: the guarantee is a property of the signature, not of a check inside the body.
+- **Owned by the existing `finance_snapshot_writer`** — `NOLOGIN`, `NOSUPERUSER`, `NOBYPASSRLS`,
+  no application member — never `postgres`, whose `BYPASSRLS` would make a browser-reachable
+  function into an RLS bypass. `search_path = ''`, every name qualified. `CREATE ON SCHEMA public`
+  is granted for the one `ALTER FUNCTION … OWNER TO` statement and revoked immediately.
+- **One new privilege for the role: `DELETE` on `bill_occurrences`**, behind a policy narrower
+  than any other writer policy in this schema — `status = 'scheduled' AND user_id =
+  private.request_owner_id()`. Paid and skipped history is unreachable at the *policy* layer,
+  before Phase 4's `guard_bill_occurrence_delete()` trigger is even consulted, and a session with
+  no JWT claim (a psql shell, a cron job) can delete nothing at all.
+- **It gains nothing else.** No `UPDATE` on `bill_occurrences` ever — the scheduler may add a
+  scheduled occurrence or remove a scheduled occurrence, and may never rewrite one.
+
+**Bill tracking creates no ledger activity.** No function or action in CP7 writes a transaction,
+a movement, an account or a budget, and none refreshes the net-worth snapshot — there is no
+figure for it to recompute. Marking a bill paid may optionally *reference* one of the owner's
+existing transactions, and that reference alters nothing about it;
+`bill_occurrences_transaction_fk` (`NO ACTION DEFERRABLE`) then protects the transaction from
+deletion until the occurrence is unmarked.
 
 **Deliberate limitation, recorded rather than implied:** Phase 4's
 `private.write_net_worth_snapshot` carries **two** sign guards — `v_assets_cents < 0` and
@@ -652,11 +765,12 @@ design; if the documented on-demand fallback (`database-schema.md §14`) is ever
 callable RPC instead, that is a **separate, deliberate grant decision** to make explicitly at
 that time — not a default extension of the cron writer's existing privilege.
 
-### The four RPCs — the only `EXECUTE` grants to an application role
+### The eight RPCs — the only `EXECUTE` grants to an application role
 
-`public.create_movement` and `public.replace_movement` (CP4), plus `public.reconcile_account`
-and `public.refresh_current_net_worth_snapshot` (CP5), are the only functions `authenticated`
-may call directly. That is the "intentional and explicitly granted for
+`public.create_movement` and `public.replace_movement` (CP4); `public.reconcile_account` and
+`public.refresh_current_net_worth_snapshot` (CP5); and `public.create_bill`,
+`public.replace_bill`, `public.set_bill_archived` and `public.maintain_bill_schedule` (CP7) are
+the only functions `authenticated` may call directly. That is the "intentional and explicitly granted for
 a stated application reason" case the rule above anticipates, and the reason is structural
 rather than ergonomic: a valid movement cannot be assembled by any sequence of PostgREST
 statements (§3), so a function is the only thing that can write one.
@@ -680,13 +794,18 @@ Three properties make that grant narrow rather than a widening:
   `090-privileges.sql` additionally asserts that these are the *entire* set of `public`-schema
   functions `authenticated` may execute, as a sorted list rather than a count.
 
-Three of the four are `SECURITY INVOKER`, for the reasons above.
-`refresh_current_net_worth_snapshot` is the single `SECURITY DEFINER` exception in the whole
-application, and the reason is a hard boundary rather than a preference — see §3, *What Phase 7
-CP5 added*, for why an invoker wrapper could reach nothing it needs, and for the properties that
-keep the definer's identity narrow: zero parameters, a `NOLOGIN`/`NOBYPASSRLS` owner, one
-column-scoped `profiles` grant behind a request-scoped policy, no standing `CREATE` on `public`,
-and no route of any kind to the range writer.
+Six of the eight are `SECURITY INVOKER`, for the reasons above.
+`refresh_current_net_worth_snapshot` (CP5) and `maintain_bill_schedule` (CP7) are the only two
+`SECURITY DEFINER` exceptions in the whole application, and in both cases the reason is a hard
+boundary rather than a preference: the machinery each one reaches lives in `private`, is owned by
+`finance_snapshot_writer`, and writes a relation `authenticated` holds no write grant on. See §3,
+*What Phase 7 CP5 added* and *What Phase 7 CP7 added*, for why an invoker wrapper could reach
+nothing either one needs, and for the properties that keep both definers' identity narrow: a
+`NOLOGIN`/`NOBYPASSRLS` owner, no owner parameter (both read the request's own JWT claim), no
+addressable month/horizon/range, no standing `CREATE` on `public`, and — for the scheduler — a
+`DELETE` policy restricted to `status = 'scheduled'` and the calling request's own rows.
+`090-privileges.sql` pins each one's argument list exactly: zero parameters for the snapshot
+bridge, `(uuid, boolean)` for the scheduler.
 
 ---
 

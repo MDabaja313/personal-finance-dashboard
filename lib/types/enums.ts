@@ -31,7 +31,14 @@
  * deliberately different objects rather than one list with a filter, so
  * widening the readable set can never silently widen the writable one.
  */
-import type { AccountType, BillFrequency, Category, Cents, TransactionKind } from "@/lib/types";
+import type {
+  AccountType,
+  BillFrequency,
+  BillOccurrenceStatus,
+  Category,
+  Cents,
+  TransactionKind,
+} from "@/lib/types";
 import { toCents } from "@/lib/types";
 
 /** `public.account_type`. */
@@ -280,17 +287,38 @@ export function signedContributionAmountFor(
 }
 
 /**
- * `public.bill_occurrence_status`. The `BillOccurrence` DTO itself does not
- * exist yet (DEVELOPMENT_PLAN.md defers it to the Phase 7 mark-as-paid work);
- * this is the label set that DTO and its validation will share.
+ * `public.bill_occurrence_status`, in declaration order.
+ *
+ * The union itself moved to `lib/types/index.ts` in Phase 7 CP7, alongside the
+ * `BillOccurrence` DTO it types — the same arrangement `BillFrequency` and
+ * `AccountType` already had. This stays the label set both the mapper and the
+ * validation layer narrow against.
+ *
+ * Membership here means "a row can carry this status and must render
+ * correctly". Which status changes a person may *make* is a strictly narrower
+ * question, and it is answered by the database
+ * (`guard_bill_occurrence_transition()`) rather than by a second array:
+ * scheduled → paid, scheduled → skipped, and either of those back to
+ * scheduled. A direct paid ↔ skipped conversion is not a supported transition.
  */
-export type BillOccurrenceStatus = "scheduled" | "paid" | "skipped";
-
 export const BILL_OCCURRENCE_STATUSES: readonly BillOccurrenceStatus[] = [
   "scheduled",
   "paid",
   "skipped",
 ];
+
+/**
+ * The two statuses a scheduled occurrence may be moved *to* — the writable
+ * subset of `BILL_OCCURRENCE_STATUSES`, and the TypeScript mirror of the
+ * outbound half of `guard_bill_occurrence_transition()`.
+ *
+ * A separate array rather than a filter over the list above, for the reason
+ * `ORDINARY_TRANSACTION_KINDS` gives: the set of states a person may write
+ * should never grow by omission.
+ */
+export type BillOccurrenceOutcome = Extract<BillOccurrenceStatus, "paid" | "skipped">;
+
+export const BILL_OCCURRENCE_OUTCOMES: readonly BillOccurrenceOutcome[] = ["paid", "skipped"];
 
 /** `public.bill_frequency`. */
 export const BILL_FREQUENCIES: readonly BillFrequency[] = ["weekly", "biweekly", "monthly", "yearly"];

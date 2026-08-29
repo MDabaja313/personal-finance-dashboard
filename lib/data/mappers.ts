@@ -30,6 +30,7 @@
  */
 import type {
   AccountBalanceRow,
+  BillOccurrenceDetailRow,
   BillRow,
   BudgetRow,
   CategoryRow,
@@ -41,6 +42,7 @@ import { dataIntegrity } from "@/lib/errors";
 import type {
   Account,
   Bill,
+  BillOccurrence,
   Budget,
   CalendarDate,
   Category,
@@ -54,6 +56,7 @@ import { toCents } from "@/lib/types";
 import {
   ACCOUNT_TYPES,
   BILL_FREQUENCIES,
+  BILL_OCCURRENCE_STATUSES,
   CATEGORY_KINDS,
   TRANSACTION_KINDS,
 } from "@/lib/types/enums";
@@ -237,6 +240,31 @@ export function toBill(row: BillRow, dueDate: unknown): Bill {
     frequency: enumFrom(row.frequency, BILL_FREQUENCIES, "bills.frequency"),
     categoryId: row.category_id ?? undefined,
     accountId: row.account_id ?? undefined,
+  };
+}
+
+/**
+ * `bill_occurrences` row → `BillOccurrence` (Phase 7 CP7).
+ *
+ * `amountCents` is read straight off the occurrence and never from the parent
+ * bill: it is what *this* instance was due for, fixed at generation time
+ * (docs/database-schema.md §13). A mapper that reached for the parent's
+ * current amount would silently rewrite payment history on every render.
+ *
+ * `transaction_id` and `paid_on` are both legitimately null — a paid
+ * occurrence need not link a transaction, and a scheduled or skipped one
+ * carries neither — so both become `undefined` per this module's rule 2.
+ * `created_at` is an ordering key only and is deliberately absent from the DTO.
+ */
+export function toBillOccurrence(row: BillOccurrenceDetailRow): BillOccurrence {
+  return {
+    id: row.id,
+    billId: row.bill_id,
+    dueDate: calendarDateFrom(row.due_date, "bill_occurrences.due_date"),
+    status: enumFrom(row.status, BILL_OCCURRENCE_STATUSES, "bill_occurrences.status"),
+    amountCents: centsFrom(row.amount_cents, "bill_occurrences.amount_cents"),
+    transactionId: row.transaction_id ?? undefined,
+    paidOn: calendarDateOrUndefined(row.paid_on, "bill_occurrences.paid_on"),
   };
 }
 

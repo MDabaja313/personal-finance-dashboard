@@ -96,6 +96,22 @@ export const BUDGET_ROUTES = ["/budgets", "/dashboard"];
 export const GOAL_ROUTES = ["/goals", "/dashboard"];
 
 /**
+ * The routes a bill or bill-occurrence write must invalidate — the same
+ * two-route shape as budgets and goals, and for a stronger reason than
+ * either.
+ *
+ * Bill tracking creates **no ledger activity at all**: no transaction, no
+ * movement, no balance change, no category rollup. So `/accounts`,
+ * `/transactions`, `/budgets` and `/analytics` cannot render a figure any
+ * bill write could have moved, and `/goals` reads a different domain
+ * entirely. `/bills` renders the management surface and `/dashboard` renders
+ * the upcoming-bill projection; those are the whole list. Listed as an exact
+ * array so adding a route out of habit fails the assertion rather than
+ * passing quietly.
+ */
+export const BILL_ROUTES = ["/bills", "/dashboard"];
+
+/**
  * The calendar day `delta` days from `date`, as 'YYYY-MM-DD'.
  *
  * `Date.UTC` rather than local-midnight construction, for the same reason

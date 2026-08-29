@@ -823,20 +823,90 @@ an arbitrary column's value:
 
 `authenticated` holds no DELETE grant on this table under any circumstance regardless
 (`rls-policies.md`), so this trigger is defense-in-depth against a privileged or direct-SQL
-deletion path, not the application's primary guard. **Document required trigger behavior only —
-no trigger SQL is written in this phase**, consistent with the movement trigger (§7) and
-timezone-validation trigger (§10).
+deletion path, not the application's primary guard. Implemented in Phase 4 as
+`guard_bill_occurrence_delete()`.
 
-### Phase 7 — what a later bill edit is and isn't allowed to do
+**Phase 7 CP7 put a second layer in front of it.** The schedule rebuild needs to remove the
+scheduled rows it replaces, so `finance_snapshot_writer` gained a `DELETE` grant — behind a
+policy reading `status = 'scheduled' AND user_id = private.request_owner_id()`. A paid or skipped
+occurrence is therefore invisible to that `DELETE` at the *policy* layer, before the trigger is
+consulted at all, and a session carrying no JWT claim can delete nothing whatsoever. The trigger
+still fires and still refuses, for every role; `180-bill-writes.sql` proves both layers
+independently.
 
-Not implemented now; recorded so the eventual mutation logic has a stated rule to follow rather
-than inventing one under time pressure:
+### Status transitions — Phase 7 CP7
 
-- If a recurring bill's default amount, frequency, or anchor date changes, **future `scheduled`
-  occurrences may be regenerated or updated** to reflect the new terms — that's a legitimate use
-  of the fact that they haven't happened yet.
-- **`paid` and `skipped` occurrences must never be silently rewritten** by a change to the parent
-  bill. Their `amount_cents` was fixed at generation time specifically so this couldn't happen.
+`guard_bill_occurrence_transition()` (`BEFORE UPDATE`) is the state machine. Supported, and
+nothing else:
+
+| From | To | Meaning |
+|---|---|---|
+| `scheduled` | `paid` | The obligation was met |
+| `scheduled` | `skipped` | It did not apply this cycle |
+| `paid` | `scheduled` | Correction — unmark; clears `paid_on` and `transaction_id` |
+| `skipped` | `scheduled` | Correction — unskip |
+
+A no-op status (`old.status = new.status`) is allowed unconditionally, which is what makes a
+resubmitted mark-paid idempotent rather than an error. A direct `paid ↔ skipped` conversion is
+**refused**: the two are different claims about what happened, and converting one to the other in
+a single statement would clear or set payment fields as a side effect of a status change nobody
+asked for. The correction goes back through `scheduled`, where it is visible as the two steps it
+is.
+
+The trigger also enforces `paid_on <= (now() AT TIME ZONE profiles.timezone)::date` — the owner's
+own calendar day, the same expression `assert_transaction_refs()`, `assert_goal_contribution_refs()`
+and `getToday()` use, never `current_date` and never server UTC. `due_date` gets no such ceiling
+and never will: a bill is an obligation, and every useful one is in the future.
+
+Finally it restates, at row level and for **every** role, that `id`, `user_id`, `bill_id`,
+`due_date`, `amount_cents` and `created_at` may not move. The column-scoped grant already makes
+them unreachable for `authenticated`; this is what makes it true of the scheduler as well, whose
+whole contract is that it may add a scheduled occurrence or remove one, and may never rewrite
+one.
+
+### Phase 7 CP7 — what a bill edit does, and what it may never touch
+
+Implemented in `supabase/migrations/20260831120001_bill_writes.sql`. The rule this section
+recorded in advance held exactly as written, and is now enforced in SQL:
+
+- If a recurring bill's **amount, frequency, or anchor date** changes, `public.replace_bill`
+  rebuilds its future schedule inside the same transaction as the `UPDATE` — so a refused
+  regeneration rolls the edit back with it, and the old bill *and* its old schedule survive byte
+  for byte. A change to `name`, `category_id` or `account_id` rebuilds nothing: those decide none
+  of the schedule, and a needless rewrite would give every future row a new id and `created_at`.
+- **`paid` and `skipped` occurrences are never rewritten by anything.** The rebuild's `DELETE`
+  names `status = 'scheduled'`, the writer's own `DELETE` policy names it again, Phase 4's
+  `guard_bill_occurrence_delete()` refuses one for any role, and
+  `guard_bill_occurrence_transition()` refuses to move `amount_cents` or `due_date` on any row.
+- **Already-overdue `scheduled` occurrences are preserved too.** The rebuild's cutoff is the
+  owner's own calendar day (`(now() AT TIME ZONE profiles.timezone)::date`), not server UTC: an
+  obligation that already fell due is a fact about the past even though nobody has acted on it
+  yet.
+- **No rebuild manufactures a past-dated obligation.** Generation starts at the bill's anchor
+  **only when the bill has no occurrence at all** — true exactly once, at creation, which is what
+  lets someone track a bill whose first due date has already passed. Every later call starts at
+  the owner's today.
+
+### Phase 7 CP7 — the rolling horizon
+
+`private.generate_bill_occurrences` (Phase 4) takes a horizon as a parameter and was never
+scheduled. CP7 fixes one, in `public.maintain_bill_schedule` and nowhere else: **one year from
+the owner's own calendar day, widened to the bill's `anchor_date` when that anchor lies further
+out.** It is a constant in the function body — no caller can supply, widen or narrow it.
+
+One year is the conservative choice for the three things the schedule has to support: a `yearly`
+bill always has a next occurrence (the frequency that would break first under a shorter window);
+`getBills()` and the dashboard projection always find one for every active bill; and a `weekly`
+bill needs its ~52 rows once rather than on every page load. The anchor widening is not a
+rounding detail — a bill whose first tracked due date is deliberately more than a year out (an
+annual premium set up early, a lease starting next autumn) would otherwise generate *nothing*, be
+omitted by `getBills()`, and read exactly like the create having failed.
+
+**Generation is mutation-time maintenance, never a render-time side effect.** No read path calls
+the scheduler. It runs inside `create_bill`/`replace_bill`/`set_bill_archived`, and — best-effort,
+after the write has already committed — after an occurrence status change, which is the moment an
+owner naturally revisits a bill as time passes. An archived bill generates nothing and loses
+nothing.
 
 ### Recurrence semantics — deterministic, documented now, not implemented
 
@@ -862,8 +932,19 @@ Each value is `anchor day-of-month = 31` clamped independently against that mont
 computed from the previous row.
 
 Occurrences are generated forward through a rolling horizon, idempotent via
-`UNIQUE (bill_id, due_date)` so re-running the generator never duplicates. **The generator itself
-is not built in this phase** — it arrives with the snapshot writer in Phase 4.
+`UNIQUE (bill_id, due_date)` so re-running the generator never duplicates. The generator arrived
+with the snapshot writer in Phase 4 (`private.next_bill_occurrence_date`,
+`private.generate_bill_occurrences`); Phase 7 CP7 adds
+`private.generate_bill_occurrences_for_bill`, which reuses that same pure date arithmetic and
+adds only a per-bill window around it. **The month-end and leap-year rules have exactly one
+implementation, and CP7 did not copy it.**
+
+CP7's generator differs from Phase 4's in two ways, and neither is stylistic: it walks **one
+bill** (an edit rebuilds one bill's future, not every bill's), and it walks from **the anchor**
+rather than from `max(due_date)`. The second matters after an anchor or frequency change:
+`next_bill_occurrence_date(anchor, freq, after)` advances in whole periods from the *anchor's* own
+month, so handing it a due date from the old series can skip the first occurrence of the new one
+outright. Walking the new series from its own anchor is the only formulation that cannot drift.
 
 ### DTO projection — how the existing `Bill` shape survived Phase 6 unchanged
 
@@ -881,8 +962,23 @@ then their `scheduled` `bill_occurrences`) reduced to one occurrence per bill in
 PostgREST's embedded-resource `order`/`limit` applies to the flattened join rather than per parent
 row. **Decided in Phase 4, shipped in Phase 6: this projection is a DAL query, not a third
 view** — `20260822150005_views.sql` creates exactly the two views in §1 (`account_balances`,
-`goal_balances`). `BillOccurrence` does not enter the UI, and no component changes, until Phase 7
-actually needs occurrence history or a mark-as-paid action.
+`goal_balances`).
+
+**Phase 7 CP7 is the point at which occurrence history did enter the UI, and `getBills()`'s
+contract is unchanged by it.** It still returns *active* bills projected onto their earliest
+`scheduled` occurrence, and `/dashboard` still depends on exactly that. CP7 adds a second, wider
+read alongside it — `getBillsForManagement()` (`lib/data/bills.ts`), returning every owned bill
+(archived included) with its recurrence terms, its archive state, its full occurrence history and
+the derived `nextDueDate`. Two queries whatever the bill count, never N+1, for the same reason
+`getBills()` uses two: PostgREST's embedded-resource `order`/`limit` applies to the flattened
+join rather than per parent row.
+
+The two shapes are deliberately not one. `Bill.dueDate` is required, and a bill whose occurrences
+are all paid or skipped has no honest value for it — which is precisely the case a management view
+must still be able to show and fix, so `BillManagement.nextDueDate` is optional. The
+`BillOccurrence` DTO (`lib/types/index.ts`) carries each occurrence's **own** `amountCents`, never
+the parent's current amount; a display layer that fell back to the bill's headline figure would
+silently undo this section's whole guarantee in the one place a person goes to check it.
 
 ---
 

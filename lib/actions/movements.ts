@@ -123,6 +123,13 @@ const TARGETS_UNUSABLE =
   "Those accounts can no longer be used for this transfer. Refresh the page and try again.";
 const DUPLICATE_SUBMISSION =
   "A different transfer was already saved from this form. Refresh the page and try again.";
+/**
+ * Deleting a movement cascades both legs, and a leg recorded as a bill
+ * occurrence's payment cannot go with it — the FK is deliberately not
+ * weakened. This names the one thing that unblocks it, exactly as the ordinary
+ * transaction delete surface does.
+ */
+const BILL_LINKED = "Unmark that bill as paid first, then delete the transfer.";
 
 /** The raw form fields, read once, shared by create and edit. */
 function movementFieldsFrom(formData: FormData) {
@@ -220,6 +227,11 @@ export async function deleteMovementAction(
   if (!outcome.ok) {
     if (outcome.reason === "unauthenticated") redirect("/login");
     if (outcome.reason === "invalid_input") return failed(TARGETS_UNUSABLE);
+    // On delete, `conflict` has exactly one meaning: a bill occurrence records
+    // one of these legs as its payment (Phase 7 CP7), and
+    // `bill_occurrences_transaction_fk` refuses the cascade. The generic
+    // "that conflicts with something that already exists" is not actionable.
+    if (outcome.reason === "conflict") return failed(BILL_LINKED);
     return outcome.state;
   }
 

@@ -19,7 +19,7 @@
 -- 42501 before RLS is ever consulted; a granted-but-unmatched SELECT
 -- returns zero rows, not an error.
 begin;
-select plan(46);
+select plan(47);
 
 -- ============================================================
 -- Fixture: two users, one row in each of the 10 grant-bearing tables,
@@ -171,22 +171,33 @@ select is(
 -- accounts and categories; CP3 added transactions (INSERT/UPDATE/
 -- DELETE); CP4 added movements (SELECT/INSERT/DELETE, never UPDATE);
 -- CP6 added budgets (INSERT/UPDATE/DELETE) and goals (INSERT/UPDATE,
--- never DELETE) -- goal_contributions stays INSERT-only. So this file
--- no longer asserts blanket write-denial on those six -- their full
--- grant, RLS, trigger and RPC behavior is
--- 100/110/120/130/135/140/170. Every *other* table is still read-only
--- for this role, which is what the spread below covers. bills and
--- bill_occurrences stand in here for the tables these assertions used
--- to name.
+-- never DELETE) -- goal_contributions stays INSERT-only; CP7 added
+-- bills (INSERT/UPDATE, never DELETE) and a three-column UPDATE on
+-- bill_occurrences. So this file no longer asserts blanket
+-- write-denial on those eight -- their full grant, RLS, trigger and
+-- RPC behavior is 100/110/120/130/135/140/170/180.
+--
+-- What remains read-only for this role after CP7 is exactly two
+-- tables, and they are the two that must stay that way: profiles (the
+-- owner's own settings row, written only by provisioning) and
+-- net_worth_snapshots (a derived artifact, written only by the Phase 4
+-- writer). They stand in here for the tables these assertions used to
+-- name. bill_occurrences keeps its INSERT and DELETE denials below,
+-- since CP7 granted neither.
 select throws_ok(
-  $$ insert into public.bills (id, user_id, name, amount_cents, frequency, anchor_date) values ('14000000-0000-4000-8000-000000000203', '14000000-0000-4000-8000-000000000001', 'C-bill', 300, 'monthly', '2026-01-01') $$,
+  $$ insert into public.net_worth_snapshots (user_id, month, assets_cents, liabilities_cents, net_worth_cents) values ('14000000-0000-4000-8000-000000000001', '2026-02', 100, 0, 100) $$,
   '42501', null,
-  'authenticated INSERT on bills (even own row) is denied at the GRANT layer'
+  'authenticated INSERT on net_worth_snapshots (even own row) is denied at the GRANT layer'
 );
 select throws_ok(
-  $$ update public.bills set name = 'changed' where user_id = '14000000-0000-4000-8000-000000000001' $$,
+  $$ update public.net_worth_snapshots set assets_cents = 1 where user_id = '14000000-0000-4000-8000-000000000001' $$,
   '42501', null,
-  'authenticated UPDATE on bills (even own row) is denied at the GRANT layer'
+  'authenticated UPDATE on net_worth_snapshots (even own row) is denied at the GRANT layer'
+);
+select throws_ok(
+  $$ delete from public.bill_occurrences where id = '14000000-0000-4000-8000-000000000301' $$,
+  '42501', null,
+  'authenticated DELETE on bill_occurrences (even own row) is denied at the GRANT layer -- CP7 granted UPDATE only'
 );
 select throws_ok(
   $$ delete from public.goals where id = '14000000-0000-4000-8000-000000000401' $$,

@@ -376,6 +376,10 @@ export async function deleteMovement(movementId: string): Promise<void> {
     assertAccountUsable(existing.toAccountId),
   ]);
 
+  if (await legsLinkedToBillOccurrence([existing.sourceLegId, existing.destinationLegId])) {
+    throw conflict("Unmark that bill as paid first.");
+  }
+
   const supabase = await getDataClient();
 
   const { error } = await supabase
@@ -387,4 +391,43 @@ export async function deleteMovement(movementId: string): Promise<void> {
   if (error) throw mapWriteError(error, "the transfer");
 
   await refreshCurrentSnapshotAfter("the transfer");
+}
+
+/**
+ * Whether either of this movement's legs is recorded as a bill occurrence's
+ * payment.
+ *
+ * Deleting the parent cascades both legs through `transactions_movement_fk`,
+ * so a leg linked from `bill_occurrences.transaction_id` would fail
+ * `bill_occurrences_transaction_fk` — `NO ACTION DEFERRABLE`, so at COMMIT,
+ * as a bare 23503 with nothing a person could act on. That was unreachable
+ * before Phase 7 CP7, because nothing could create a link; it became reachable
+ * the moment marking a bill paid could name a transaction, so the check
+ * arrives with the feature rather than after a confusing failure report.
+ *
+ * The FK is not weakened to accommodate this — the preflight exists to produce
+ * the sentence, and the constraint remains the enforcement. Unmarking the
+ * occurrence clears the reference and leaves the movement deletable under its
+ * ordinary rules.
+ *
+ * `head: true` with an exact count asks PostgREST for the count and no rows,
+ * so this stays O(1) on the wire. The owner predicate is applied on
+ * `bill_occurrences` as well, so it can never count a row it is not entitled
+ * to see. The relation is named as a literal rather than looped over a table
+ * list, so `lib/write-posture.test.ts` can enumerate every relation this layer
+ * touches by scanning the source.
+ */
+async function legsLinkedToBillOccurrence(legIds: readonly string[]): Promise<boolean> {
+  const ownerId = await getOwnerId();
+  const supabase = await getDataClient();
+
+  const { count, error } = await supabase
+    .from("bill_occurrences")
+    .select("id", { count: "exact", head: true })
+    .in("transaction_id", legIds)
+    .eq("user_id", ownerId);
+
+  if (error) throw mapWriteError(error, "the transfer");
+
+  return (count ?? 0) > 0;
 }

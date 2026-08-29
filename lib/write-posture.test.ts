@@ -404,17 +404,18 @@ describe("write-boundary source posture", () => {
   });
 });
 
-describe("CP6 write surface is exactly accounts + categories + transactions + movements + reconciliation + budgets + goals + goal-contributions", () => {
+describe("CP7 write surface is exactly accounts + categories + transactions + movements + reconciliation + budgets + goals + goal-contributions + bills + bill-occurrences", () => {
   // CP1's version of this block asserted the application was still entirely
   // read-only; CP2's turned it into a two-domain allowlist; CP3 added the
   // third; CP4 the fourth; CP5 added reconciliation, deliberately NOT a fifth
   // table (it writes `transactions` through an RPC and opens no new relation
-  // at all). CP6 adds three genuinely new tables — budgets, goals,
-  // goal_contributions. The point is unchanged throughout: the set of
-  // writable things is a checked fact, and adding to it cannot happen
-  // quietly.
+  // at all). CP6 added three genuinely new tables — budgets, goals,
+  // goal_contributions. CP7 adds the last two, `bills` and `bill_occurrences`,
+  // and with them the schema's first scheduler bridge. The point is unchanged
+  // throughout: the set of writable things is a checked fact, and adding to it
+  // cannot happen quietly.
 
-  it("has Server Actions only for auth, accounts, categories, transactions, movements, reconciliation, budgets, goals, and goal-contributions", () => {
+  it("has Server Actions only for auth, accounts, categories, transactions, movements, reconciliation, budgets, goals, goal-contributions, bills, and bill-occurrences", () => {
     // 'use server' marks a file whose exports are independently reachable HTTP
     // endpoints. Every one of them is a new attack surface, so the list is
     // enumerated rather than bounded.
@@ -429,6 +430,8 @@ describe("CP6 write surface is exactly accounts + categories + transactions + mo
 
     expect(serverActionFiles).toEqual([
       "lib/actions/accounts.ts",
+      "lib/actions/bill-occurrences.ts",
+      "lib/actions/bills.ts",
       "lib/actions/budgets.ts",
       "lib/actions/categories.ts",
       "lib/actions/goal-contributions.ts",
@@ -440,7 +443,7 @@ describe("CP6 write surface is exactly accounts + categories + transactions + mo
     ]);
   });
 
-  it("has mutation DAL modules only for the eight write domains plus the snapshot bridge", () => {
+  it("has mutation DAL modules only for the ten write domains plus the two maintenance bridges", () => {
     const mutationModules = filesWithCode
       .map(({ repoPath }) => repoPath)
       .filter((repoPath) => repoPath.startsWith("lib/data/mutations/"))
@@ -448,6 +451,9 @@ describe("CP6 write surface is exactly accounts + categories + transactions + mo
 
     expect(mutationModules).toEqual([
       "lib/data/mutations/accounts.ts",
+      "lib/data/mutations/bill-occurrences.ts",
+      "lib/data/mutations/bill-schedule.ts",
+      "lib/data/mutations/bills.ts",
       "lib/data/mutations/budgets.ts",
       "lib/data/mutations/categories.ts",
       "lib/data/mutations/goal-contributions.ts",
@@ -459,14 +465,114 @@ describe("CP6 write surface is exactly accounts + categories + transactions + mo
     ]);
   });
 
-  it("has no bill or bill-occurrence write surface — CP7 onward is not implemented", () => {
-    // The specific things CP6 must not have started. Each would also fail the
-    // enumerations above, but failing here says which one and why.
+  it("has no profile or snapshot write surface — the two tables that stay read-only", () => {
+    // The CP7 counterpart of the assertion that used to name bills here. Every
+    // finance domain is now writable, so what this guards is the pair that is
+    // not and never will be: `profiles` (the owner's own timezone row, written
+    // only by provisioning) and `net_worth_snapshots` (a derived artifact,
+    // written only by the Phase 4 writer behind CP5's zero-parameter bridge).
+    // Each would also fail the enumerations above, but failing here says which
+    // one and why.
     const modules = filesWithCode.map(({ repoPath }) => repoPath);
-    for (const domain of ["bills", "bill-occurrences"]) {
-      expect(modules).not.toContain(`lib/data/mutations/${domain}.ts`);
+    for (const domain of ["profiles", "net-worth-snapshots", "snapshots"]) {
       expect(modules).not.toContain(`lib/actions/${domain}.ts`);
     }
+    expect(modules).not.toContain("lib/data/mutations/profiles.ts");
+
+    // And no mutation module issues a PostgREST write against either table.
+    // `snapshots.ts` reaches the snapshot bridge as an RPC and touches no
+    // relation at all, which the relation enumeration below re-states.
+    const offenders = filesWithCode
+      .filter(({ repoPath }) => repoPath.startsWith("lib/data/mutations/"))
+      .filter(({ code }) => /\.from\(\s*["'`](profiles|net_worth_snapshots)["'`]/.test(code))
+      .map(({ repoPath }) => repoPath);
+
+    expect(offenders).toEqual([]);
+  });
+
+  it("keeps bill tracking free of ledger writes", () => {
+    // The load-bearing CP7 property, as a source fact: creating, editing,
+    // archiving a bill, and marking an occurrence paid or skipped write no
+    // transaction, no movement, no account and no budget — so no balance, no
+    // economic total and no net-worth figure can move. The integration half is
+    // tests/mutations/bill-occurrences.test.ts, which reads every one of those
+    // figures back before and after.
+    const billModules = filesWithCode.filter(
+      ({ repoPath }) =>
+        repoPath === "lib/data/mutations/bills.ts" ||
+        repoPath === "lib/data/mutations/bill-occurrences.ts" ||
+        repoPath === "lib/data/mutations/bill-schedule.ts"
+    );
+    expect(billModules).toHaveLength(3);
+
+    for (const { repoPath, code } of billModules) {
+      // No write verb against any relation but the two bill relations. The
+      // occurrence module *reads* `transactions` to validate a link, which is
+      // why this checks the write verbs rather than the relation name.
+      for (const relation of ["transactions", "movements", "accounts", "budgets", "goals"]) {
+        expect(
+          new RegExp(`\\.from\\(\\s*["'\`]${relation}["'\`]\\)[\\s\\S]{0,200}?\\.(insert|update|upsert|delete)\\s*\\(`).test(
+            code
+          ),
+          `${repoPath} must not write ${relation}`
+        ).toBe(false);
+      }
+
+      // And no snapshot refresh: bill tracking changes no figure a snapshot
+      // records, so calling the bridge would be a write with nothing to write.
+      expect(code, `${repoPath} must not refresh the net-worth snapshot`).not.toMatch(
+        /net_worth_snapshot|refreshCurrentSnapshot/
+      );
+    }
+  });
+
+  it("keeps bill create/edit/archive off the best-effort scheduler helper", () => {
+    // The correctness-critical half of CP7's atomicity story, as a source fact.
+    //
+    // `lib/data/mutations/bill-schedule.ts` is best-effort: it runs *after* a
+    // committed write and swallows its own failure. That is correct for a
+    // rolling-horizon top-up after an occurrence status change, and it would be
+    // wrong for create, a terms edit, or unarchive — those must generate or
+    // rebuild in the SAME transaction as the parent write, so a scheduler
+    // failure rolls the parent back. They do, because
+    // `public.create_bill`/`replace_bill`/`set_bill_archived` call
+    // `public.maintain_bill_schedule` from inside their own function bodies.
+    //
+    // So `lib/data/mutations/bills.ts` must never import the helper at all. If
+    // it ever does, someone has moved a required rebuild to a path that can
+    // silently not happen. 180-bill-writes.sql proves the database half by
+    // forcing a generation failure and asserting no bill row survives.
+    const billsModule = filesWithCode.find(
+      ({ repoPath }) => repoPath === "lib/data/mutations/bills.ts"
+    );
+    expect(billsModule).toBeDefined();
+    expect(billsModule!.code).not.toMatch(/bill-schedule/);
+    expect(billsModule!.code).not.toMatch(/maintainBillSchedule/);
+
+    // And the helper is reachable from exactly one module: the occurrence
+    // state-machine one, where a missed top-up is recoverable.
+    const importers = filesWithCode
+      .filter(({ code }) => /@\/lib\/data\/mutations\/bill-schedule/.test(code))
+      .map(({ repoPath }) => repoPath)
+      .sort();
+
+    expect(importers).toEqual(["lib/data/mutations/bill-occurrences.ts"]);
+  });
+
+  it("never names a private recurrence function anywhere in application code", () => {
+    // `authenticated` has no USAGE on the `private` schema at all
+    // (090-privileges.sql), so naming one of these would be a call that could
+    // only ever fail — and, more to the point, an attempt to generate
+    // occurrences for an owner and a horizon of the caller's choosing. The
+    // public bridge takes neither: an owned bill id and a boolean, and nothing
+    // else.
+    const offenders = filesWithCode
+      .filter(({ code }) =>
+        /generate_bill_occurrences|next_bill_occurrence_date|private\./.test(code)
+      )
+      .map(({ repoPath }) => repoPath);
+
+    expect(offenders).toEqual([]);
   });
 
   it("keeps goal_contributions strictly append-only in source", () => {
@@ -530,36 +636,47 @@ describe("CP6 write surface is exactly accounts + categories + transactions + mo
       .sort();
 
     expect(callers).toEqual([
+      "lib/data/mutations/bill-schedule.ts",
+      "lib/data/mutations/bills.ts",
       "lib/data/mutations/movements.ts",
       "lib/data/mutations/reconciliation.ts",
       "lib/data/mutations/snapshots.ts",
     ]);
   });
 
-  it("names exactly the four RPCs authenticated may execute", () => {
+  it("names exactly the eight RPCs authenticated may execute", () => {
     // Enumerated rather than bounded, for the same reason the relation list
     // below is: a function is a privilege surface, and `authenticated` holds
-    // EXECUTE on exactly these four. 090-privileges.sql asserts the database
+    // EXECUTE on exactly these eight. 090-privileges.sql asserts the database
     // half of the same claim, as a sorted list of every function in `public`
     // that role can execute.
     //
-    // Two shapes are scanned because snapshots.ts names its RPC through a
-    // module constant (`.rpc(REFRESH_RPC)`), deliberately: that module exists
-    // to have exactly one name in it, and a literal at the call site would put
-    // the same string in two places.
+    // Two shapes are scanned because the two *bridge* modules name their RPC
+    // through a module constant (`.rpc(REFRESH_RPC)`, `.rpc(MAINTAIN_RPC)`),
+    // deliberately: each exists to have exactly one name in it, and a literal
+    // at the call site would put the same string in two places.
+    const BRIDGE_MODULES = new Set([
+      "lib/data/mutations/snapshots.ts",
+      "lib/data/mutations/bill-schedule.ts",
+    ]);
+
     const invoked = new Set<string>();
 
     for (const { repoPath, code } of filesWithCode) {
       for (const match of code.matchAll(/\.rpc\(\s*["'`]([a-z_]+)["'`]/g)) invoked.add(match[1]);
-      if (repoPath !== "lib/data/mutations/snapshots.ts") continue;
+      if (!BRIDGE_MODULES.has(repoPath)) continue;
       for (const match of code.matchAll(/^const [A-Z_]+ = "([a-z_]+)";$/gm)) invoked.add(match[1]);
     }
 
     expect([...invoked].sort()).toEqual([
+      "create_bill",
       "create_movement",
+      "maintain_bill_schedule",
       "reconcile_account",
       "refresh_current_net_worth_snapshot",
+      "replace_bill",
       "replace_movement",
+      "set_bill_archived",
     ]);
   });
 

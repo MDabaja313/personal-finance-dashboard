@@ -132,6 +132,49 @@ export interface Bill {
   accountId?: string;
 }
 
+/**
+ * `public.bill_occurrence_status`. The label set lives in `lib/types/enums.ts`
+ * (`BILL_OCCURRENCE_STATUSES`); the union lives here, beside every other DTO
+ * union, so `lib/validation/**` and `lib/data/**` can both reach it without
+ * either importing the other.
+ */
+export type BillOccurrenceStatus = "scheduled" | "paid" | "skipped";
+
+/**
+ * One concrete due instance of a recurring bill — Phase 7 CP7's addition to
+ * the domain. Deferred until now on purpose: nothing rendered an occurrence
+ * before there was a way to mark one paid.
+ *
+ * `amountCents` is **not** a live reference to the parent bill's current
+ * amount. It was copied from `bills.amount_cents` at generation time and from
+ * then on stands alone as what this instance was actually due for
+ * (docs/database-schema.md §13). Editing a bill's amount later can never
+ * change it, which is exactly what makes a paid occurrence a record of what
+ * happened rather than a projection of what the bill costs today.
+ *
+ * `transactionId` is legitimately absent on a paid occurrence: a bill can be
+ * marked paid from a payment that was never recorded as a transaction. When it
+ * is present it names one of the owner's own transactions, and **nothing about
+ * that transaction is altered by the link** — marking a bill paid is bookkeeping
+ * about an obligation, not a ledger event. Neither a balance, a category, nor
+ * an amount moves.
+ *
+ * `paidOn` is present if and only if `status` is `paid`
+ * (`bill_occurrences_status_consistency_ck`).
+ */
+export interface BillOccurrence {
+  id: string;
+  billId: string;
+  dueDate: CalendarDate;
+  status: BillOccurrenceStatus;
+  /** Fixed at generation time — never the parent bill's current amount. */
+  amountCents: Cents;
+  /** Present only when the payment was linked to an existing transaction. */
+  transactionId?: string;
+  /** Present if and only if `status` is `paid`. */
+  paidOn?: CalendarDate;
+}
+
 export interface Goal {
   id: string;
   name: string;

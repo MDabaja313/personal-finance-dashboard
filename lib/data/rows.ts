@@ -140,6 +140,45 @@ export interface BillOccurrenceRow {
 }
 
 /**
+ * `public.bills`, widened with the columns the Phase 7 CP7 management read
+ * needs and the Phase 6 projection deliberately never did.
+ *
+ * `anchor_date` and `is_archived` were always queried but never selected —
+ * they drove `getBills()`'s filter rather than its result. The management
+ * surface has to *edit* the recurrence terms and *unarchive* a bill, so both
+ * become part of the row rather than staying query-only. `getBills()` keeps
+ * the narrower `BillRow` above, unchanged.
+ */
+export interface BillManagementRow extends BillRow {
+  /** DATE, 'YYYY-MM-DD'. The recurrence anchor — never a stored due date. */
+  anchor_date: string;
+  is_archived: boolean;
+}
+
+/**
+ * `public.bill_occurrences`, the full projection behind the `BillOccurrence`
+ * DTO (Phase 7 CP7). Wider than `BillOccurrenceRow` above, which exists only
+ * to resolve a bill's next scheduled due date.
+ *
+ * `created_at` is an ordering key only, like `TransactionRow`'s and
+ * `GoalContributionRow`'s — PostgREST can order by a column that is not
+ * selected, and it must never appear on the DTO.
+ */
+export interface BillOccurrenceDetailRow {
+  id: string;
+  bill_id: string;
+  /** DATE, 'YYYY-MM-DD'. */
+  due_date: string;
+  /** `public.bill_occurrence_status`. */
+  status: string;
+  amount_cents: BigIntColumn;
+  /** Null on a scheduled or skipped row, and legally null on a paid one. */
+  transaction_id: string | null;
+  /** DATE or null — non-null if and only if `status` is 'paid'. */
+  paid_on: string | null;
+}
+
+/**
  * `public.goal_balances` — the `security_invoker` view. `saved_cents` is
  * derived from `goal_contributions` and exists only here. `archived_at` is on
  * the view and drives the `IS NULL` filter, but is not on the `Goal` DTO.
