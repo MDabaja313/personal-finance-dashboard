@@ -3,18 +3,18 @@
 A private, single-user personal finance dashboard — accounts, transactions, budgets, bills,
 goals, and analytics.
 
-**Status:** Fully writable, Supabase-backed, not yet deployed (Phase 7 CP1–CP8A complete). Every
-finance domain — accounts, categories, transactions, transfers/credit-card payments,
-reconciliation, budgets, goals, and recurring bills — is writable by its owner through real Server
-Actions, real per-mutation RLS policies, and real database triggers, with `profiles` and
-`net_worth_snapshots` deliberately staying read-only. Two `pg_cron` jobs maintain the bill-schedule
-horizon and the current month's net-worth snapshot unattended, daily, entirely inside the
-database. `getToday()` derives "today" from the signed-in owner's own timezone
-(`profiles.timezone`), so data ages naturally against the real date rather than a frozen mock
-clock. **Not yet deployed** — the application has not been pushed to a hosted Supabase project or
-to Vercel; see [docs/operations.md](docs/operations.md) for what running it day to day looks like
-once it is, and its final section for exactly what's left before that happens. See
-[DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md) for the full roadmap.
+**Status:** Live in production (Phase 7 CP1–CP8B complete). Every finance domain — accounts,
+categories, transactions, transfers/credit-card payments, reconciliation, budgets, goals, and
+recurring bills — is writable by its owner through real Server Actions, real per-mutation RLS
+policies, and real database triggers, with `profiles` and `net_worth_snapshots` deliberately
+staying read-only. Two `pg_cron` jobs maintain the bill-schedule horizon and the current month's
+net-worth snapshot unattended, daily, entirely inside the database. `getToday()` derives "today"
+from the signed-in owner's own timezone (`profiles.timezone`), so data ages naturally against the
+real date rather than a frozen mock clock. Password recovery
+(`/forgot-password` → `/reset-password`) works against Supabase's default hosted email template,
+with no custom SMTP required. See [docs/operations.md](docs/operations.md) for day-to-day use,
+migrations, and how to redeploy, and [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md) for the full
+roadmap.
 
 ## Stack
 
@@ -165,7 +165,9 @@ and exits non-zero on any mismatch — see `scripts/verify-auth.ts` for exactly 
 
 ## Deployment and operations
 
-Not yet deployed. Once it is: Vercel hosts the Next.js app, Supabase hosts the database and auth,
-and two `pg_cron` jobs maintain bill schedules and net-worth snapshots unattended. See
-[docs/operations.md](docs/operations.md) for day-to-day use, environment variables, migrations,
-backup/restore, and exactly what's left before the first deploy.
+Deployed: Vercel hosts the Next.js app, Supabase hosts the database and auth, and two `pg_cron`
+jobs maintain bill schedules and net-worth snapshots unattended. Deploys are a deliberate CLI
+action (`vercel deploy --prod`) from a reviewed local checkout, not a side effect of `git push` —
+see [docs/operations.md §10](docs/operations.md#10-cp8b--deployment-status-and-redeploying) for
+why and how to redeploy. See [docs/operations.md](docs/operations.md) for day-to-day use,
+environment variables, migrations, and backup/restore.

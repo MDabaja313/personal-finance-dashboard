@@ -2,10 +2,10 @@
 
 A practical runbook for running this application day to day, written for its one owner — not a
 generic SaaS on-call guide. It assumes you've read [README.md](../README.md) for orientation and
-[DEVELOPMENT_PLAN.md](../DEVELOPMENT_PLAN.md) for what's actually shipped. This is CP8A's
-deliverable: the application is fully writable (Phase 7 CP1–CP8A) but **not yet deployed** —
-hosted verification and the actual Vercel/Supabase go-live are CP8B, tracked at the bottom of this
-document.
+[DEVELOPMENT_PLAN.md](../DEVELOPMENT_PLAN.md) for what's actually shipped. **The application is
+live** (Phase 7 CP1–CP8B complete) — hosted Supabase is fully migrated and security-verified, the
+owner is provisioned, and the app is deployed to Vercel production. §10 records what CP8B actually
+did and, going forward, how to redeploy.
 
 ## Contents
 
@@ -18,7 +18,7 @@ document.
 7. [Recovery](#7-recovery)
 8. [Known limitations](#8-known-limitations)
 9. [Unattended maintenance](#9-unattended-maintenance)
-10. [CP8B — what remains before going live](#10-cp8b--what-remains-before-going-live)
+10. [CP8B — deployment status and redeploying](#10-cp8b--deployment-status-and-redeploying)
 
 ---
 
@@ -198,20 +198,46 @@ that creates it must actually be applied. If a job exists but its recent runs sh
 `status`, `return_message` carries a summary (counts, not figures — see the migration file's own
 comments) and is safe to read without exposing account data.
 
-## 10. CP8B — what remains before going live
+## 10. CP8B — deployment status and redeploying
 
-CP8A is preparation and verification only. **Nothing has been deployed and no hosted migration has
-been applied.** What's actually left, in order:
+**Complete.** All 9 Phase 7 migrations (CP2 through CP8A) are applied to the hosted Supabase
+project, alongside the 8 Phase 4 migrations already there — `npx supabase migration list` shows
+local and hosted history in agreement. Hosted security posture was verified directly, read-only,
+not assumed: RLS `ENABLE`+`FORCE` on all 11 tables, the `authenticated` grant matrix matching the
+documented spec column by column, `anon` holding zero financial grants, `profiles`/
+`net_worth_snapshots` still `SELECT`-only, the `private` schema unreachable by any application
+role, every `SECURITY DEFINER` bridge present with the correct owner, and both `pg_cron` jobs
+`active` and running as `postgres`. The hosted owner was already fully provisioned before CP8B
+began — §4's script did not need to run again. A full authenticated smoke test passed against the
+live deployment: all 8 routes, sign-in/sign-out, session survival across navigation, security
+headers, and cache posture, matching what was proven locally in CP8A.
 
-1. **Authenticate the Supabase CLI and Vercel CLI/dashboard**, in your own terminal/browser —
-   never by pasting a token into an assistant session.
-2. **Apply the pending hosted migrations** (§5) — as of this checkpoint, every Phase 7 migration
-   (CP2 through CP8A) is pending on the linked hosted project; only the eight Phase 4 migrations
-   are applied there today (verified via `npx supabase migration list`, read-only).
-3. **Provision the hosted owner** (§4), if not already done.
-4. **Deploy to Vercel**, set the two environment variables (§3), and confirm the build succeeds
-   against the real hosted project rather than the CI workflow's placeholder values.
-5. **Run through the CP8A smoke-test checklist** (every route, sign-in/sign-out, security headers,
-   protected-page cache posture) against the live deployment, the same way it was proven locally
-   against `npm run build && npm run start` during CP8A.
-6. **Confirm both `pg_cron` jobs exist and have run at least once** (§9) after the first day live.
+**How the app is actually deployed — read this before your next redeploy.** The Vercel project
+(`orvane1/personal-finance-dashboard`) is deliberately **not** connected to GitHub — `vercel link`
+auto-connects a new project's Git integration by default, and its Production Branch defaults to
+the repository's default branch, which will not always be the branch carrying the latest reviewed
+work (it wasn't at the time of this deploy: `main` trailed `feature/write-mutations` by several
+checkpoints, and an auto-deploy from it would have silently served stale code). `vercel git
+disconnect` was run for exactly this reason. **Deploying is therefore a deliberate CLI action, not
+a side effect of `git push`:**
+
+```bash
+vercel deploy --prod --scope <your-team-slug>
+```
+
+run from a clean, reviewed local checkout of the branch you actually want live — the CLI uploads
+the working directory's contents directly, independent of any git remote state. If you later want
+push-to-deploy back (e.g., once `main` is the branch you always want live), `vercel git connect`
+re-enables it — but set the Production Branch explicitly in the Vercel dashboard first, don't rely
+on the default.
+
+**Password recovery** (`/forgot-password`, `/auth/callback`, `/reset-password` —
+[docs/auth-design.md §14](auth-design.md#14-password-recovery-cp8b)) was added during CP8B, after
+hosted manual testing found no recovery path existed and a first attempt surfaced that the hosted
+Auth **Site URL** was still unset/defaulted, sending recovery links to `localhost`. Both are fixed:
+the hosted Site URL is `https://personal-finance-dashboard-beta-one.vercel.app` (Supabase Dashboard
+→ Authentication → URL Configuration), and the application derives its own `redirectTo` from each
+request's `Origin` header rather than trusting a fixed host either way.
+
+**Confirming the cron jobs keep running**, ongoing (§9's queries) — worth a periodic glance, not a
+one-time CP8B check.

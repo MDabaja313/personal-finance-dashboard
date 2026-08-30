@@ -418,13 +418,16 @@ only; no production code imports it.
 cumulative "Load more" reveal window described above resolves this — no route makes an unbounded
 `getTransactions()` call.
 
-## Phase 7 — Mutations 🚧 in progress
+## Phase 7 — Mutations ✅ complete
 
-Checkpoints 1 through 8A are complete. **CP5 was the REAL-FINANCE GATE, and it passes** — see its
-section below. **CP7 completed the finance domains: every table except `profiles` and
+All checkpoints, 1 through 8B, are complete. **CP5 was the REAL-FINANCE GATE, and it passes** — see
+its section below. **CP7 completed the finance domains: every table except `profiles` and
 `net_worth_snapshots` is now writable by its owner.** **CP8A hardened the application for hosted
 use — unattended daily maintenance, visible snapshot staleness, security headers, and a clean
-audit trail — without changing any finance semantics. CP8B (actual deployment) has not started.**
+audit trail — without changing any finance semantics. CP8B deployed the application: hosted
+Supabase migrations applied and security-verified, the hosted owner confirmed provisioned, Vercel
+production live, a full authenticated smoke test passed, and a password-recovery flow added (a gap
+CP1–CP8A never covered) — see its section below.**
 
 ### CP1 — Write foundation ✅ (no migration, no write grant, no mutating code)
 
@@ -936,13 +939,60 @@ CP8A is preparation for hosted use, not a new finance domain.
   this checkpoint's CP8A migration) are pending. Applying them, provisioning the hosted owner, and
   the actual Vercel deploy are **CP8B**, not this checkpoint.
 
-### Remaining — CP8B, not started
+### CP8B — Hosted deployment ✅
 
-**Deployment has not happened.** No hosted migration has been applied beyond the pre-existing
-Phase 4 set, no Vercel project has been created or configured, and the hosted Supabase project has
-not been provisioned with the real owner. `docs/operations.md §10` lists the exact remaining
-steps, in order, including where CLI authentication (Supabase and Vercel) must happen in the
-owner's own terminal/browser rather than through this tooling.
+**The application is live.** All 9 Phase 7 migrations (CP2 through CP8A) are applied to the hosted
+Supabase project, alongside the 8 Phase 4 migrations already there — `npx supabase migration list`
+confirms local and hosted history agree exactly. No `seed.sql` was applied hosted (`db push` never
+runs it — verified via a clean dry-run first). Hosted security posture verified directly, read-only
+(not assumed from local behavior): RLS `ENABLE`+`FORCE` on all 11 tables; the `authenticated` grant
+matrix matches the documented column-scoped spec exactly, table by table; `anon` holds zero grants
+on any financial table; `profiles` and `net_worth_snapshots` remain `SELECT`-only for
+`authenticated`; the `private` schema has zero `USAGE` for `authenticated`/`anon`; every
+`SECURITY DEFINER` bridge (CP5's snapshot refresh, CP7's bill-schedule maintenance, CP8A's two
+`private` maintenance functions) is present with the correct owner/security posture; both `pg_cron`
+jobs exist, are `active`, and run as `postgres` — no application role can `EXECUTE` either private
+maintenance function.
+
+The hosted owner was **already fully provisioned** before CP8B began (1 Auth user, 1 matching
+`profiles` row with a valid timezone, all 12 default categories) — `supabase/provisioning/owner.sql`
+did not need to run again.
+
+**Vercel**: a new project (`orvane1/personal-finance-dashboard`) was linked and deployed via the
+CLI directly from the reviewed local checkout, deliberately **not** through Vercel's GitHub
+integration — the repository's default branch (`main`) trails this work by several checkpoints, and
+auto-deploying from it would have silently served stale code. Exactly two environment variables are
+configured, Production only: `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` —
+the hosted project's values, nothing else (`docs/operations.md §3`'s list is unchanged and matched
+exactly).
+
+**Full production smoke test passed**, unauthenticated and authenticated: all 8 routes redirect
+signed-out and load signed-in (`/dashboard`, `/accounts`, `/transactions`, `/budgets`, `/bills`,
+`/goals`, `/analytics`, `/settings`); session survives navigation and refresh; sign-out re-protects
+every route; security headers (`X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`,
+`Permissions-Policy`, HSTS) are present on live responses; protected routes and `/login` are
+`private, no-cache, no-store`; only `/` is publicly cached, matching the CP8A design; no source map
+is exposed; no page leaks database detail.
+
+**CP8B also closed a real gap CP1–CP8A never covered: password recovery.** No "forgot password"
+path existed anywhere in the codebase before this checkpoint — discovered only during hosted manual
+smoke testing, when a recovery email was found to link back to `localhost`. Added
+`/forgot-password`, `/auth/callback`, and `/reset-password`
+(`lib/auth/actions.ts`'s `requestPasswordReset`/`updatePassword`, `lib/auth/recovery.ts`), using
+`resetPasswordForEmail` against Supabase's **default, unmodified** recovery email template — the
+hosted project is on the Free tier, which does not allow editing Auth email templates without
+custom SMTP, so a template-editing solution was never an option. This works because `@supabase/ssr`
+v0.12.4 hardcodes `flowType: "pkce"` on both its clients (verified directly against the installed
+package source, not assumed): the default template's link already resolves to `redirectTo` with a
+plain `?code=` query parameter, which `app/auth/callback/route.ts` exchanges server-side
+(`exchangeCodeForSession`) before `/reset-password` ever renders — no URL fragment, no client-side
+session parsing, and `/reset-password` gates with the same `requireUser()` every other protected
+page uses. `redirectTo` is derived from the request's own `Origin` header, never hardcoded, so the
+identical code path is correct in local development and production. Manually verified end to end
+against the live hosted project: request → email → same-browser click → session established →
+password updated → redirected to `/login` → signs in with the new password. See
+[docs/auth-design.md §14](docs/auth-design.md#14-password-recovery-cp8b) for the full design
+narrative.
 
 The outstanding **finance** item carried forward from CP5 is unchanged by CP8A and remains a
 schema-meaning decision, not a bug: the two reachable **snapshot sign-guard states** in which
