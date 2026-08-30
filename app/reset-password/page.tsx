@@ -10,8 +10,10 @@ export const metadata: Metadata = {
 };
 
 /**
- * Reached from the recovery email link (`app/auth/confirm` → here) or an
- * ordinary active login. Deliberately not under `app/(app)/**` — this is a
+ * Reached from the recovery email link (`app/auth/callback` → here, once
+ * the PKCE code exchange has established a real session server-side — see
+ * `lib/auth/recovery.ts`) or an ordinary active login. Deliberately not
+ * under `app/(app)/**` — this is a
  * one-off page, not part of the authenticated app shell, so it renders its
  * own minimal centered layout rather than the sidebar/header — but it still
  * re-verifies its own identity requirement directly, the same way every

@@ -100,7 +100,7 @@ export async function requestPasswordReset(
 
   const supabase = await createClient();
   await supabase.auth.resetPasswordForEmail(email, {
-    redirectTo: `${origin}/auth/confirm`,
+    redirectTo: `${origin}/auth/callback`,
   });
   // The call's own result/error is intentionally never inspected — GoTrue
   // does not reliably distinguish "no such user" here, and branching on it
@@ -111,8 +111,9 @@ export async function requestPasswordReset(
 
 /**
  * Sets a new password for the currently authenticated session — reached
- * either via the recovery link (`app/auth/confirm` → `/reset-password`) or
- * an ordinary active login, both equally valid per Supabase's model.
+ * either via the recovery link (`app/auth/callback` → `/reset-password`,
+ * see lib/auth/recovery.ts) or an ordinary active login, both equally valid
+ * per Supabase's model.
  * `requireUser()` re-verifies first because a Server Action is an
  * independently reachable endpoint (docs/auth-design.md §10) — it must not
  * assume the caller ever rendered `/reset-password`. Signs the session out

@@ -160,7 +160,7 @@ describe("requestPasswordReset", () => {
     );
 
     expect(resetPasswordForEmail).toHaveBeenCalledWith("owner@example.com", {
-      redirectTo: "https://personal-finance-dashboard-beta-one.vercel.app/auth/confirm",
+      redirectTo: "https://personal-finance-dashboard-beta-one.vercel.app/auth/callback",
     });
     expect(result).toEqual({ status: "success", message: RESET_REQUESTED });
   });
@@ -172,7 +172,7 @@ describe("requestPasswordReset", () => {
     await requestPasswordReset({ status: "idle", message: null }, formDataFor({ email: "owner@example.com" }));
 
     expect(resetPasswordForEmail).toHaveBeenCalledWith("owner@example.com", {
-      redirectTo: "http://localhost:3000/auth/confirm",
+      redirectTo: "http://localhost:3000/auth/callback",
     });
   });
 
