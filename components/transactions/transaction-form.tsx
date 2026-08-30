@@ -24,6 +24,7 @@ import {
   categoryKindFor,
   type OrdinaryTransactionKind,
 } from "@/lib/types/enums";
+import { optionItems, selectItems } from "@/lib/ui/select-items";
 
 /**
  * The transaction create/edit form.
@@ -59,6 +60,14 @@ import {
  * Archived accounts and categories never appear: the page passes active ones
  * only. An archived option would be a control that always fails, and
  * "unarchive it first" is the rule the database states too.
+ *
+ * ## Every Select carries an `items` map
+ *
+ * Base UI's `<Select.Value>` resolves its text from the Root's `items` prop and
+ * falls back to `String(value)` without one — which is a raw UUID for the
+ * account and category pickers. The maps come from `lib/ui/select-items.ts`;
+ * the `value` on each `<Select.Item>` and in the submitted `FormData` is
+ * unchanged and is still the row id.
  */
 
 const KIND_LABELS: Record<OrdinaryTransactionKind, string> = {
@@ -165,6 +174,17 @@ export function TransactionForm({
     [categories, kind]
   );
 
+  const accountLabels = useMemo(() => optionItems(accounts), [accounts]);
+  const categoryLabels = useMemo(
+    () => optionItems(availableCategories, { value: UNCATEGORIZED, label: "Uncategorized" }),
+    [availableCategories]
+  );
+  const kindLabels = useMemo(
+    () =>
+      selectItems(ORDINARY_TRANSACTION_KINDS.map((option) => ({ value: option, label: KIND_LABELS[option] }))),
+    []
+  );
+
   /**
    * Changing the kind can strand a category the new kind cannot serve — an
    * expense category on an income row. Clearing it here, in the event handler
@@ -215,6 +235,7 @@ export function TransactionForm({
         ) : (
           <Select
             name="accountId"
+            items={accountLabels}
             value={accountId}
             onValueChange={(value) => setAccountId(String(value))}
             disabled={pending}
@@ -236,6 +257,7 @@ export function TransactionForm({
       <Field id={kindId} label="Type" errors={errorsFor("kind")}>
         <Select
           name="kind"
+          items={kindLabels}
           value={kind}
           onValueChange={(value) => changeKind(value as OrdinaryTransactionKind)}
           disabled={pending}
@@ -317,6 +339,7 @@ export function TransactionForm({
         errors={errorsFor("categoryId")}
       >
         <Select
+          items={categoryLabels}
           value={categoryId}
           onValueChange={(value) => setCategoryId(String(value))}
           disabled={pending}
