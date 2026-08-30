@@ -14,7 +14,7 @@
 -- a missing policy on a granted table would silently return zero rows,
 -- which a bare success check could not distinguish from an empty table.
 begin;
-select plan(57);
+select plan(58);
 
 insert into auth.users (id, aud, role, email) values
   ('17000000-0000-4000-8000-000000000001', 'authenticated', 'authenticated', 'priv-test@local.test');
@@ -355,7 +355,7 @@ select is(
   (select count(*)::int from (values
     ('profiles'), ('accounts'), ('categories'), ('movements'), ('transactions'),
     ('budgets'), ('bills'), ('bill_occurrences'), ('goals'), ('goal_contributions'),
-    ('net_worth_snapshots'), ('account_balances'), ('goal_balances')
+    ('net_worth_snapshots'), ('monthly_plans'), ('account_balances'), ('goal_balances')
   ) as t(name)
   where has_table_privilege('anon', 'public.' || t.name, 'select')
      or has_table_privilege('anon', 'public.' || t.name, 'insert')
@@ -491,12 +491,17 @@ select throws_ok(
   '42501', null, 'writer DELETE on net_worth_snapshots is denied -- no DELETE grant'
 );
 
--- No access at all to the remaining five tables.
+-- No access at all to the remaining six tables.
 select throws_ok($$ select count(*) from public.categories $$, '42501', null, 'writer has no SELECT grant on categories');
 select throws_ok($$ select count(*) from public.movements $$, '42501', null, 'writer has no SELECT grant on movements');
 select throws_ok($$ select count(*) from public.budgets $$, '42501', null, 'writer has no SELECT grant on budgets');
 select throws_ok($$ select count(*) from public.goals $$, '42501', null, 'writer has no SELECT grant on goals');
 select throws_ok($$ select count(*) from public.goal_contributions $$, '42501', null, 'writer has no SELECT grant on goal_contributions');
+-- Phase 8 CP2. The snapshot writer sums accounts and transactions; an
+-- expected figure is not a balance and must never reach net worth. The
+-- absence of a grant is what makes that structural rather than a rule the
+-- writer's body happens to follow.
+select throws_ok($$ select count(*) from public.monthly_plans $$, '42501', null, 'writer has no SELECT grant on monthly_plans -- a target is not a balance');
 
 -- ============================================================
 -- profiles: the one privilege Phase 7 CP5 added to the writer

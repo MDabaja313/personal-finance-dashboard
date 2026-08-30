@@ -18,3 +18,17 @@ export interface BudgetCategoryOption {
   readonly id: string;
   readonly name: string;
 }
+
+/**
+ * The monthly-plan Server Actions, bundled so `/budgets` can hand them to the
+ * summary card as one prop.
+ *
+ * Two, not three: setting and changing expected income are the same operation
+ * (the mutation layer upserts by `(user_id, period)`), and clearing is the only
+ * other thing a person can do to a plan. Neither takes a month — both derive it
+ * from the owner's own calendar day on the server.
+ */
+export interface MonthlyPlanActions {
+  readonly set: FormAction;
+  readonly clear: FormAction;
+}

@@ -19,6 +19,7 @@ clarify intent; nothing here is meant to be run as-is. See
 10. [`security_invoker` views](#10-security_invoker-views)
 11. [EXECUTE privilege rules for functions](#11-execute-privilege-rules-for-functions)
 12. [No `service_role` in application code](#12-no-service_role-in-application-code)
+13. [What Phase 8 added](#13-what-phase-8-added)
 
 ---
 
@@ -829,3 +830,95 @@ operations, not for anything the Next.js application itself runs. **`service_rol
 in application code, in any phase of this roadmap.** Application authorization always runs as
 the authenticated user's own session, subject to the grants and policies documented here. See
 [auth-design.md](auth-design.md) for how that session is established and verified.
+
+---
+
+## 13. What Phase 8 added
+
+Two migrations, one new table, one widened column grant, and two new `SECURITY INVOKER` functions.
+**No `SECURITY DEFINER` function was added, no existing policy was rewritten, and neither
+`finance_snapshot_writer` nor `anon` gained a single privilege.**
+
+### 13.1 `monthly_plans` â€” the budgets shape, transplanted
+
+`20260902120002_monthly_plans.sql`. RLS `ENABLE` + `FORCE`, four operation-specific policies each
+targeted at `authenticated` and predicated on `(select auth.uid()) = user_id`, and column-scoped
+grants:
+
+| Operation | Columns | Why |
+| --- | --- | --- |
+| `SELECT` | table | The one read path, `getMonthlyPlan(period)` |
+| `INSERT` | `id, user_id, period, expected_income_cents` | `id` for the client-minted idempotency key; `user_id` so the row is insertable at all |
+| `UPDATE` | `expected_income_cents` | The only thing about an existing plan a person can change |
+| `DELETE` | table | Planning metadata, no history to lose â€” and "not set" is a state a zero cannot express |
+
+`period` is **INSERT-only**, exactly as `budgets.period` is and for the identical reason: it
+decides which month the row *is*, and getting the month wrong means writing that month's own row
+rather than relabelling this one. `100-write-grants.sql` asserts the column matrix and
+`210-monthly-plans.sql` asserts the behaviour, including that owner A's update and delete against
+owner B's plan match zero rows and leave it untouched.
+
+`anon` is named in no grant and no policy. `finance_snapshot_writer` holds **nothing** on this
+table, which is what makes "an expected figure cannot reach net worth" structural rather than a
+rule the snapshot writer happens to follow â€” `090-privileges.sql` proves the writer's `SELECT` is
+refused with 42501.
+
+No trigger. There is nothing cross-row to assert: the table references no category, account or
+transaction, its format and sign rules are plain `CHECK`s, and its month is chosen by the server
+from the owner's own `profiles.timezone` rather than accepted from a client.
+
+### 13.2 `bill_occurrences.transaction_origin` â€” one column, and why it can be granted
+
+`20260902120001_bill_payment_ledger.sql` widens CP7's three-column UPDATE grant to four:
+
+```sql
+grant update (transaction_origin) on table public.bill_occurrences to authenticated;
+```
+
+`amount_cents` and `due_date` are still absent, which is the part of CP7 that has not moved and
+must not: they are what *this* instance was due for and when, fixed at generation time. There is
+still no `INSERT` and no `DELETE` on this table for `authenticated`, ever.
+
+The new column *has* to be grantable, because `public.settle_bill_occurrence` is `SECURITY
+INVOKER` and therefore writes as the caller. What prevents a hand-crafted request from claiming
+`'generated'` over a hand-written transaction â€” and then having it deleted by unmarking â€” is
+**not** the grant but `guard_bill_occurrence_transition()`:
+
+```sql
+-- accepted only when the referenced transaction was created by THIS transaction
+if v_created_at is not null and v_created_at <> now() then raise ... end if;
+```
+
+`now()` is `transaction_timestamp()` and `transactions.created_at` takes the identical default, so
+the equality holds only for a row inserted by the very transaction performing the update. It is
+unforgeable because `authenticated` holds no grant on `transactions.created_at` on `INSERT` *or*
+`UPDATE` â€” there is no statement available to that role that could manufacture a qualifying row.
+`200-bill-payment-ledger.sql` proves both halves: the forged label is refused with 23514, and the
+same statement with `'linked'` succeeds.
+
+This is the pattern Â§5 describes ("what RLS cannot enforce") used in its strongest form so far: a
+privilege that must be held is made safe by a row-level invariant the privilege holder cannot
+satisfy dishonestly.
+
+### 13.3 `settle_bill_occurrence` / `unsettle_bill_occurrence`
+
+Both `SECURITY INVOKER`, `search_path = ''`, owner from `auth.uid()`, `EXECUTE` revoked from
+`PUBLIC`/`anon` and granted to `authenticated` alone. They bring the count of functions
+`authenticated` may execute anywhere in `public` from eight to ten, and `090-privileges.sql`
+asserts that sorted list exactly.
+
+They are `INVOKER` for the CP4/CP7 reason, and it matters more here than anywhere else because
+they write the **ledger**: the caller already holds `INSERT` and `DELETE` on `transactions` and the
+four-column `UPDATE` on `bill_occurrences`, and under FORCE RLS the invoker sees only its own rows.
+A definer's context would strip RLS off a browser-reachable path that creates and removes
+expenses â€” the one place in this schema where that would be least acceptable.
+
+Their *signatures* carry a security property of their own, asserted in `090-privileges.sql` the way
+`maintain_bill_schedule`'s is: `(uuid, date, uuid, uuid)` and `(uuid)`. No owner, no account, no
+category, no merchant, no amount, no kind. Every fact about the row they may write is read from the
+occurrence and its bill, so a hand-crafted request cannot post an expense of its choosing through
+the bill surface.
+
+The reversal's `DELETE` is likewise not a new privilege: it runs under CP3's existing
+`transactions_delete_own_non_movement` policy, scoped to the caller's own non-movement rows. A
+generated payment is an ordinary row and is reachable; nothing else is.

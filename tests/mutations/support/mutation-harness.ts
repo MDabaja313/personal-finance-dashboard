@@ -130,6 +130,17 @@ export const LEDGER_BILL_ROUTES = [
 ];
 
 /**
+ * The one route a monthly-plan write must invalidate.
+ *
+ * Narrower than every other list here, and deliberately: expected income is
+ * planning context for the Monthly Plan summary and appears nowhere else. It is
+ * not a transaction, it moves no balance, it reaches no chart, and — unlike a
+ * budget, whose utilisation the dashboard renders — nothing outside `/budgets`
+ * reads it at all. `/dashboard` is absent on purpose.
+ */
+export const MONTHLY_PLAN_ROUTES = ["/budgets"];
+
+/**
  * The calendar day `delta` days from `date`, as 'YYYY-MM-DD'.
  *
  * `Date.UTC` rather than local-midnight construction, for the same reason

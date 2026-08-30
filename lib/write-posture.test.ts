@@ -436,6 +436,7 @@ describe("CP7 write surface is exactly accounts + categories + transactions + mo
       "lib/actions/categories.ts",
       "lib/actions/goal-contributions.ts",
       "lib/actions/goals.ts",
+      "lib/actions/monthly-plans.ts",
       "lib/actions/movements.ts",
       "lib/actions/reconciliation.ts",
       "lib/actions/transactions.ts",
@@ -443,7 +444,7 @@ describe("CP7 write surface is exactly accounts + categories + transactions + mo
     ]);
   });
 
-  it("has mutation DAL modules only for the ten write domains plus the two maintenance bridges", () => {
+  it("has mutation DAL modules only for the eleven write domains plus the two maintenance bridges", () => {
     const mutationModules = filesWithCode
       .map(({ repoPath }) => repoPath)
       .filter((repoPath) => repoPath.startsWith("lib/data/mutations/"))
@@ -458,6 +459,7 @@ describe("CP7 write surface is exactly accounts + categories + transactions + mo
       "lib/data/mutations/categories.ts",
       "lib/data/mutations/goal-contributions.ts",
       "lib/data/mutations/goals.ts",
+      "lib/data/mutations/monthly-plans.ts",
       "lib/data/mutations/movements.ts",
       "lib/data/mutations/reconciliation.ts",
       "lib/data/mutations/snapshots.ts",
@@ -613,6 +615,38 @@ describe("CP7 write surface is exactly accounts + categories + transactions + mo
         /transactionOrigin/
       );
     }
+  });
+
+  it("keeps the monthly plan away from every ledger relation", () => {
+    // Expected income is a target, not money. The mutation module names
+    // exactly one relation, and nothing it writes can reach a balance, a
+    // transaction, a budget or a net-worth figure — which is the whole reason
+    // it is a table of its own rather than a `budgets` row.
+    const planModule = filesWithCode.find(
+      ({ repoPath }) => repoPath === "lib/data/mutations/monthly-plans.ts"
+    );
+    expect(planModule).toBeDefined();
+
+    const relations = [...planModule!.code.matchAll(/\.from\(\s*["'`]([a-z_]+)["'`]/g)].map(
+      (match) => match[1]
+    );
+    expect([...new Set(relations)]).toEqual(["monthly_plans"]);
+
+    expect(planModule!.code).not.toMatch(/refreshCurrentSnapshot/);
+    expect(planModule!.code).not.toMatch(/\.rpc\s*\(/);
+
+    // And the pure calculation never invents an actual: it calls the three
+    // authorities in lib/finance/transactions.ts rather than re-deriving them.
+    const planning = filesWithCode.find(({ repoPath }) => repoPath === "lib/finance/planning.ts");
+    expect(planning).toBeDefined();
+    for (const authority of ["monthlyIncome", "monthlySpending", "monthlyCashFlow"]) {
+      expect(planning!.code, `planning.ts must call ${authority}`).toMatch(
+        new RegExp(`\\b${authority}\\(`)
+      );
+    }
+    // No transaction filtering of its own — that is what re-deriving would
+    // look like, and it is how the plan and the dashboard would drift apart.
+    expect(planning!.code).not.toMatch(/countsAsIncome|countsAsSpending|kind === "income"/);
   });
 
   it("keeps bill create/edit/archive off the best-effort scheduler helper", () => {
@@ -852,7 +886,7 @@ describe("CP7 write surface is exactly accounts + categories + transactions + mo
     expect(offenders).toEqual([]);
   });
 
-  it("issues a PostgREST delete from exactly four modules", () => {
+  it("issues a PostgREST delete from exactly five modules", () => {
     // CP3 added the first DELETE in this application; CP4 the second; CP5 the
     // third; CP6 the fourth (budgets). All four are deliberate and none
     // generalizes: accounts, categories, bills and goals are *labels* that
@@ -877,6 +911,7 @@ describe("CP7 write surface is exactly accounts + categories + transactions + mo
 
     expect(deleters).toEqual([
       "lib/data/mutations/budgets.ts",
+      "lib/data/mutations/monthly-plans.ts",
       "lib/data/mutations/movements.ts",
       "lib/data/mutations/reconciliation.ts",
       "lib/data/mutations/transactions.ts",
@@ -921,6 +956,7 @@ describe("CP7 write surface is exactly accounts + categories + transactions + mo
       "categories",
       "goal_contributions",
       "goals",
+      "monthly_plans",
       "movements",
       "transactions",
     ]);

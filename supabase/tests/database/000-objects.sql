@@ -1,7 +1,7 @@
 -- Object inventory: every enum, table, view, index, and function exists
 -- with the correct security context.
 begin;
-select plan(43);
+select plan(46);
 
 -- Enums (7)
 select has_type('public', 'account_type', 'account_type enum exists');
@@ -15,7 +15,7 @@ select has_type('public', 'bill_occurrence_status', 'bill_occurrence_status enum
 -- whether unmarking may delete it.
 select has_type('public', 'bill_payment_origin', 'bill_payment_origin enum exists');
 
--- Tables (11)
+-- Tables (12)
 select has_table('public', 'profiles', 'profiles table exists');
 select has_table('public', 'accounts', 'accounts table exists');
 select has_table('public', 'categories', 'categories table exists');
@@ -27,6 +27,12 @@ select has_table('public', 'bill_occurrences', 'bill_occurrences table exists');
 select has_table('public', 'goals', 'goals table exists');
 select has_table('public', 'goal_contributions', 'goal_contributions table exists');
 select has_table('public', 'net_worth_snapshots', 'net_worth_snapshots table exists');
+-- Phase 8 CP2. Expected income per owner per month -- planning metadata, and
+-- deliberately not a `budgets` row: a budget is a per-category spending limit
+-- that assert_budget_category_active_expense() requires an expense category
+-- for, and budgetStatus() would render an income target as a permanently
+-- unused meter.
+select has_table('public', 'monthly_plans', 'monthly_plans table exists');
 
 -- Views (2)
 select has_view('public', 'account_balances', 'account_balances view exists');
@@ -50,6 +56,8 @@ select has_index('public', 'categories', 'categories_user_id_lower_name_key', 'c
 select has_check('public', 'transactions', 'transactions has a CHECK constraint');
 select has_check('public', 'net_worth_snapshots', 'net_worth_snapshots has a CHECK constraint');
 select col_is_pk('public', 'net_worth_snapshots', array['user_id', 'month'], 'net_worth_snapshots PK is (user_id, month)');
+select has_check('public', 'monthly_plans', 'monthly_plans has a CHECK constraint');
+select col_is_unique('public', 'monthly_plans', array['user_id', 'period'], 'monthly_plans is unique per owner per month');
 
 -- SECURITY INVOKER functions (prosecdef = false) -- five from Phase 4,
 -- two from CP2, one from CP3
