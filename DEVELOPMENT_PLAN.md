@@ -420,9 +420,11 @@ cumulative "Load more" reveal window described above resolves this — no route 
 
 ## Phase 7 — Mutations 🚧 in progress
 
-Checkpoints 1 through 7 are complete. **CP5 was the REAL-FINANCE GATE, and it passes** — see its
+Checkpoints 1 through 8A are complete. **CP5 was the REAL-FINANCE GATE, and it passes** — see its
 section below. **CP7 completed the finance domains: every table except `profiles` and
-`net_worth_snapshots` is now writable by its owner.**
+`net_worth_snapshots` is now writable by its owner.** **CP8A hardened the application for hosted
+use — unattended daily maintenance, visible snapshot staleness, security headers, and a clean
+audit trail — without changing any finance semantics. CP8B (actual deployment) has not started.**
 
 ### CP1 — Write foundation ✅ (no migration, no write grant, no mutating code)
 
@@ -837,13 +839,115 @@ writable.**
   is generation on render, which this checkpoint deliberately refuses — and ordinary use (marking
   each cycle paid) keeps the horizon rolling.
 
-### Remaining — CP8 onward, not started
+### CP8A — Final hardening + production readiness ✅
 
-Every finance domain is now writable. `profiles` and `net_worth_snapshots` remain the two tables
-`authenticated` may not write, and both should stay that way: the first is provisioning, the
-second is a derived artifact written only by the Phase 4 writer behind CP5's zero-parameter
-bridge. The outstanding item carried forward is the **snapshot sign-guard limitation** recorded in
-CP5 — two reachable states in which `private.write_net_worth_snapshot` raises rather than writing,
-leaving the current month's snapshot stale but never wrong. Addressing it is a schema decision
-about what a snapshot *means* (whether `CHECK (assets_cents >= 0 AND liabilities_cents >= 0)` is
-still the right rule), not a bug fix.
+**No finance semantics changed.** Every table's grants, every RLS policy, every trigger, and the
+`net_worth_snapshots` sign-guard `CHECK` constraints from CP5 onward are byte-for-byte unchanged.
+CP8A is preparation for hosted use, not a new finance domain.
+
+- **One additive migration**, `20260901120001_scheduled_maintenance.sql`. Installs `pg_cron`
+  (verified locally: preloaded in `shared_preload_libraries` on this Postgres image, installable
+  via a plain `create extension`) and adds two `private`, `SECURITY DEFINER` functions, both owned
+  by the existing `finance_snapshot_writer` — no new role, no widened grant on any table for
+  `authenticated` or `anon`. `private.refresh_all_current_net_worth_snapshots()` and
+  `private.maintain_all_active_bill_schedules()` run daily, each a single call from a `pg_cron`
+  job. pg_cron records the scheduling session's `current_user` as a job's `username` and executes
+  the job with that role's permissions; running a job as a *different* role requires the
+  scheduling role to be an actual superuser. These two jobs are scheduled by the migration as
+  `postgres` (`NOSUPERUSER` here, verified directly, so the migration never requests that
+  override), so both jobs execute as `postgres` and immediately enter `private` `SECURITY
+  DEFINER` functions owned by `finance_snapshot_writer` — narrowing `postgres`'s
+  `BYPASSRLS`-carrying reach *down* to that role's own already-audited, `NOLOGIN`/`NOBYPASSRLS`,
+  RLS-bound privileges, the mirror image of why CP5's and CP7's bridges use the same mechanism to
+  narrow `authenticated`'s privilege *up*. Neither function widens CP5's narrow, request-scoped
+  `profiles_select_writer` policy (`id = private.request_owner_id()`, matching zero rows with no
+  JWT claim — exactly a cron job's own session): owners are discovered from tables the writer
+  already reads unconditionally (`accounts`, `bills`), then impersonated one at a time via
+  `set_config('request.jwt.claim.sub', <owner id>, true)` before touching `profiles` — the same
+  GUC `private.request_owner_id()` already reads. Both functions isolate each owner/bill in a
+  nested exception block, so one sign-guard failure or one pathological bill never blocks another
+  owner's maintenance in the same run, and a caught failure leaves the prior row exactly as it was
+  — the same "stale, never wrong" guarantee CP5 already established for the request-driven path.
+  Full design in [docs/database-schema.md](docs/database-schema.md), *Phase 7 CP8A*, and
+  [docs/rls-policies.md §9](docs/rls-policies.md)/[docs/auth-design.md §13](docs/auth-design.md).
+  This finally realizes the "intended writer: `pg_cron`" design recorded all the way back in
+  Phase 2/4 — `docs/database-schema.md` and `docs/rls-policies.md §9` both said this explicitly
+  and are updated to say it shipped.
+- **CP7's own documented gap — a bill nobody ever touches again eventually runs out of scheduled
+  occurrences — is closed**, by the daily bill function, without generation ever moving onto a
+  render path: it is a non-destructive top-up, per active bill, reusing
+  `private.generate_bill_occurrences_for_bill` unmodified. Archived bills are skipped; paid and
+  skipped occurrences are never touched; repeated runs are idempotent (`on conflict do nothing`,
+  unchanged).
+- **Snapshot staleness is now visible, not just documented.** `lib/finance/trends.ts`'s
+  `snapshotHealth()` — a pure function, reusing `totalAssets`/`totalLiabilities`/`netWorth`
+  (`lib/finance/accounts.ts`) as the one authority for live totals rather than re-deriving them —
+  compares the current month's stored snapshot against live totals and reports `"stale"` for a
+  mismatch *or* a missing row; a historical month is never compared against today's balances.
+  `/dashboard` and `/analytics` render a small, non-alarming notice on the net-worth trend chart
+  exactly when it is stale, naming no SQLSTATE, no sign-guard mechanics, and no account figures.
+- **Security headers**: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+  `Referrer-Policy: strict-origin-when-cross-origin`, and a `Permissions-Policy` turning off
+  camera/microphone/geolocation/payment, applied to every route
+  (`lib/security/headers.ts` + `next.config.ts`). No `Content-Security-Policy` (this app loads no
+  third-party script/font/style host, so a hand-rolled CSP would be pure maintenance risk with no
+  attack surface behind it) and no `Strict-Transport-Security` (Vercel already sets it for every
+  HTTPS custom-domain deployment — documented rather than duplicated, `docs/operations.md`).
+  Verified against a real `next build && next start`: every protected route responds
+  `Cache-Control: private, no-cache, no-store, max-age=0, must-revalidate`, the public `/` route
+  (an unconditional redirect with no data) is the only statically-cached response, and
+  `npm run auth:verify` plus a full manual pass across all eight routes (`/dashboard`,
+  `/accounts`, `/transactions`, `/budgets`, `/bills`, `/goals`, `/analytics`, `/settings`) passed
+  signed-out and signed-in.
+- **Audits, all clean, nothing changed as a result:** `npm audit --omit=dev` — zero vulnerabilities
+  at any severity, so no dependency was upgraded. Secret/environment audit — `.env.local` is
+  gitignored and untracked, `.env.example` holds placeholder names only, no service-role/database
+  secret exists in tracked files or application source (already a standing regression test,
+  `lib/auth/posture.test.ts`), and `LOCAL_OWNER_EMAIL`/`LOCAL_OWNER_PASSWORD`/`OWNER_TIMEZONE` are
+  read only by local tooling (`scripts/**`, test harness `global-setup.ts` files) — never by
+  `app/**`, `components/**`, or `lib/**`, verified directly rather than assumed.
+- **New tests**: `supabase/tests/database/190-scheduled-maintenance.sql` (27 pgTAP assertions —
+  function ownership/security posture, the two daily jobs' exact names/schedules/commands/
+  username, CP5's profiles policy proven unwidened, an untouched bill gaining occurrences, an
+  archived bill gaining none, paid/skipped history untouched, idempotent repeated maintenance, a
+  month-end-anchored bill's occurrences never drifting, a missing current-month snapshot getting
+  created, an existing one refreshed in place, a sign-guard owner leaving its prior row
+  byte-for-byte unchanged, and one owner's sign-guard failure not blocking another owner's
+  refresh in the same run); `lib/finance/trends.test.ts` (9 new cases for `snapshotHealth`);
+  `lib/security/headers.test.ts` (6 cases). `npm run db:test` — 780/780 pgTAP assertions across
+  all 21 files. `npm test` — passes with the new cases included.
+- **CI**: a new GitHub Actions workflow (`.github/workflows/ci.yml`) runs the fully-offline chain
+  (`lint`, `next typegen`, `typecheck`, `test`, `build`) on every push/PR, using clearly-fake
+  placeholder Supabase URL/key values for the build step (never real credentials, and never a
+  hosted or local Supabase instance) — `test:parity`, `test:mutations`, `db:test`, and
+  `auth:verify` are deliberately excluded, since all four need a running local Supabase instance
+  this workflow does not provision.
+- **Docs**: `docs/operations.md` (new) — normal use, architecture, environment variable names
+  only, hosted owner provisioning, migrations, backup/restore, known limitations, and unattended
+  maintenance, written for this application's one owner. `README.md` rewritten to state the
+  actual current state (fully writable, not yet deployed) and link to the operations doc, replacing
+  the stale "Phase 6 complete... there is still no persistence path" line. `docs/database-schema.md`,
+  `docs/rls-policies.md §9`, and `docs/auth-design.md §13` each gained a short "resolved in CP8A"
+  note closing out the "intended writer: pg_cron, not yet scheduled" language they carried since
+  Phase 2/4 — no historical narrative was rewritten, only appended to.
+- **Hosted dry-run** (read-only; nothing was applied, deployed, or modified): `npx supabase
+  migration list` and `npx supabase db push --dry-run` against the already-linked hosted project
+  confirm all 8 Phase 4 migrations are applied hosted and all 9 Phase 7 migrations (CP2 through
+  this checkpoint's CP8A migration) are pending. Applying them, provisioning the hosted owner, and
+  the actual Vercel deploy are **CP8B**, not this checkpoint.
+
+### Remaining — CP8B, not started
+
+**Deployment has not happened.** No hosted migration has been applied beyond the pre-existing
+Phase 4 set, no Vercel project has been created or configured, and the hosted Supabase project has
+not been provisioned with the real owner. `docs/operations.md §10` lists the exact remaining
+steps, in order, including where CLI authentication (Supabase and Vercel) must happen in the
+owner's own terminal/browser rather than through this tooling.
+
+The outstanding **finance** item carried forward from CP5 is unchanged by CP8A and remains a
+schema-meaning decision, not a bug: the two reachable **snapshot sign-guard states** in which
+`private.write_net_worth_snapshot` raises rather than writing, leaving the current month's
+snapshot stale but never wrong. CP8A made that condition **visible** (`snapshotHealth()`, the
+dashboard/analytics notice) without changing when it fires or what it means; deciding whether
+`net_worth_snapshots`' `CHECK (assets_cents >= 0 AND liabilities_cents >= 0)` should ever accept a
+negative aggregate is still future work, not CP8A's or CP8B's to resolve.

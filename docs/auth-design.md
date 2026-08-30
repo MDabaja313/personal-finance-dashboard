@@ -309,3 +309,11 @@ fully-qualified references, minimal `EXECUTE`, explicit in-function user scoping
 [docs/rls-policies.md §9](rls-policies.md#9-security-definer-bypassrls-and-the-snapshot-writer).
 The exact database role/identity that owns it is an explicit **Phase 4 provisioning decision**,
 not settled here.
+
+**Resolved in Phase 7 CP8A.** `pg_cron` is now scheduled — see
+[database-schema.md](database-schema.md#phase-7-cp8a--pg_cron-is-finally-scheduled-and-it-is-the-writer-this-section-always-intended)
+and [rls-policies.md §9](rls-policies.md#9-security-definer-bypassrls-and-the-snapshot-writer).
+The identity is `finance_snapshot_writer`, unchanged from Phase 4; this document's principle that
+such a job "runs without an authenticated user context" holds exactly as written, and the CP8A
+functions never call `auth.uid()` — they read `private.request_owner_id()`'s own GUC, one owner at
+a time.

@@ -1098,6 +1098,47 @@ snapshot-writing API; `private.write_net_worth_snapshots_for_range` keeps its Ph
 with no wrapper of any kind, and backfill remains an operator action. Full privilege rationale
 in [rls-policies.md §3](rls-policies.md), *What Phase 7 CP5 added*.
 
+### Phase 7 CP8A — `pg_cron` is finally scheduled, and it is the writer this section always intended
+
+The "intended writer" from Phase 2/4 — an unattended, `pg_cron`-scheduled pass that iterates
+over every owner rather than one request's own owner — is implemented in
+`20260901120001_scheduled_maintenance.sql` as `private.refresh_all_current_net_worth_snapshots()`,
+run daily. It is a *second*, separate function from CP5's `refresh_current_net_worth_snapshot()`
+bridge, not a replacement for it: the two serve different callers (a live authenticated request
+vs. an unattended daily pass with no JWT at all) and CP8A does not touch CP5's bridge, its grant,
+or its RLS policy in any way. Both ultimately call the same unchanged Phase 4
+`private.write_net_worth_snapshot(p_user_id, p_month)` — no snapshot arithmetic is duplicated a
+third time.
+
+pg_cron records the scheduling session's `current_user` as a job's `username` and executes the
+job with that role's permissions; running a job *as a different* role requires the scheduling
+role to be an actual database superuser (verified directly against the local image). These two
+jobs are scheduled by the migration as `postgres` — itself `NOSUPERUSER`, so it never requests
+that override — and so both execute as `postgres`. Because of that, the cron command is a single
+call to a `SECURITY DEFINER` function owned by `finance_snapshot_writer`, so execution
+immediately narrows from `postgres` down to that role's `NOLOGIN`/`NOBYPASSRLS` privileges. This
+is the same mechanism CP5's and CP7's bridges use, applied in the opposite direction: those
+narrow `authenticated`'s insufficient privilege *up* to what the writer needs; this one narrows
+`postgres`'s `BYPASSRLS`-carrying privilege *down* to the writer's own RLS-bound, already-audited
+reach.
+
+Owner enumeration never widens CP5's narrow `profiles_select_writer` policy (`id =
+private.request_owner_id()`, matching zero rows with no JWT claim set — the exact case a cron
+job's own connection is). Instead, the daily function discovers candidate owners from `accounts`
+(`finance_snapshot_writer` has held unconditional `SELECT` there since Phase 4), then, for each
+owner in turn, calls `set_config('request.jwt.claim.sub', <that owner's id>, true)` before
+touching `profiles` — the same GUC `private.request_owner_id()` already reads, impersonating one
+owner's request context at a time rather than reading every profile in one unscoped query. See
+the migration file for the full rationale and `090-privileges.sql` /
+`190-scheduled-maintenance.sql` for the assertions that this policy is unchanged.
+
+A companion function, `private.maintain_all_active_bill_schedules()`, runs on the same daily
+schedule and closes CP7's own documented gap
+([DEVELOPMENT_PLAN.md](../DEVELOPMENT_PLAN.md#cp7--bills--bill-occurrences-), *Deliberate
+limitation*: a bill nobody ever touches again eventually runs out of scheduled occurrences) the
+same way — a non-destructive top-up, per bill, reusing `private.generate_bill_occurrences_for_bill`
+unmodified, never a rebuild.
+
 `lib/data/mutations/snapshots.ts` is the only module in the application that names it, and every
 balance-affecting mutation calls it **after** its own write has committed, best-effort: the
 refresh is a separate PostgREST request and therefore a separate transaction, so it can fail on

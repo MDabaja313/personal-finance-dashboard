@@ -3,14 +3,18 @@
 A private, single-user personal finance dashboard — accounts, transactions, budgets, bills,
 goals, and analytics.
 
-**Status:** Supabase-backed (Phase 6 complete). The database schema, RLS, migrations,
-authentication, and the full read-side data-access layer are provisioned and verified both locally
-and hosted — login, logout, route protection, and every page's data all run against real Supabase
-queries end to end. `getToday()` derives "today" from the signed-in owner's own timezone
-(`profiles.timezone`), so seeded data ages naturally against the real date rather than a frozen
-mock clock. Phase 7 (mutations — Server Actions, writes, per-mutation RLS) is next; there is still
-no persistence path in the application. See [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md) for the
-full roadmap.
+**Status:** Fully writable, Supabase-backed, not yet deployed (Phase 7 CP1–CP8A complete). Every
+finance domain — accounts, categories, transactions, transfers/credit-card payments,
+reconciliation, budgets, goals, and recurring bills — is writable by its owner through real Server
+Actions, real per-mutation RLS policies, and real database triggers, with `profiles` and
+`net_worth_snapshots` deliberately staying read-only. Two `pg_cron` jobs maintain the bill-schedule
+horizon and the current month's net-worth snapshot unattended, daily, entirely inside the
+database. `getToday()` derives "today" from the signed-in owner's own timezone
+(`profiles.timezone`), so data ages naturally against the real date rather than a frozen mock
+clock. **Not yet deployed** — the application has not been pushed to a hosted Supabase project or
+to Vercel; see [docs/operations.md](docs/operations.md) for what running it day to day looks like
+once it is, and its final section for exactly what's left before that happens. See
+[DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md) for the full roadmap.
 
 ## Stack
 
@@ -44,6 +48,7 @@ only when you're intentionally changing dependency resolution.
 | `npm test` | Run the Vitest suite once — fully **offline**, no local Supabase required |
 | `npm run test:watch` | Vitest in watch mode |
 | `npm run test:parity` | Prove every Supabase-backed `lib/data/**` function agrees with the fixture oracle — **requires local Supabase running and a provisioned owner** (see below) |
+| `npm run test:mutations` | Drive every real Server Action, mutation, and RPC against local Supabase as the real owner — **requires local Supabase running**; rebuilds the local database itself, so run `test:parity` first and `auth:reset-local` after |
 | `npm run auth:reset-local` | Rebuild the local database around one real, login-capable owner (see [Local auth setup](#local-auth-setup)) |
 | `npm run auth:verify` | Runtime-verify the auth flow against a running `npm run dev` (see [Local auth setup](#local-auth-setup)) |
 | `npm run db:reset` | `supabase db reset` — schema + fixture seed, **not** login-capable on its own |
@@ -157,3 +162,10 @@ npm run auth:verify    # in another
 
 `auth:verify` drives real HTTP requests (login, protected routes, logout) against `localhost:3000`
 and exits non-zero on any mismatch — see `scripts/verify-auth.ts` for exactly what it proves.
+
+## Deployment and operations
+
+Not yet deployed. Once it is: Vercel hosts the Next.js app, Supabase hosts the database and auth,
+and two `pg_cron` jobs maintain bill schedules and net-worth snapshots unattended. See
+[docs/operations.md](docs/operations.md) for day-to-day use, environment variables, migrations,
+backup/restore, and exactly what's left before the first deploy.

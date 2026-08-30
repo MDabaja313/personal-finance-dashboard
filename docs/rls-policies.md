@@ -680,6 +680,19 @@ which role is chosen:**
   this document states requirements; it does not assume Supabase's managed `pg_cron` offering
   behaves identically to vanilla Postgres, and that gap must be checked before relying on it.
 
+**Resolved in Phase 7 CP8A.** The role is `finance_snapshot_writer` (decided in Phase 4, unchanged
+since), and `pg_cron` is now actually scheduled — two daily jobs, each a single call to a
+`SECURITY DEFINER` function owned by that role, satisfying every requirement above: fixed
+`search_path`, qualified references, `EXECUTE` revoked from `PUBLIC`/`anon`/`authenticated`,
+explicit per-owner iteration (never an unscoped cross-user write), and no reliance on `auth.uid()`
+— the functions use `private.request_owner_id()`'s own GUC, impersonated one owner at a time via
+`set_config`, exactly as CP5's request-scoped bridge already does for a live request. Full design
+in [database-schema.md](database-schema.md#phase-7-cp8a--pg_cron-is-finally-scheduled-and-it-is-the-writer-this-section-always-intended).
+Verified against the real local Postgres/pg_cron image, not assumed — `postgres` is `NOSUPERUSER`
+here exactly as this document already notes, which is why the scheduled command is a `SECURITY
+DEFINER` call rather than pg_cron running the job directly as `finance_snapshot_writer` (that path
+requires an actual superuser to schedule).
+
 ---
 
 ## 10. `security_invoker` views
