@@ -85,12 +85,23 @@ describe("zOptionalNote", () => {
 });
 
 describe("blankToUndefined", () => {
-  it("only collapses blank strings, and passes everything else through", () => {
+  it("collapses blank strings and passes non-blank strings through", () => {
     expect(blankToUndefined("")).toBeUndefined();
     expect(blankToUndefined("  ")).toBeUndefined();
     expect(blankToUndefined("x")).toBe("x");
+  });
+
+  it("collapses null — a FormData control that was never rendered — to undefined too", () => {
+    // FormData.get() returns null (not "") for a name that never appears in
+    // the submission, which is exactly what happens for a conditionally
+    // mounted control like AccountForm's credit limit on a savings account.
+    // "not rendered" and "rendered but left blank" both mean "not supplied",
+    // so both must normalize to the same undefined.
+    expect(blankToUndefined(null)).toBeUndefined();
+  });
+
+  it("preserves a non-string, non-null value rather than coercing it", () => {
     expect(blankToUndefined(0)).toBe(0);
-    expect(blankToUndefined(null)).toBeNull();
   });
 });
 

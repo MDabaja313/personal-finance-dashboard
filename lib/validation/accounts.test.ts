@@ -136,6 +136,123 @@ describe("accountCreateSchema", () => {
 
     expect(result.success).toBe(false);
   });
+
+  describe("FormData semantics: a control that is not rendered", () => {
+    // `<Input name="creditLimit">` and `<Input name="interestRate">` in
+    // AccountForm are only mounted when `allowsCreditLimit`/`allowsInterestRate`
+    // say the selected type can carry them (see account-form.tsx). For every
+    // other type — savings, checking, cash, investment — those controls never
+    // exist in the DOM, so `formData.get("creditLimit")` returns `null`, not
+    // `""`. `blankToUndefined` must collapse both to `undefined`; a schema that
+    // only normalizes `""` leaves `null` to fail `zMoneyCents`/`zBasisPoints`,
+    // which is the exact production bug reported against /accounts.
+
+    it("accepts the exact production repro: a savings account with null optional fields", () => {
+      const result = accountCreateSchema.safeParse({
+        name: "Savings",
+        institution: "Personal",
+        type: "savings",
+        openingBalance: "105.00",
+        creditLimit: null,
+        interestRate: null,
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.data.openingBalanceCents).toBe(10500);
+      expect(result.data.creditLimitCents).toBeUndefined();
+      expect(result.data.interestRateBps).toBeUndefined();
+    });
+
+    it("accepts a checking account submitted with both optional controls absent (null)", () => {
+      const result = accountCreateSchema.safeParse({
+        name: "Everyday Checking",
+        institution: "Horizon Bank",
+        type: "checking",
+        openingBalance: "1234.56",
+        creditLimit: null,
+        interestRate: null,
+      });
+
+      expect(result.success).toBe(true);
+    });
+
+    it("accepts a cash account submitted with both optional controls absent (null)", () => {
+      const result = accountCreateSchema.safeParse({
+        name: "Wallet",
+        institution: "Personal",
+        type: "cash",
+        openingBalance: "20.00",
+        creditLimit: null,
+        interestRate: null,
+      });
+
+      expect(result.success).toBe(true);
+    });
+
+    it("accepts an investment account submitted with both optional controls absent (null)", () => {
+      const result = accountCreateSchema.safeParse({
+        name: "Brokerage",
+        institution: "Personal",
+        type: "investment",
+        openingBalance: "5000.00",
+        creditLimit: null,
+        interestRate: null,
+      });
+
+      expect(result.success).toBe(true);
+    });
+
+    it("still accepts credit with both domain fields present, unaffected by the null fix", () => {
+      const result = accountCreateSchema.safeParse({
+        name: "Rewards Card",
+        institution: "Personal",
+        type: "credit",
+        openingBalance: "-500.00",
+        creditLimit: "5000.00",
+        interestRate: "23.99",
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.data.creditLimitCents).toBe(500000);
+      expect(result.data.interestRateBps).toBe(2399);
+    });
+
+    it("still accepts loan with interestRate present and creditLimit absent (null)", () => {
+      const result = accountCreateSchema.safeParse({
+        name: "Auto Loan",
+        institution: "Personal",
+        type: "loan",
+        openingBalance: "-12000.00",
+        creditLimit: null,
+        interestRate: "6.49",
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.data.creditLimitCents).toBeUndefined();
+      expect(result.data.interestRateBps).toBe(649);
+    });
+
+    it("still produces an actionable field error when a visible field is actually invalid", () => {
+      // A null optional field must not mask a real problem elsewhere: a blank
+      // name on the same savings submission still fails, and still fails under
+      // "name" specifically rather than collapsing to a form-only error.
+      const result = accountCreateSchema.safeParse({
+        name: "",
+        institution: "Personal",
+        type: "savings",
+        openingBalance: "105.00",
+        creditLimit: null,
+        interestRate: null,
+      });
+
+      expect(result.success).toBe(false);
+      if (result.success) return;
+      expect(fieldErrors(result.error).name).toBeDefined();
+    });
+  });
 });
 
 describe("accountUpdateSchema", () => {

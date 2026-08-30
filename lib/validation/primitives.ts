@@ -8,13 +8,20 @@
  *
  * ## Two conventions that matter more than they look
  *
- * **An empty string is not a value.** An unfilled HTML input submits `""`,
- * never `undefined`, so every *optional* field here maps `""` to `undefined`
- * before validating. Without that, an untouched optional select would fail a
- * UUID check, and an untouched optional note would be stored as an empty
- * string rather than as "absent" — which is exactly the `null`/`undefined`
- * confusion `lib/data/mappers.ts` works to keep out of the domain, arriving
- * from the other direction.
+ * **An empty string is not a value, and neither is a missing control.** An
+ * unfilled-but-rendered HTML input submits `""`; a control that is not
+ * rendered at all — a conditionally-mounted field like `AccountForm`'s credit
+ * limit and interest rate, present only for the account types that can carry
+ * them — makes `FormData.get()` return `null` instead, because the name never
+ * appears in the submission. Both mean exactly the same thing, "not
+ * supplied", so every *optional* field here maps both `""` and `null` to
+ * `undefined` before validating. Without that, an untouched optional select
+ * would fail a UUID check, an untouched optional note would be stored as an
+ * empty string rather than as "absent", and a domain-restricted field hidden
+ * for the current type (e.g. a savings account's credit limit) would fail
+ * validation instead of being treated as absent — which is exactly the
+ * `null`/`undefined` confusion `lib/data/mappers.ts` works to keep out of the
+ * domain, arriving from the other direction.
  *
  * **`today` is a parameter, never a clock read.** `zNotFuture(today)` is a
  * factory for the same reason every `lib/finance/**` function takes `today`
@@ -42,12 +49,21 @@ export const NAME_MAX_LENGTH = 120;
 export const NOTE_MAX_LENGTH = 500;
 
 /**
- * `""` (or whitespace) → `undefined`; everything else through untouched.
+ * `""` (or whitespace), or `null`, → `undefined`; everything else through
+ * untouched.
+ *
+ * `null` is included alongside blank strings because `FormData.get()` returns
+ * it for a control that was never rendered — not just one that was rendered
+ * and left empty — and this application's convention is that both mean "not
+ * supplied". A non-`null` non-string value (a `File`, a number from a
+ * non-FormData caller) is preserved rather than coerced: only the two shapes
+ * that actually mean "absent" collapse to `undefined`.
  *
  * Exported because every optional field needs it and a second implementation
  * would eventually disagree with this one about whitespace.
  */
 export function blankToUndefined(value: unknown): unknown {
+  if (value === null) return undefined;
   if (typeof value !== "string") return value;
   return value.trim() === "" ? undefined : value;
 }
