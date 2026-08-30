@@ -1,6 +1,6 @@
 "use client";
 
-import { useActionState, useEffect, useId, useState, type ReactNode } from "react";
+import { useActionState, useEffect, useId, useMemo, useState, type ReactNode } from "react";
 
 import type { BillFormValues, BillReferenceOption } from "@/components/bills/types";
 import { Button } from "@/components/ui/button";
@@ -16,6 +16,7 @@ import type { ActionState, FormAction } from "@/lib/actions/types";
 import { formatCentsForInput } from "@/lib/format/currency";
 import type { BillFrequency } from "@/lib/types";
 import { BILL_FREQUENCIES } from "@/lib/types/enums";
+import { optionItems, selectItems } from "@/lib/ui/select-items";
 
 /**
  * The bill create/edit form.
@@ -86,6 +87,24 @@ export function BillForm({
   const [categoryId, setCategoryId] = useState<string>(bill?.categoryId ?? NONE);
   const [accountId, setAccountId] = useState<string>(bill?.accountId ?? NONE);
 
+  // Base UI's `<Select.Value>` reads the Root's `items` map and falls back to
+  // `String(value)` without one — a raw UUID for the category and account
+  // pickers, and the wire label for the frequency. Every submitted value is
+  // unchanged. See `lib/ui/select-items.ts`.
+  const frequencyLabels = useMemo(
+    () =>
+      selectItems(BILL_FREQUENCIES.map((option) => ({ value: option, label: FREQUENCY_LABEL[option] }))),
+    []
+  );
+  const categoryLabels = useMemo(
+    () => optionItems(categories, { value: NONE, label: "No category" }),
+    [categories]
+  );
+  const accountLabels = useMemo(
+    () => optionItems(accounts, { value: NONE, label: "No account" }),
+    [accounts]
+  );
+
   const nameId = useId();
   const amountId = useId();
   const frequencyId = useId();
@@ -146,6 +165,7 @@ export function BillForm({
 
       <Field id={frequencyId} label="Repeats" errors={errorsFor("frequency")}>
         <Select
+          items={frequencyLabels}
           value={frequency}
           onValueChange={(value) => setFrequency(value as BillFrequency)}
           disabled={pending}
@@ -181,7 +201,12 @@ export function BillForm({
       </Field>
 
       <Field id={categoryFieldId} label="Category (optional)" errors={errorsFor("categoryId")}>
-        <Select value={categoryId} onValueChange={(value) => setCategoryId(String(value))} disabled={pending}>
+        <Select
+          items={categoryLabels}
+          value={categoryId}
+          onValueChange={(value) => setCategoryId(String(value))}
+          disabled={pending}
+        >
           <SelectTrigger id={categoryFieldId} className="w-full">
             <SelectValue />
           </SelectTrigger>
@@ -197,7 +222,12 @@ export function BillForm({
       </Field>
 
       <Field id={accountFieldId} label="Account (optional)" errors={errorsFor("accountId")}>
-        <Select value={accountId} onValueChange={(value) => setAccountId(String(value))} disabled={pending}>
+        <Select
+          items={accountLabels}
+          value={accountId}
+          onValueChange={(value) => setAccountId(String(value))}
+          disabled={pending}
+        >
           <SelectTrigger id={accountFieldId} className="w-full">
             <SelectValue />
           </SelectTrigger>

@@ -1,7 +1,7 @@
 "use client";
 
 import { useRouter, useSearchParams } from "next/navigation";
-import { useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { Input } from "@/components/ui/input";
 import {
   Select,
@@ -11,6 +11,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import type { Account, Category } from "@/lib/types";
+import { optionItems, selectItems } from "@/lib/ui/select-items";
 
 const ALL = "all";
 
@@ -49,6 +50,30 @@ export function TransactionFilters({ months, accounts, categories }: Transaction
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   /**
+   * Base UI's `<Select.Value>` resolves its text from the Root's `items` map
+   * and falls back to `String(value)` without one — so the account and category
+   * filters rendered a raw UUID once something was selected, and the type
+   * filter rendered `credit_card_payment`. The values in the URL are unchanged;
+   * only the trigger's text is. See `lib/ui/select-items.ts`.
+   */
+  const monthLabels = useMemo(
+    () => selectItems([{ value: ALL, label: "All months" }, ...months]),
+    [months]
+  );
+  const accountLabels = useMemo(
+    () => optionItems(accounts, { value: ALL, label: "All accounts" }),
+    [accounts]
+  );
+  const categoryLabels = useMemo(
+    () => optionItems(categories, { value: ALL, label: "All categories" }),
+    [categories]
+  );
+  const kindLabels = useMemo(
+    () => selectItems([{ value: ALL, label: "All types" }, ...KIND_OPTIONS]),
+    []
+  );
+
+  /**
    * The single funnel every filter control goes through — which is what makes
    * the pagination reset below unmissable rather than something each control
    * has to remember.
@@ -80,7 +105,11 @@ export function TransactionFilters({ months, accounts, categories }: Transaction
 
   return (
     <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
-      <Select value={searchParams.get("month") ?? ALL} onValueChange={(value) => setParam("month", String(value))}>
+      <Select
+        items={monthLabels}
+        value={searchParams.get("month") ?? ALL}
+        onValueChange={(value) => setParam("month", String(value))}
+      >
         <SelectTrigger className="w-full sm:w-40">
           <SelectValue placeholder="Month" />
         </SelectTrigger>
@@ -94,7 +123,11 @@ export function TransactionFilters({ months, accounts, categories }: Transaction
         </SelectContent>
       </Select>
 
-      <Select value={searchParams.get("account") ?? ALL} onValueChange={(value) => setParam("account", String(value))}>
+      <Select
+        items={accountLabels}
+        value={searchParams.get("account") ?? ALL}
+        onValueChange={(value) => setParam("account", String(value))}
+      >
         <SelectTrigger className="w-full sm:w-44">
           <SelectValue placeholder="Account" />
         </SelectTrigger>
@@ -109,6 +142,7 @@ export function TransactionFilters({ months, accounts, categories }: Transaction
       </Select>
 
       <Select
+        items={categoryLabels}
         value={searchParams.get("category") ?? ALL}
         onValueChange={(value) => setParam("category", String(value))}
       >
@@ -125,7 +159,11 @@ export function TransactionFilters({ months, accounts, categories }: Transaction
         </SelectContent>
       </Select>
 
-      <Select value={searchParams.get("kind") ?? ALL} onValueChange={(value) => setParam("kind", String(value))}>
+      <Select
+        items={kindLabels}
+        value={searchParams.get("kind") ?? ALL}
+        onValueChange={(value) => setParam("kind", String(value))}
+      >
         <SelectTrigger className="w-full sm:w-40">
           <SelectValue placeholder="Type" />
         </SelectTrigger>

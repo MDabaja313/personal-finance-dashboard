@@ -1,7 +1,7 @@
 "use client";
 
 import { Plus } from "lucide-react";
-import { useActionState, useCallback, useEffect, useId, useState } from "react";
+import { useActionState, useCallback, useEffect, useId, useMemo, useState } from "react";
 
 import type { BudgetCategoryOption } from "@/components/budgets/types";
 import { Button } from "@/components/ui/button";
@@ -15,6 +15,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import type { ActionState, FormAction } from "@/lib/actions/types";
+import { optionItems } from "@/lib/ui/select-items";
 
 /**
  * The "Add budget" disclosure at the top of `/budgets`.
@@ -98,6 +99,11 @@ function BudgetCreateForm({
   // full rationale this mirrors.
   const [submissionKey] = useState(() => crypto.randomUUID());
 
+  // Base UI's `<Select.Value>` reads the Root's `items` map and falls back to
+  // `String(value)` without one — which here is a raw category UUID. The
+  // submitted `categoryId` is unchanged. See `lib/ui/select-items.ts`.
+  const categoryLabels = useMemo(() => optionItems(eligibleCategories), [eligibleCategories]);
+
   const categoryFieldId = useId();
   const limitId = useId();
   const formErrorId = useId();
@@ -119,6 +125,7 @@ function BudgetCreateForm({
         </label>
         <Select
           name="categoryId"
+          items={categoryLabels}
           value={categoryId}
           onValueChange={(value) => setCategoryId(String(value))}
           disabled={pending}

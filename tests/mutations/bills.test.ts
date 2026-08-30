@@ -345,10 +345,20 @@ describe("updateBillAction", () => {
     expect(past.length).toBeGreaterThanOrEqual(2);
 
     const occurrenceActions = await import("@/lib/actions/bill-occurrences");
-    await occurrenceActions.markBillOccurrencePaidAction(
+    // `generatedTransactionId` is required on every mark-paid submission as of
+    // Phase 8 CP1 — it is the id an auto-created expense would take, and the
+    // form cannot predict whether one will be created. This bill names no
+    // account, so nothing is generated and the key goes unused.
+    const paidState = await occurrenceActions.markBillOccurrencePaidAction(
       IDLE,
-      formData({ id: past[0].id, paidOn: today, transactionId: "" })
+      formData({
+        id: past[0].id,
+        paidOn: today,
+        transactionId: "",
+        generatedTransactionId: crypto.randomUUID(),
+      })
     );
+    expect(paidState.status, paidState.formError ?? "").toBe("success");
     await occurrenceActions.skipBillOccurrenceAction(IDLE, formData({ id: past[1].id }));
 
     const state = await billActions.updateBillAction(

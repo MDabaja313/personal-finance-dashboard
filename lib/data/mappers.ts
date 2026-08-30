@@ -35,6 +35,7 @@ import type {
   BudgetRow,
   CategoryRow,
   GoalBalanceRow,
+  MonthlyPlanRow,
   NetWorthSnapshotRow,
   TransactionRow,
 } from "@/lib/data/rows";
@@ -49,6 +50,7 @@ import type {
   Cents,
   Goal,
   MonthKey,
+  MonthlyPlan,
   NetWorthSnapshot,
   Transaction,
 } from "@/lib/types";
@@ -57,6 +59,7 @@ import {
   ACCOUNT_TYPES,
   BILL_FREQUENCIES,
   BILL_OCCURRENCE_STATUSES,
+  BILL_PAYMENT_ORIGINS,
   CATEGORY_KINDS,
   TRANSACTION_KINDS,
 } from "@/lib/types/enums";
@@ -251,10 +254,16 @@ export function toBill(row: BillRow, dueDate: unknown): Bill {
  * (docs/database-schema.md §13). A mapper that reached for the parent's
  * current amount would silently rewrite payment history on every render.
  *
- * `transaction_id` and `paid_on` are both legitimately null — a paid
- * occurrence need not link a transaction, and a scheduled or skipped one
- * carries neither — so both become `undefined` per this module's rule 2.
- * `created_at` is an ordering key only and is deliberately absent from the DTO.
+ * `transaction_id`, `transaction_origin` and `paid_on` are all legitimately
+ * null — a paid occurrence need not reference a transaction, and a scheduled or
+ * skipped one carries none of the three — so each becomes `undefined` per this
+ * module's rule 2. `created_at` is an ordering key only and is deliberately
+ * absent from the DTO.
+ *
+ * `transaction_origin` is narrowed rather than passed through: it decides
+ * whether the reversal path may delete the referenced transaction, so an
+ * unrecognized label must fail loudly here rather than fall through some
+ * later comparison as "not generated" (or, worse, as "generated").
  */
 export function toBillOccurrence(row: BillOccurrenceDetailRow): BillOccurrence {
   return {
@@ -264,7 +273,31 @@ export function toBillOccurrence(row: BillOccurrenceDetailRow): BillOccurrence {
     status: enumFrom(row.status, BILL_OCCURRENCE_STATUSES, "bill_occurrences.status"),
     amountCents: centsFrom(row.amount_cents, "bill_occurrences.amount_cents"),
     transactionId: row.transaction_id ?? undefined,
+    transactionOrigin:
+      row.transaction_origin === null
+        ? undefined
+        : enumFrom(
+            row.transaction_origin,
+            BILL_PAYMENT_ORIGINS,
+            "bill_occurrences.transaction_origin"
+          ),
     paidOn: calendarDateOrUndefined(row.paid_on, "bill_occurrences.paid_on"),
+  };
+}
+
+/**
+ * `monthly_plans` row → `MonthlyPlan` (Phase 8 CP2).
+ *
+ * `expected_income_cents` goes through `centsFrom` like every other money
+ * column: it is a plain non-negative magnitude with no sign convention to
+ * preserve, but it is still `BIGINT` on the wire and still has to clear the
+ * safe-integer bound before it can be branded.
+ */
+export function toMonthlyPlan(row: MonthlyPlanRow): MonthlyPlan {
+  return {
+    id: row.id,
+    period: monthKeyFrom(row.period, "monthly_plans.period"),
+    expectedIncomeCents: centsFrom(row.expected_income_cents, "monthly_plans.expected_income_cents"),
   };
 }
 

@@ -456,9 +456,18 @@ select lives_ok(
 -- Linking an owned transaction
 -- ------------------------------------------------------------
 
+-- `transaction_origin` is written alongside the reference as of Phase 8 CP1:
+-- `bill_occurrences_transaction_origin_ck` makes provenance and reference the
+-- same fact, so a link with no origin is not a representable state. 'linked'
+-- is the honest label here -- this transaction was written by hand, long
+-- before the occurrence pointed at it -- and it is also the only label the
+-- guard would accept, since 'generated' requires a transaction created by the
+-- statement's own database transaction (200-bill-payment-ledger.sql).
 select lives_ok(
   $$ update public.bill_occurrences
-     set status = 'paid', paid_on = '2026-01-06', transaction_id = '19000000-0000-4000-8000-000000000101'
+     set status = 'paid', paid_on = '2026-01-06',
+         transaction_id = '19000000-0000-4000-8000-000000000101',
+         transaction_origin = 'linked'
      where bill_id = '19000000-0000-4000-8000-000000000408' and due_date = '2026-01-05' $$,
   'an owned transaction may be linked as the payment'
 );
@@ -481,7 +490,8 @@ rollback to savepoint linked_transaction_delete;
 set constraints all deferred;
 
 select lives_ok(
-  $$ update public.bill_occurrences set status = 'scheduled', paid_on = null, transaction_id = null
+  $$ update public.bill_occurrences
+     set status = 'scheduled', paid_on = null, transaction_id = null, transaction_origin = null
      where bill_id = '19000000-0000-4000-8000-000000000408' and due_date = '2026-01-05' $$,
   'unmarking clears the reference'
 );

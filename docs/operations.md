@@ -104,6 +104,20 @@ never applies a seed, and there is no hosted seed step to accidentally run.
 database only and this repository's tooling (`npm run db:reset`, `npm run auth:reset-local`)
 never targets anything but `127.0.0.1`.
 
+### Currently pending (Phase 8, unmerged)
+
+Two migrations exist on `feature/monthly-planning-and-bill-ledger` and are **not applied hosted**:
+
+| File | What it does | Backfill? |
+| --- | --- | --- |
+| `20260902120001_bill_payment_ledger.sql` | Adds `bill_occurrences.transaction_origin` and the two settlement RPCs | **Yes** — every existing occurrence that already references a transaction is set to `'linked'` *before* the biconditional `CHECK` is added. That is the safe direction: `'linked'` is the value that makes unmarking leave the transaction alone, and nothing could have generated one before this migration |
+| `20260902120002_monthly_plans.sql` | Adds the `monthly_plans` table, its RLS and its grants | No — a new, empty table |
+
+Both are additive and neither edits an earlier migration. Apply them the ordinary way (`migration
+list` / `--dry-run` first, then `db push`) whenever this branch is deployed. Take a backup first,
+per §6 — the backfill is an `UPDATE` over an existing table, which is the one thing in either file
+that touches data that already exists.
+
 ## 6. Backup and export
 
 The Supabase CLI can dump the hosted project directly:

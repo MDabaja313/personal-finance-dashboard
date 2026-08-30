@@ -86,8 +86,22 @@
 -- foreign rows, user_id reassignment, anon) is 110-write-rls.sql, and
 -- for movements it is 140-movement-writes.sql; the invariant triggers
 -- are 120/130 and the movement invariant is 020.
+--
+-- Phase 8 adds two rows to the matrix and widens exactly one existing grant:
+--
+--   * monthly_plans -- a new table with INSERT/UPDATE/DELETE, shaped exactly
+--     like budgets (planning metadata, no ledger history to preserve).
+--   * bill_occurrences.transaction_origin joins its three-column UPDATE grant.
+--     It has to: public.settle_bill_occurrence is SECURITY INVOKER and writes
+--     as the caller. What stops a hand-crafted request from claiming
+--     'generated' over a hand-written transaction is not the grant but
+--     guard_bill_occurrence_transition()'s provenance rule -- see
+--     200-bill-payment-ledger.sql, which proves it.
+--
+-- `amount_cents` and `due_date` are still absent from that grant, which is the
+-- part of CP7 that has not moved and must not.
 begin;
-select plan(102);
+select plan(113);
 
 -- Every user-financial table. The last assertion in this file proves
 -- this list is exactly `public`'s table set, so it cannot silently fall
@@ -96,7 +110,7 @@ create temporary table write_posture_tables (name text primary key) on commit dr
 insert into write_posture_tables (name) values
   ('profiles'), ('accounts'), ('categories'), ('movements'), ('transactions'),
   ('budgets'), ('bills'), ('bill_occurrences'), ('goals'), ('goal_contributions'),
-  ('net_worth_snapshots');
+  ('net_worth_snapshots'), ('monthly_plans');
 
 -- The tables that hold any INSERT grant, kept as a separate list so
 -- every assertion below reads as "these and no others" rather than as a
@@ -104,7 +118,7 @@ insert into write_posture_tables (name) values
 create temporary table writable_tables (name text primary key) on commit drop;
 insert into writable_tables (name) values
   ('accounts'), ('categories'), ('transactions'), ('movements'),
-  ('budgets'), ('goals'), ('goal_contributions'), ('bills');
+  ('budgets'), ('goals'), ('goal_contributions'), ('bills'), ('monthly_plans');
 
 -- bill_occurrences is deliberately NOT in the list above. It is the one
 -- relation `authenticated` may UPDATE without being able to INSERT: an
@@ -128,7 +142,7 @@ insert into update_only_tables (name) values ('bill_occurrences');
 create temporary table updatable_tables (name text primary key) on commit drop;
 insert into updatable_tables (name) values
   ('accounts'), ('categories'), ('transactions'), ('budgets'), ('goals'),
-  ('bills'), ('bill_occurrences');
+  ('bills'), ('bill_occurrences'), ('monthly_plans');
 
 -- DELETE is tracked separately too, because it is granted on a strictly
 -- narrower set than INSERT: transactions, movements and budgets only.
@@ -137,7 +151,8 @@ insert into updatable_tables (name) values
 -- CP2 accounts/categories treatment (soft-delete via `archived_at`),
 -- never a DELETE grant.
 create temporary table deletable_tables (name text primary key) on commit drop;
-insert into deletable_tables (name) values ('transactions'), ('movements'), ('budgets');
+insert into deletable_tables (name) values
+  ('transactions'), ('movements'), ('budgets'), ('monthly_plans');
 
 -- The behavioral section below reads these lists while running *as*
 -- `authenticated`/`anon`, so those roles need to see them. Scoped to
@@ -182,13 +197,13 @@ select is(
    where has_any_column_privilege('authenticated', 'public.' || t.name, 'insert')
      and t.name not in (select name from writable_tables)),
   0,
-  'authenticated has no INSERT grant outside accounts/categories/transactions/movements/budgets/goals/goal_contributions/bills'
+  'authenticated has no INSERT grant outside accounts/categories/transactions/movements/budgets/goals/goal_contributions/bills/monthly_plans'
 );
 select is(
   (select count(*)::int from writable_tables t
    where has_any_column_privilege('authenticated', 'public.' || t.name, 'insert')),
-  8,
-  'authenticated does hold an INSERT grant on all eight insertable tables (not vacuous)'
+  9,
+  'authenticated does hold an INSERT grant on all nine insertable tables (not vacuous)'
 );
 
 -- The single most important negative fact about the CP7 grants, stated on
@@ -210,13 +225,13 @@ select is(
    where has_any_column_privilege('authenticated', 'public.' || t.name, 'update')
      and t.name not in (select name from updatable_tables)),
   0,
-  'authenticated has no UPDATE grant outside accounts/categories/transactions/budgets/goals/bills/bill_occurrences -- movements and goal_contributions included'
+  'authenticated has no UPDATE grant outside accounts/categories/transactions/budgets/goals/bills/bill_occurrences/monthly_plans -- movements and goal_contributions included'
 );
 select is(
   (select count(*)::int from updatable_tables t
    where has_any_column_privilege('authenticated', 'public.' || t.name, 'update')),
-  7,
-  'authenticated does hold an UPDATE grant on all seven updatable tables (not vacuous)'
+  8,
+  'authenticated does hold an UPDATE grant on all eight updatable tables (not vacuous)'
 );
 -- Stated on its own as well, because it is the single most important
 -- negative fact about the CP4/CP6 grants and a set-difference assertion
@@ -238,7 +253,7 @@ select is(
    where has_table_privilege('authenticated', 'public.' || t.name, 'delete')
      and t.name not in (select name from deletable_tables)),
   0,
-  'authenticated has no DELETE grant outside transactions/movements/budgets -- accounts, categories, goals, goal_contributions, bills and bill_occurrences included'
+  'authenticated has no DELETE grant outside transactions/movements/budgets/monthly_plans -- accounts, categories, goals, goal_contributions, bills and bill_occurrences included'
 );
 -- Stated on its own for the two CP7 relations, because "no DELETE" means
 -- something different on each. A bill is soft-deleted (`is_archived`) so
@@ -253,8 +268,8 @@ select ok(
 select is(
   (select count(*)::int from deletable_tables t
    where has_table_privilege('authenticated', 'public.' || t.name, 'delete')),
-  3,
-  'authenticated does hold DELETE on transactions, movements and budgets (not vacuous)'
+  4,
+  'authenticated does hold DELETE on transactions, movements, budgets and monthly_plans (not vacuous)'
 );
 
 -- ============================================================
@@ -465,12 +480,18 @@ select is(
   'authenticated may UPDATE exactly the 7 intended bills columns (id/user_id/created_at excluded)'
 );
 
--- bill_occurrences. The narrowest grant in this schema, and the only
--- UPDATE-without-INSERT one. `amount_cents` and `due_date` are absent
--- and that is the whole point: they are the historical facts
--- docs/database-schema.md 13 protects -- what this instance was due for,
--- and when -- and neither the owner nor the scheduler may rewrite them.
--- `string_agg` over an empty set is NULL, which is the INSERT assertion.
+-- bill_occurrences. Still the only UPDATE-without-INSERT grant in this
+-- schema. `amount_cents` and `due_date` are absent and that is the whole
+-- point: they are the historical facts docs/database-schema.md 13
+-- protects -- what this instance was due for, and when -- and neither the
+-- owner nor the scheduler may rewrite them. `string_agg` over an empty
+-- set is NULL, which is the INSERT assertion.
+--
+-- Phase 8 CP1 adds `transaction_origin` to the UPDATE list, and only
+-- that. It has to be there because public.settle_bill_occurrence is
+-- SECURITY INVOKER and therefore writes as the caller. Forgery is
+-- prevented by guard_bill_occurrence_transition(), not by withholding
+-- the column -- see 200-bill-payment-ledger.sql.
 select is(
   (select string_agg(a.attname::text, ',' order by a.attname)
    from pg_attribute a
@@ -486,8 +507,33 @@ select is(
    where a.attrelid = 'public.bill_occurrences'::regclass
      and a.attnum > 0 and not a.attisdropped
      and has_column_privilege('authenticated', a.attrelid, a.attnum, 'update')),
-  'paid_on,status,transaction_id',
-  'authenticated may UPDATE exactly the 3 state-machine columns of bill_occurrences'
+  'paid_on,status,transaction_id,transaction_origin',
+  'authenticated may UPDATE exactly the 4 state-machine columns of bill_occurrences'
+);
+
+-- monthly_plans. The budgets shape, transplanted: `id` for the
+-- client-minted idempotency key, `user_id` INSERT-only (never re-homed),
+-- `period` INSERT-only (it decides which month the row *is*, exactly as
+-- budgets.period does), and `expected_income_cents` as the one editable
+-- value. The table has no created_at, so there is nothing else to
+-- exclude.
+select is(
+  (select string_agg(a.attname::text, ',' order by a.attname)
+   from pg_attribute a
+   where a.attrelid = 'public.monthly_plans'::regclass
+     and a.attnum > 0 and not a.attisdropped
+     and has_column_privilege('authenticated', a.attrelid, a.attnum, 'insert')),
+  'expected_income_cents,id,period,user_id',
+  'authenticated may INSERT exactly all 4 monthly_plans columns (the table has no others)'
+);
+select is(
+  (select string_agg(a.attname::text, ',' order by a.attname)
+   from pg_attribute a
+   where a.attrelid = 'public.monthly_plans'::regclass
+     and a.attnum > 0 and not a.attisdropped
+     and has_column_privilege('authenticated', a.attrelid, a.attnum, 'update')),
+  'expected_income_cents',
+  'authenticated may UPDATE only monthly_plans.expected_income_cents (id/user_id/period excluded)'
 );
 
 -- ============================================================
@@ -519,8 +565,8 @@ select is(
 select is(
   (select count(*)::int from write_posture_tables t
    where has_table_privilege('authenticated', 'public.' || t.name, 'select')),
-  11,
-  'authenticated now holds SELECT on all 11 tables (the checks above are not vacuous)'
+  12,
+  'authenticated now holds SELECT on all 12 tables (the checks above are not vacuous)'
 );
 
 -- ============================================================
@@ -793,6 +839,25 @@ select throws_ok(
   'authenticated cannot UPDATE bill_occurrences.created_at'
 );
 
+-- monthly_plans' three excluded UPDATE columns. `period` is the one that
+-- matters: getting the month wrong means writing that month's own row,
+-- never relabelling this one -- exactly the budgets rule.
+select throws_ok(
+  $$ update public.monthly_plans set user_id = user_id where false $$,
+  '42501', null,
+  'authenticated cannot UPDATE monthly_plans.user_id -- a plan can never be re-homed'
+);
+select throws_ok(
+  $$ update public.monthly_plans set id = id where false $$,
+  '42501', null,
+  'authenticated cannot UPDATE monthly_plans.id'
+);
+select throws_ok(
+  $$ update public.monthly_plans set period = period where false $$,
+  '42501', null,
+  'authenticated cannot UPDATE monthly_plans.period -- wrong month means writing that month''s row'
+);
+
 -- ============================================================
 -- Behavioral: anon cannot write either
 -- ============================================================
@@ -905,6 +970,38 @@ select throws_ok(
 select throws_ok(
   $$ select public.maintain_bill_schedule('18000000-0000-4000-8000-0000000000d9', true) $$,
   '42501', null, 'anon EXECUTE of maintain_bill_schedule is denied at the GRANT layer -- the one CP7 definer'
+);
+
+-- Phase 8's new relation and its two new RPCs, for the same role. The two
+-- settlement functions are the first ones an anonymous caller reaching
+-- them could use to write the *ledger*, so their refusal at the privilege
+-- layer -- before a single argument is examined -- is worth stating.
+select throws_ok(
+  $$ insert into public.monthly_plans (user_id, period, expected_income_cents)
+     values ('18000000-0000-4000-8000-000000000001', '2026-01', 100) $$,
+  '42501', null, 'anon INSERT on monthly_plans is denied at the GRANT layer'
+);
+select throws_ok(
+  $$ update public.monthly_plans set expected_income_cents = 1 where false $$,
+  '42501', null, 'anon UPDATE on monthly_plans is denied at the GRANT layer'
+);
+select throws_ok(
+  $$ delete from public.monthly_plans where false $$,
+  '42501', null, 'anon DELETE on monthly_plans is denied at the GRANT layer'
+);
+select throws_ok(
+  $$ select count(*) from public.monthly_plans $$,
+  '42501', null, 'anon cannot even read monthly_plans'
+);
+select throws_ok(
+  $$ select public.settle_bill_occurrence(
+       '18000000-0000-4000-8000-0000000000e1', '2026-01-01', null,
+       '18000000-0000-4000-8000-0000000000e2') $$,
+  '42501', null, 'anon EXECUTE of settle_bill_occurrence is denied at the GRANT layer'
+);
+select throws_ok(
+  $$ select public.unsettle_bill_occurrence('18000000-0000-4000-8000-0000000000e1') $$,
+  '42501', null, 'anon EXECUTE of unsettle_bill_occurrence is denied at the GRANT layer'
 );
 
 reset role;

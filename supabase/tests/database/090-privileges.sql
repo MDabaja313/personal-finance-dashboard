@@ -14,7 +14,7 @@
 -- a missing policy on a granted table would silently return zero rows,
 -- which a bare success check could not distinguish from an empty table.
 begin;
-select plan(55);
+select plan(58);
 
 insert into auth.users (id, aud, role, email) values
   ('17000000-0000-4000-8000-000000000001', 'authenticated', 'authenticated', 'priv-test@local.test');
@@ -127,10 +127,20 @@ select is(
        'private.generate_bill_occurrences_for_bill(uuid,uuid,date,date)'::regprocedure,
        'public.create_bill(uuid,text,bigint,public.bill_frequency,date,uuid,uuid)'::regprocedure,
        'public.replace_bill(uuid,text,bigint,public.bill_frequency,date,uuid,uuid)'::regprocedure,
-       'public.set_bill_archived(uuid,boolean)'::regprocedure
+       'public.set_bill_archived(uuid,boolean)'::regprocedure,
+       -- Phase 8 CP1. The two settlement functions are SECURITY INVOKER for
+       -- exactly the CP4/CP7 reason and it matters more here than anywhere
+       -- else: they write the *ledger*. The caller already holds INSERT and
+       -- DELETE on transactions and the four-column UPDATE on
+       -- bill_occurrences, and under FORCE RLS the invoker sees only its own
+       -- rows. A definer's context would strip the RLS off a browser-reachable
+       -- path that creates and removes expenses -- which is the one place in
+       -- this schema where that would be least acceptable.
+       'public.settle_bill_occurrence(uuid,date,uuid,uuid)'::regprocedure,
+       'public.unsettle_bill_occurrence(uuid)'::regprocedure
      )),
-  18,
-  'all 18 invoker functions are SECURITY INVOKER (prosecdef = false) -- CP7 bill writes included'
+  20,
+  'all 20 invoker functions are SECURITY INVOKER (prosecdef = false) -- Phase 8 settlement included'
 );
 
 -- The eight RPCs are the *only* functions `authenticated` may execute
@@ -148,8 +158,10 @@ select ok(
   and has_function_privilege('authenticated', 'public.create_bill(uuid,text,bigint,public.bill_frequency,date,uuid,uuid)'::regprocedure, 'execute')
   and has_function_privilege('authenticated', 'public.replace_bill(uuid,text,bigint,public.bill_frequency,date,uuid,uuid)'::regprocedure, 'execute')
   and has_function_privilege('authenticated', 'public.set_bill_archived(uuid,boolean)'::regprocedure, 'execute')
-  and has_function_privilege('authenticated', 'public.maintain_bill_schedule(uuid,boolean)'::regprocedure, 'execute'),
-  'authenticated may EXECUTE all eight public RPCs'
+  and has_function_privilege('authenticated', 'public.maintain_bill_schedule(uuid,boolean)'::regprocedure, 'execute')
+  and has_function_privilege('authenticated', 'public.settle_bill_occurrence(uuid,date,uuid,uuid)'::regprocedure, 'execute')
+  and has_function_privilege('authenticated', 'public.unsettle_bill_occurrence(uuid)'::regprocedure, 'execute'),
+  'authenticated may EXECUTE all ten public RPCs'
 );
 select ok(
   not has_function_privilege('anon', 'public.create_movement(uuid,public.movement_kind,date,uuid,uuid,bigint,uuid,uuid)'::regprocedure, 'execute')
@@ -167,12 +179,16 @@ select ok(
   and not has_function_privilege('public', 'public.create_bill(uuid,text,bigint,public.bill_frequency,date,uuid,uuid)'::regprocedure, 'execute')
   and not has_function_privilege('public', 'public.replace_bill(uuid,text,bigint,public.bill_frequency,date,uuid,uuid)'::regprocedure, 'execute')
   and not has_function_privilege('public', 'public.set_bill_archived(uuid,boolean)'::regprocedure, 'execute')
-  and not has_function_privilege('public', 'public.maintain_bill_schedule(uuid,boolean)'::regprocedure, 'execute'),
-  'neither anon nor the PUBLIC pseudo-role may EXECUTE any of the eight RPCs'
+  and not has_function_privilege('public', 'public.maintain_bill_schedule(uuid,boolean)'::regprocedure, 'execute')
+  and not has_function_privilege('anon', 'public.settle_bill_occurrence(uuid,date,uuid,uuid)'::regprocedure, 'execute')
+  and not has_function_privilege('anon', 'public.unsettle_bill_occurrence(uuid)'::regprocedure, 'execute')
+  and not has_function_privilege('public', 'public.settle_bill_occurrence(uuid,date,uuid,uuid)'::regprocedure, 'execute')
+  and not has_function_privilege('public', 'public.unsettle_bill_occurrence(uuid)'::regprocedure, 'execute'),
+  'neither anon nor the PUBLIC pseudo-role may EXECUTE any of the ten RPCs'
 );
 
 -- The set of `authenticated`-executable functions in public is exactly
--- those eight. Enumerated as a sorted list rather than a count, because a
+-- those ten. Enumerated as a sorted list rather than a count, because a
 -- function swapped for another would pass a count.
 --
 -- Note what is NOT here and must never be: any wrapper that takes a user
@@ -181,15 +197,39 @@ select ok(
 -- and a boolean -- so "the caller can address only its own current month"
 -- and "the caller cannot choose an owner or how far ahead to generate"
 -- are properties of the signatures rather than of checks inside the
--- bodies.
+-- bodies. Phase 8's two settlement functions follow the same rule: neither
+-- takes an owner, and neither takes an account, a category, a merchant or
+-- an amount -- every fact about the ledger row they may write is read from
+-- the occurrence and its bill.
 select is(
   (select string_agg(p.proname::text, ',' order by p.proname)
    from pg_proc p
    join pg_namespace n on n.oid = p.pronamespace
    where n.nspname = 'public'
      and has_function_privilege('authenticated', p.oid, 'execute')),
-  'create_bill,create_movement,maintain_bill_schedule,reconcile_account,refresh_current_net_worth_snapshot,replace_bill,replace_movement,set_bill_archived',
-  'authenticated may EXECUTE exactly the eight RPCs in public and nothing else'
+  'create_bill,create_movement,maintain_bill_schedule,reconcile_account,refresh_current_net_worth_snapshot,replace_bill,replace_movement,set_bill_archived,settle_bill_occurrence,unsettle_bill_occurrence',
+  'authenticated may EXECUTE exactly the ten RPCs in public and nothing else'
+);
+
+-- The settlement function's argument list, asserted exactly, for the same
+-- reason maintain_bill_schedule's is: what a caller *cannot* say is the
+-- security property. There is no account, no category, no merchant, no
+-- amount and no kind -- so a hand-crafted request cannot post an expense of
+-- its choosing through the bill surface. The four are an owned occurrence,
+-- the paid date, an optional owned transaction to link, and the idempotency
+-- key a generated row would take.
+select is(
+  (select string_agg(format_type(t.oid, null), ',' order by t.ord)
+   from pg_proc p,
+        unnest(p.proargtypes) with ordinality as t(oid, ord)
+   where p.oid = 'public.settle_bill_occurrence(uuid,date,uuid,uuid)'::regprocedure),
+  'uuid,date,uuid,uuid',
+  'settle_bill_occurrence takes (occurrence, paid date, link, generated key) -- no owner, no amount, no account'
+);
+select is(
+  (select pronargs::int from pg_proc where oid = 'public.unsettle_bill_occurrence(uuid)'::regprocedure),
+  1,
+  'unsettle_bill_occurrence takes exactly one parameter -- the occurrence, and nothing about what to delete'
 );
 
 -- The snapshot bridge takes no arguments at all. Asserted against the
@@ -315,7 +355,7 @@ select is(
   (select count(*)::int from (values
     ('profiles'), ('accounts'), ('categories'), ('movements'), ('transactions'),
     ('budgets'), ('bills'), ('bill_occurrences'), ('goals'), ('goal_contributions'),
-    ('net_worth_snapshots'), ('account_balances'), ('goal_balances')
+    ('net_worth_snapshots'), ('monthly_plans'), ('account_balances'), ('goal_balances')
   ) as t(name)
   where has_table_privilege('anon', 'public.' || t.name, 'select')
      or has_table_privilege('anon', 'public.' || t.name, 'insert')
@@ -451,12 +491,17 @@ select throws_ok(
   '42501', null, 'writer DELETE on net_worth_snapshots is denied -- no DELETE grant'
 );
 
--- No access at all to the remaining five tables.
+-- No access at all to the remaining six tables.
 select throws_ok($$ select count(*) from public.categories $$, '42501', null, 'writer has no SELECT grant on categories');
 select throws_ok($$ select count(*) from public.movements $$, '42501', null, 'writer has no SELECT grant on movements');
 select throws_ok($$ select count(*) from public.budgets $$, '42501', null, 'writer has no SELECT grant on budgets');
 select throws_ok($$ select count(*) from public.goals $$, '42501', null, 'writer has no SELECT grant on goals');
 select throws_ok($$ select count(*) from public.goal_contributions $$, '42501', null, 'writer has no SELECT grant on goal_contributions');
+-- Phase 8 CP2. The snapshot writer sums accounts and transactions; an
+-- expected figure is not a balance and must never reach net worth. The
+-- absence of a grant is what makes that structural rather than a rule the
+-- writer's body happens to follow.
+select throws_ok($$ select count(*) from public.monthly_plans $$, '42501', null, 'writer has no SELECT grant on monthly_plans -- a target is not a balance');
 
 -- ============================================================
 -- profiles: the one privilege Phase 7 CP5 added to the writer

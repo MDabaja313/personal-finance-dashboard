@@ -15,6 +15,7 @@ import {
 } from "@/components/ui/select";
 import type { ActionState, FormAction } from "@/lib/actions/types";
 import type { Category } from "@/lib/types";
+import { selectItems } from "@/lib/ui/select-items";
 import { cn } from "@/lib/utils";
 
 /**
@@ -40,6 +41,13 @@ const KIND_OPTIONS = [
   { value: "expense", label: "Expense" },
   { value: "income", label: "Income" },
 ] as const;
+
+/**
+ * The same labels, as the `items` map Base UI's `<Select.Value>` reads —
+ * without it the trigger renders the wire label (`expense`) rather than the
+ * display one. See `lib/ui/select-items.ts`.
+ */
+const KIND_ITEMS = selectItems(KIND_OPTIONS);
 
 const KIND_LABEL: Record<Category["kind"], string> = { expense: "Expense", income: "Income" };
 
@@ -214,6 +222,7 @@ function CategoryFields({
         <FieldShell id={kindId} label="Type" className="w-36">
           <Select
             name="kind"
+            items={KIND_ITEMS}
             value={kind}
             onValueChange={(value) => setKind(value as Category["kind"])}
             disabled={pending}

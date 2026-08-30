@@ -34,6 +34,8 @@ Phase 6 — the schema below is exactly what Phase 4 shipped.
 16. [DAL function mapping](#16-dal-function-mapping)
 17. [Fixture / invariant traceability](#17-fixture--invariant-traceability)
 18. [Known future limitation — balance reconciliation](#18-known-future-limitation--balance-reconciliation)
+19. [Bill payment provenance (Phase 8 CP1)](#19-bill-payment-provenance-phase-8-cp1)
+20. [Monthly plans (Phase 8 CP2)](#20-monthly-plans-phase-8-cp2)
 
 ---
 
@@ -53,11 +55,13 @@ auth.users (Supabase)
             │      └──< bill_occurrences >── (optional) transaction_id
             ├──< goals
             │      └──< goal_contributions   [append-only]
+            ├──< monthly_plans               [one per month; referenced by nothing]
             └──< net_worth_snapshots
 ```
 
-**Eleven tables:** `profiles`, `accounts`, `categories`, `movements`, `transactions`, `budgets`,
-`bills`, `bill_occurrences`, `goals`, `goal_contributions`, `net_worth_snapshots`.
+**Twelve tables:** `profiles`, `accounts`, `categories`, `movements`, `transactions`, `budgets`,
+`bills`, `bill_occurrences`, `goals`, `goal_contributions`, `net_worth_snapshots`, and — added by
+Phase 8 CP2 — `monthly_plans` (§20).
 
 **Two views**, both `security_invoker = on`, both implemented in
 `20260822150005_views.sql`
@@ -83,7 +87,8 @@ reconciliation limitation (§18) is recorded as a *future* prerequisite, not a t
 | `movement_kind` | `transfer`, `credit_card_payment` | **Deliberately narrower** than `transaction_kind` — makes "a movement can only be one of the two paired kinds" a type-level fact, not a runtime check |
 | `bill_frequency` | `weekly`, `biweekly`, `monthly`, `yearly` | Matches `BillFrequency` |
 | `category_kind` | `income`, `expense` | Matches `Category.kind` |
-| `bill_occurrence_status` | `scheduled`, `paid`, `skipped` | New — no current DTO equivalent |
+| `bill_occurrence_status` | `scheduled`, `paid`, `skipped` | Matches `BillOccurrenceStatus` |
+| `bill_payment_origin` | `linked`, `generated` | **Phase 8 CP1** (`20260902120001_bill_payment_ledger.sql`). Matches `BillPaymentOrigin`. Unlike every other enum here, **no layer of this application ever writes one of these labels** — `public.settle_bill_occurrence` chooses it in SQL and `guard_bill_occurrence_transition()` refuses `'generated'` for any transaction not created by the same database transaction (§19) |
 
 ---
 
@@ -224,7 +229,8 @@ No amounts or dates live here — those belong to the two `transactions` legs (�
 | `due_date` | `DATE` | NOT NULL | |
 | `status` | `bill_occurrence_status` | NOT NULL, default `'scheduled'` | |
 | `amount_cents` | `BIGINT` | **NOT NULL** | Copied from `bills.amount_cents` **at generation time** — a concrete historical fact, not a live reference (§9, §13) |
-| `transaction_id` | `UUID` | nullable | Composite FK → `transactions(id, user_id)`, `ON DELETE RESTRICT`. Nullable because an occurrence may be marked paid without a linked imported transaction (§13) |
+| `transaction_id` | `UUID` | nullable | Composite FK → `transactions(id, user_id)`, `ON DELETE RESTRICT`. Nullable because an occurrence may be marked paid without any transaction at all (§13) |
+| `transaction_origin` | `bill_payment_origin` | nullable | **Phase 8 CP1.** Where the reference came from: `'linked'` (the owner's own row, never deleted by this application) or `'generated'` (created by the settlement, removed by its reversal). Non-null exactly when `transaction_id` is — and unforgeable; see §19 |
 | `paid_on` | `DATE` | nullable | |
 | — | | | `UNIQUE (bill_id, due_date)` — makes generation idempotent; status-consistency `CHECK`s and the FK to `transactions` detailed in §13 |
 
@@ -1358,3 +1364,173 @@ would stack them forever.
 The four requirements listed above are unchanged and still unmet as a whole — in particular,
 nothing yet decides *when* an adjustment is written or how a reconciliation is recorded and
 audited.
+
+---
+
+## 19. Bill payment provenance (Phase 8 CP1)
+
+Through Phase 7 CP7, an occurrence's `transaction_id` was a *reference and only a reference*: the
+owner picked one of their own transactions and the occurrence pointed at it. Phase 8 CP1 keeps
+that case exactly as it was and adds a second one â€” a transaction this application **creates** when
+an occurrence is settled â€” which makes "where did this reference come from?" a question the schema
+has to be able to answer.
+
+### The invariant that changed, stated precisely
+
+CP7's rule was *bill tracking creates no ledger activity, ever*. The rule now is narrower, and the
+narrowing is deliberate rather than an erosion:
+
+| Operation | Ledger effect |
+| --- | --- |
+| Generating a `scheduled` occurrence | **None.** An unmet obligation is a projection. |
+| Creating / editing / archiving / unarchiving a **bill** | **None.** Defining an obligation is not an economic event. |
+| `scheduled â†’ skipped`, and back | **None.** Nothing was paid. |
+| `scheduled â†’ paid`, existing transaction linked | **None.** The reference alters nothing about that transaction. |
+| `scheduled â†’ paid`, bill names a usable account | **One `expense` row created**, recorded as `generated`. |
+| `scheduled â†’ paid`, bill names no usable account | **None.** Paid, with no ledger row â€” the CP7 behaviour, unchanged. |
+| `paid â†’ scheduled`, origin `generated` | **That row deleted**, in the same transaction. |
+| `paid â†’ scheduled`, origin `linked` | **None.** The reference is cleared; the transaction is never deleted. |
+
+"A usable account" means the bill's `account_id` is non-null **and** that account is not archived.
+An archived account is a fallback to status-only rather than a refusal: `assert_transaction_refs()`
+would reject a row posted into one, and blocking the settlement over it would leave a person unable
+to record a payment they actually made.
+
+### `bill_occurrences.transaction_origin`
+
+| Column | Type | Nullability | Notes |
+| --- | --- | --- | --- |
+| `transaction_origin` | `public.bill_payment_origin` | nullable | `'linked'` or `'generated'`. Non-null **exactly when** `transaction_id` is (`bill_occurrences_transaction_origin_ck`). |
+
+Provenance is a stored fact rather than a client claim, and it is **unforgeable**:
+`guard_bill_occurrence_transition()` accepts `'generated'` only when the referenced transaction's
+`created_at` equals `now()` â€” `transaction_timestamp()`, fixed for the whole database transaction,
+and the same default `transactions.created_at` takes. So the label holds only for a row inserted by
+the very transaction performing the update. `authenticated` has no grant on
+`transactions.created_at` on INSERT *or* UPDATE, so there is no statement available to that role
+that could manufacture a qualifying row.
+
+The consequence worth stating plainly: **a transaction the owner wrote by hand can only ever be
+marked `linked`, and a `linked` transaction is never deleted by any path.** That is a structural
+property, not an application rule.
+
+Existing rows were backfilled as `'linked'` by the migration, which is both correct (nothing could
+generate one before it) and the conservative direction.
+
+### The two settlement functions
+
+`public.settle_bill_occurrence(p_occurrence_id, p_paid_on, p_transaction_id, p_generated_transaction_id)`
+and `public.unsettle_bill_occurrence(p_occurrence_id)`. Both are `SECURITY INVOKER` with
+`search_path = ''`, both derive the owner from `auth.uid()`, and neither takes an owner, an
+account, a category, a merchant, an amount or a kind â€” every fact about the ledger row they may
+write is read from the occurrence and its bill. They exist because the status change and the
+ledger row must commit together: PostgREST issues one statement per request in its own
+transaction, so two calls could leave a paid occurrence with a phantom reference or an orphan
+expense.
+
+The generated row is an ordinary expense in every respect:
+
+| Field | Source |
+| --- | --- |
+| `amount_cents` | negated **occurrence** amount â€” never the parent bill's current amount (Â§13) |
+| `account_id` | the bill's account |
+| `category_id` | the bill's category **when it is an active expense category**, otherwise null |
+| `date` | `paid_on` |
+| `merchant` | the bill's name, verbatim |
+| `kind` | the literal `'expense'` |
+| `movement_id` | null â€” an ordinary row, reachable from the ordinary transaction surface |
+
+The category rule is the one asymmetry: a bill's category kind is deliberately unconstrained (Â§13,
+`assert_bill_refs()`), while an expense transaction's is not. When the bill's category cannot
+legally label an expense the row is created uncategorized rather than the settlement being refused
+â€” an uncategorized expense is legal, visible and one edit from correct, while a refusal is a dead
+end.
+
+### Idempotency, in three layers
+
+1. **An already-`paid` occurrence is a no-op that reports success**, checked before anything is
+   inserted. This is the layer that fires for a retry after a lost response, a double-clicked
+   button, or a replayed request â€” and it is what makes "marking paid twice never creates a second
+   transaction" true regardless of what the second submission carries. It also means correcting a
+   paid date is unmark-then-mark-again rather than a second mark.
+2. **`p_generated_transaction_id` is a client-minted UUID** used verbatim as the new row's `id`, so
+   a torn retry that somehow reached the INSERT collides with itself on the primary key.
+3. **The settling UPDATE carries `status = 'scheduled'` in its own `WHERE`** and the row count is
+   checked, so two simultaneous requests cannot both settle one occurrence â€” the second matches
+   zero rows and rolls its own inserted transaction back with it.
+
+### Verification
+
+`supabase/tests/database/200-bill-payment-ledger.sql` (44 assertions) and
+`tests/mutations/bill-occurrences.test.ts` (29 tests, including a block that reads every balance,
+total, cash-flow figure, net worth and snapshot back before, during and after a generated payment).
+
+---
+
+## 20. Monthly plans (Phase 8 CP2)
+
+`public.monthly_plans` stores one figure â€” what the owner **expects** to earn in a given month â€” so
+`/budgets` can start from income rather than from a list of spending limits.
+
+| Column | Type | Nullability | Notes |
+| --- | --- | --- | --- |
+| `id` | `UUID` | NOT NULL, PK | `gen_random_uuid()` default; client-minted on insert, as every other create surface here |
+| `user_id` | `UUID` | NOT NULL | FK â†’ `profiles(id)` `ON DELETE CASCADE` |
+| `period` | `TEXT` | NOT NULL | `'YYYY-MM'`, same `CHECK` as `budgets.period` |
+| `expected_income_cents` | `BIGINT` | NOT NULL | `>= 0` â€” a magnitude; an expectation has no direction |
+| â€” | | | `UNIQUE (user_id, period)` â€” the natural key, one target per month |
+| â€” | | | `UNIQUE (id, user_id)` â€” the composite shape every table here carries; nothing references it today |
+
+No `created_at`, matching `budgets` and `categories`: nothing orders these rows by entry time.
+
+### Why not a `budgets` row
+
+Four independent reasons, any one of which is sufficient:
+
+1. `assert_budget_category_active_expense()` refuses a budget whose category is not an active
+   *expense* category. Storing income there means weakening that trigger or inventing a sentinel
+   category.
+2. Every consumer of `getBudgets()` treats a row as a spending limit â€” `budgetStatus()` compares it
+   against `spendingByCategory()`, `/budgets` renders a utilisation meter, and the dashboard sums
+   them. An income row would appear as a permanently 0%-used expense budget.
+3. A budget is per *category*; expected income is per *month*. Forcing a category onto it invents a
+   dimension the concept does not have, and `(user_id, category_id, period)` would then permit
+   several contradictory targets for one month.
+4. "Total planned expense budgets" â€” the figure the whole summary is built around â€” would have to
+   start excluding one magic row.
+
+### What it is not
+
+- **Not income.** Actual income stays `monthlyIncome()` over `kind = 'income'` transactions.
+  Nothing in `lib/finance/transactions.ts` reads a plan.
+- **Not a balance.** `private.write_net_worth_snapshot` sums accounts and transactions; the writer
+  role holds no grant on this table at all (`090-privileges.sql` asserts it), so an expected figure
+  cannot reach net worth even by accident.
+- **Not referenced by anything.** No foreign key in this schema points at `monthly_plans`, and it
+  points only at `profiles` â€” proven directly in `210-monthly-plans.sql`.
+
+### "Not set" is a state, and it is not zero
+
+A month with no plan has **no row**, and `getMonthlyPlan()` returns `undefined` rather than a
+zeroed plan. Zero expected income makes every planned expense unallocated, which is a real answer;
+"not set" is the absence of one, rendered as "â€”". The `DELETE` grant exists so a person can return
+to it â€” without one there would be no way back.
+
+### The summary the page renders
+
+`monthlyPlanSummary()` (`lib/finance/planning.ts`) is pure and takes the plan, the month's budgets,
+the transactions and the period. It **calls** `monthlyIncome`, `monthlySpending` and
+`monthlyCashFlow` rather than reimplementing them, so a plan can never disagree with the dashboard
+about what a month earned:
+
+```
+unallocated = expectedIncome âˆ’ Î£(budget.limitCents)      (undefined when no plan is set)
+```
+
+Negative unallocated is a real, useful state â€” the budgets add up to more than the month expects to
+earn â€” and is never clamped.
+
+### Verification
+
+`supabase/tests/database/210-monthly-plans.sql` (25 assertions), `lib/finance/planning.test.ts`,
+`lib/validation/monthly-plans.test.ts`, and `tests/mutations/monthly-plans.test.ts` (17 tests).

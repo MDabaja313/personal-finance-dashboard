@@ -16,6 +16,7 @@ import {
 import type { FormAction } from "@/lib/actions/types";
 import type { CalendarDate } from "@/lib/types";
 import { MOVEMENT_KINDS, type MovementKind } from "@/lib/types/enums";
+import { optionItems, selectItems } from "@/lib/ui/select-items";
 
 /**
  * The transfer / credit-card-payment create and edit form.
@@ -200,6 +201,17 @@ export function MovementForm({
 
   const labels = ACCOUNT_LABELS[kind];
 
+  // Base UI resolves a Select's trigger text from the Root's `items` map and
+  // falls back to `String(value)` without one — a raw UUID for both account
+  // pickers, and the wire label for the kind. The submitted values are
+  // unchanged; see `lib/ui/select-items.ts`.
+  const kindLabels = useMemo(
+    () => selectItems(MOVEMENT_KINDS.map((option) => ({ value: option, label: KIND_LABELS[option] }))),
+    []
+  );
+  const sourceLabels = useMemo(() => optionItems(accounts), [accounts]);
+  const destinationLabels = useMemo(() => optionItems(destinationOptions), [destinationOptions]);
+
   // A movement needs two different accounts to exist at all, and a card payment
   // needs a credit account to aim at. Both are "there is nothing to submit",
   // not "the submission is wrong", so the button is disabled rather than the
@@ -222,6 +234,7 @@ export function MovementForm({
       <Field id={kindId} label="Type" errors={errorsFor("kind")}>
         <Select
           name="kind"
+          items={kindLabels}
           value={kind}
           onValueChange={(value) => changeKind(value as MovementKind)}
           disabled={pending}
@@ -247,6 +260,7 @@ export function MovementForm({
         ) : (
           <Select
             name="fromAccountId"
+            items={sourceLabels}
             value={fromAccountId}
             onValueChange={(value) => setFromAccountId(String(value))}
             disabled={pending}
@@ -274,6 +288,7 @@ export function MovementForm({
           </p>
         ) : (
           <Select
+            items={destinationLabels}
             value={toAccountId}
             onValueChange={(value) => setToAccountId(String(value))}
             disabled={pending}

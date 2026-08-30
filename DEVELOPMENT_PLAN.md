@@ -1001,3 +1001,110 @@ snapshot stale but never wrong. CP8A made that condition **visible** (`snapshotH
 dashboard/analytics notice) without changing when it fires or what it means; deciding whether
 `net_worth_snapshots`' `CHECK (assets_cents >= 0 AND liabilities_cents >= 0)` should ever accept a
 negative aggregate is still future work, not CP8A's or CP8B's to resolve.
+
+---
+
+## Phase 8 â€” Monthly planning & the billâ†’ledger bridge ðŸŸ¡ implemented, not merged
+
+Branch `feature/monthly-planning-and-bill-ledger`. Two additive migrations, **neither applied to
+the hosted project**. No earlier migration edited.
+
+| Migration | Adds |
+| --- | --- |
+| `20260902120001_bill_payment_ledger.sql` | `public.bill_payment_origin` enum; `bill_occurrences.transaction_origin`; its biconditional `CHECK`; one column on the existing UPDATE grant; a replaced `guard_bill_occurrence_transition()` with a provenance rule; `public.settle_bill_occurrence` and `public.unsettle_bill_occurrence` (both `SECURITY INVOKER`) |
+| `20260902120002_monthly_plans.sql` | `public.monthly_plans`, RLS ENABLE+FORCE, four operation-specific policies, column-scoped grants |
+
+### CP1 â€” a paid bill occurrence may become a real transaction
+
+**The invariant that changed, and it is the only one.** Phase 7 CP7 stated *bill tracking creates
+no ledger activity, ever*. That is now:
+
+> A **scheduled** occurrence writes nothing. A **skipped** one writes nothing. Creating, editing,
+> archiving or unarchiving a **bill** writes nothing. Only `scheduled â†’ paid` may write a ledger
+> row, and only `paid â†’ scheduled` may remove one.
+
+Marking an occurrence paid produces exactly one of four outcomes, decided **in SQL** from stored
+state and never inferred by the application:
+
+| Condition | Outcome |
+| --- | --- |
+| already `paid` | no-op, reports success â€” the idempotency guarantee |
+| a transaction was linked | linked, origin `'linked'`; nothing created, nothing about it altered |
+| the bill names an account that is not archived | one ordinary `expense` created, origin `'generated'` |
+| otherwise | paid with no ledger row â€” CP7's behaviour, byte for byte |
+
+The generated row takes the **occurrence's own** amount (never the parent bill's current one), the
+bill's account, the bill's category *when that category is an active expense category*, `paid_on`
+as its date, and the bill's name as its merchant. It is negative in storage, counts toward monthly
+spending and its category's budget, carries no movement, and is deletable/editable under the
+ordinary rules once no longer referenced.
+
+**Provenance is the load-bearing design decision.** Unmarking must be able to delete a generated
+row and must never delete a hand-written one, so "which is this?" cannot be a claim the caller
+makes. `guard_bill_occurrence_transition()` accepts `'generated'` only when the referenced
+transaction's `created_at` equals `now()` â€” true only for a row inserted by the very transaction
+performing the update â€” and `authenticated` holds no grant on `transactions.created_at` on INSERT
+*or* UPDATE. A pre-existing transaction therefore **cannot** be relabelled, which makes "a manually
+linked transaction is never silently deleted" structural rather than an application rule.
+
+**Atomicity** forces the two RPCs: PostgREST issues one statement per request in its own
+transaction, so an INSERT into `transactions` and an UPDATE of `bill_occurrences` cannot be one
+commit from two calls. Same argument as CP4's movement RPCs and CP7's bill RPCs, same resolution â€”
+`SECURITY INVOKER`, caller's privileges, caller's RLS.
+
+**Three idempotency layers**, in the order they fire: the already-paid short circuit (checked
+before any insert â€” this is the one that catches a double click or a lost response), a
+client-minted `generatedTransactionId` used verbatim as the row's `id`, and `status = 'scheduled'`
+in the settling UPDATE's own `WHERE` with a row-count check for the genuinely-simultaneous case.
+
+**Route revalidation and the snapshot follow the ledger, not the operation.** A settlement that
+created or removed a row revalidates `/bills`, `/dashboard`, `/transactions`, `/accounts`,
+`/budgets`, `/analytics` and refreshes the current-month net-worth snapshot; every other occurrence
+write still revalidates `/bills` + `/dashboard` only and refreshes nothing. Which one applies is
+the RPC's own `ledger_changed`.
+
+### CP2 â€” monthly planning starts with income
+
+`public.monthly_plans` â€” one row per owner per month, holding `expected_income_cents` â€” plus a
+Monthly Plan summary at the top of `/budgets`: expected income, planned expenses (the sum of the
+month's category budget limits), unallocated (`expected âˆ’ planned`), actual income, actual
+spending, and actual cash flow.
+
+Deliberately **not** a `budgets` row, for four independent reasons set out in
+[docs/database-schema.md Â§20](docs/database-schema.md#20-monthly-plans-phase-8-cp2). Actual income
+stays derived from `kind = 'income'` transactions; `lib/finance/planning.ts` **calls**
+`monthlyIncome`/`monthlySpending`/`monthlyCashFlow` rather than reimplementing them, so the plan
+card and the dashboard cannot disagree about what a month earned. Nothing references
+`monthly_plans`, `finance_snapshot_writer` holds no grant on it, and "not set" (no row) is a
+distinct state from zero â€” the `DELETE` grant exists so a person can return to it.
+
+Current month only, matching the existing budget UX; `period` is INSERT-only at the grant layer and
+is derived by the Server Action from the owner's own `profiles.timezone`, never read from a form.
+
+### CP3 â€” raw UUIDs in Select controls
+
+A real rendering bug, not a refactor. `@base-ui/react`'s `<Select.Value>` resolves its label from
+the Root's `items` prop and falls back to `String(value)` without one, so every UUID-backed
+selector rendered a raw id in its closed trigger (`8b4a18d2-4fc7-4be5-â€¦`) and every enum-backed one
+rendered its wire label (`expense`, `credit_card_payment`). The options list looked correct because
+the popup renders `<Select.Item>` children directly, which is why it survived review.
+
+All 16 selectors now pass an `items` map built by `lib/ui/select-items.ts`. **No `value` changed** â€”
+every `<Select.Item value>` and every submitted `FormData` entry is still the id or enum label the
+database expects. `lib/ui/select-items.test.ts` unit-tests the helper and scans `components/**` to
+assert every `<Select` has an `items` prop, no `<SelectItem value>` is bound to a display name, and
+every file rendering a Select imports the helper.
+
+### Verification
+
+`lint`, `next typegen`, `typecheck`, `test` (722 offline), `db:test` (869 pgTAP assertions across
+23 files, including the new `200-bill-payment-ledger.sql` and `210-monthly-plans.sql`),
+`test:parity` (75), `test:mutations` (236, including 29 bill-occurrence and 17 monthly-plan),
+`auth:verify`, and `build`.
+
+### Not done, deliberately
+
+Not merged, not pushed, not deployed. The two migrations are **pending** against the hosted project
+and must be applied with `npx supabase db push` as part of a deployment, after the usual
+`migration list` / `--dry-run` read-only check (`docs/operations.md Â§5`). The CP5 snapshot
+sign-guard question is untouched and remains future work.

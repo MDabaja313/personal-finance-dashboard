@@ -30,8 +30,21 @@ import { zNotFuture, zOptionalUuid, zUuid } from "@/lib/validation/primitives";
 export interface BillOccurrencePaidInput {
   readonly id: string;
   readonly paidOn: CalendarDate;
-  /** Absent when the payment was recorded manually, with no transaction to link. */
+  /** Present when the owner picked one of their own existing transactions to link. */
   readonly transactionId?: string;
+  /**
+   * The idempotency key the auto-created expense will take as its row `id`,
+   * when one is created at all.
+   *
+   * Always minted by the form — one per mounted form, exactly as every other
+   * create surface here does it — and required by the schema even on the
+   * link-an-existing-transaction path, where it goes unused. Requiring it
+   * unconditionally is what keeps the form from having to predict, in the
+   * browser, whether the server will end up generating a row: that decision
+   * depends on the bill's account and on whether it is archived, both of which
+   * are the server's to know.
+   */
+  readonly generatedTransactionId: string;
 }
 
 /**
@@ -49,18 +62,31 @@ export interface BillOccurrencePaidInput {
  * real — `due_date` and `paidOn` are independent facts, and neither is
  * constrained against the other anywhere in this application.
  *
- * `transactionId` is optional in the strongest sense: marking a bill paid is
- * **not** a ledger event. It creates no transaction, moves no balance, and —
- * when a transaction *is* linked — alters nothing whatsoever about that
- * transaction. The link records "this existing payment settled this
- * obligation" and nothing more. Its amount is free to differ from the bill's:
- * a bill is an expected obligation and a transaction is what actually
- * happened.
+ * `transactionId` is optional, and supplying it is the owner saying "this
+ * payment is already in my ledger, point at it". When it is present nothing
+ * whatsoever about that transaction is altered — not its amount, category,
+ * account or date — and nothing new is created. Its amount is free to differ
+ * from the bill's: a bill is an expected obligation and a transaction is what
+ * actually happened.
  *
  * No transaction *kind* is constrained here, deliberately. The approved design
  * imposes none — `bill_occurrences_transaction_fk` requires only that the row
  * belong to the same owner — and inventing one would refuse legitimate
  * records.
+ *
+ * ## What changed in Phase 8 CP1
+ *
+ * When `transactionId` is **absent**, marking paid is no longer guaranteed to
+ * be status-only. If the bill names an account that is not archived,
+ * `public.settle_bill_occurrence` creates one ordinary expense — the
+ * occurrence's own amount, the bill's account, the bill's category when it can
+ * legally label an expense, dated `paidOn`, merchant taken from the bill's name
+ * — and records it as `generated`. When the bill names no usable account the
+ * behaviour is exactly what it always was: paid, with no ledger row at all.
+ *
+ * None of that is decided here. This layer cannot read a bill, so it cannot
+ * know which of the two will happen; it only carries the key the generated row
+ * would take.
  */
 export function makeBillOccurrencePaidSchema(today: CalendarDate) {
   return z
@@ -68,12 +94,14 @@ export function makeBillOccurrencePaidSchema(today: CalendarDate) {
       id: zUuid,
       paidOn: zNotFuture(today),
       transactionId: zOptionalUuid,
+      generatedTransactionId: zUuid,
     })
     .transform(
       (value): BillOccurrencePaidInput => ({
         id: value.id,
         paidOn: value.paidOn,
         transactionId: value.transactionId,
+        generatedTransactionId: value.generatedTransactionId,
       })
     );
 }

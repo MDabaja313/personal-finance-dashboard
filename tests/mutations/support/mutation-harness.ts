@@ -96,20 +96,49 @@ export const BUDGET_ROUTES = ["/budgets", "/dashboard"];
 export const GOAL_ROUTES = ["/goals", "/dashboard"];
 
 /**
- * The routes a bill or bill-occurrence write must invalidate — the same
- * two-route shape as budgets and goals, and for a stronger reason than
- * either.
+ * The routes a bill write, or an occurrence write with **no ledger effect**,
+ * must invalidate — the same two-route shape as budgets and goals.
  *
- * Bill tracking creates **no ledger activity at all**: no transaction, no
- * movement, no balance change, no category rollup. So `/accounts`,
- * `/transactions`, `/budgets` and `/analytics` cannot render a figure any
- * bill write could have moved, and `/goals` reads a different domain
- * entirely. `/bills` renders the management surface and `/dashboard` renders
- * the upcoming-bill projection; those are the whole list. Listed as an exact
- * array so adding a route out of habit fails the assertion rather than
- * passing quietly.
+ * Defining a bill creates no ledger activity at all, and neither does
+ * skipping, unskipping, linking an existing transaction, unlinking one, or
+ * marking a bill paid when it names no usable account. So `/accounts`,
+ * `/transactions`, `/budgets` and `/analytics` cannot render a figure any of
+ * those moved, and `/goals` reads a different domain entirely. `/bills`
+ * renders the management surface and `/dashboard` renders the upcoming-bill
+ * projection; those are the whole list. Listed as an exact array so adding a
+ * route out of habit fails the assertion rather than passing quietly.
  */
 export const BILL_ROUTES = ["/bills", "/dashboard"];
+
+/**
+ * The routes a bill-occurrence write that **did** move the ledger must
+ * invalidate — Phase 8 CP1's addition.
+ *
+ * A generated payment is an ordinary expense: it moves an account balance, the
+ * month's spending and cash flow, that category's budget utilisation, and four
+ * charts. So this is `TRANSACTION_ROUTES` plus `/bills`, because the occurrence
+ * changed too. Which of the two lists an action uses is the database's answer
+ * (`ledger_changed`), never an inference from the shape of the submission.
+ */
+export const LEDGER_BILL_ROUTES = [
+  "/bills",
+  "/dashboard",
+  "/transactions",
+  "/accounts",
+  "/budgets",
+  "/analytics",
+];
+
+/**
+ * The one route a monthly-plan write must invalidate.
+ *
+ * Narrower than every other list here, and deliberately: expected income is
+ * planning context for the Monthly Plan summary and appears nowhere else. It is
+ * not a transaction, it moves no balance, it reaches no chart, and — unlike a
+ * budget, whose utilisation the dashboard renders — nothing outside `/budgets`
+ * reads it at all. `/dashboard` is absent on purpose.
+ */
+export const MONTHLY_PLAN_ROUTES = ["/budgets"];
 
 /**
  * The calendar day `delta` days from `date`, as 'YYYY-MM-DD'.

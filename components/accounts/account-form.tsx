@@ -15,6 +15,7 @@ import type { ActionState, FormAction } from "@/lib/actions/types";
 import { formatCentsForInput } from "@/lib/format/currency";
 import type { Account, AccountType, Cents } from "@/lib/types";
 import { allowsCreditLimit, allowsInterestRate } from "@/lib/types/enums";
+import { selectItems } from "@/lib/ui/select-items";
 
 /**
  * The account create/edit form.
@@ -55,6 +56,16 @@ const ACCOUNT_TYPE_OPTIONS: { value: AccountType; label: string }[] = [
 ];
 
 const ACCOUNT_TYPE_LABEL = new Map(ACCOUNT_TYPE_OPTIONS.map((option) => [option.value, option.label]));
+
+/**
+ * The same labels, as the `items` map Base UI's `<Select.Value>` reads.
+ *
+ * Without it the trigger renders `String(value)` — the wire label `checking`
+ * rather than `Checking`, and on the UUID-backed selectors elsewhere in this
+ * application a raw id. Module scope rather than a `useMemo`: the option list
+ * is a constant. See `lib/ui/select-items.ts`.
+ */
+const ACCOUNT_TYPE_ITEMS = selectItems(ACCOUNT_TYPE_OPTIONS);
 
 /**
  * Cents → the decimal string a money input should start with, or `""` when
@@ -155,6 +166,7 @@ export function AccountForm({ action, account, onSuccess, onCancel }: AccountFor
         <Field id={typeId} label="Type" errors={errorsFor("type")}>
           <Select
             name="type"
+            items={ACCOUNT_TYPE_ITEMS}
             value={type}
             onValueChange={(value) => setType(value as AccountType)}
             disabled={pending}

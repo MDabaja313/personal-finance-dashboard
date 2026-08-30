@@ -44,8 +44,37 @@ export interface BillOccurrenceRow {
   /** What *this* instance was due for — never the parent's current amount. */
   readonly amountCents: Cents;
   readonly paidOn?: CalendarDate;
-  /** A short human description of the linked transaction, when one is linked. */
+  /** A short human description of the referenced transaction, when there is one. */
   readonly transactionLabel?: string;
+  /**
+   * True when the referenced transaction was created by settling this
+   * occurrence, so unmarking it will remove that transaction too.
+   *
+   * A boolean rather than the stored `BillPaymentOrigin`, because the history
+   * row asks exactly one question of it: does the Unmark control also delete a
+   * ledger row? Absent origin and `linked` both answer "no" and are the same
+   * answer here, while remaining different facts in the database.
+   */
+  readonly paymentWasGenerated?: boolean;
+}
+
+/**
+ * What marking one occurrence paid will create, when nothing is linked instead.
+ *
+ * Resolved on the server, by the same two rules `public.settle_bill_occurrence`
+ * applies: the bill must name an account that is not archived, and the bill's
+ * category is carried only when it is an active *expense* category (a bill's
+ * category kind is deliberately unconstrained, but an expense transaction's is
+ * not). `undefined` on the props means no ledger row will be created at all.
+ *
+ * It exists so the form can state the effect *before* the button is pressed
+ * rather than reporting it afterwards. It is never used to decide anything —
+ * the database decides — only to describe.
+ */
+export interface GeneratedPaymentPreview {
+  readonly accountName: string;
+  /** Absent when the bill's category cannot legally label an expense. */
+  readonly categoryName?: string;
 }
 
 /**

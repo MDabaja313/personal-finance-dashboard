@@ -14,6 +14,7 @@ import {
 import type { ActionState, FormAction } from "@/lib/actions/types";
 import type { CalendarDate } from "@/lib/types";
 import { CONTRIBUTION_ACTIONS, type ContributionAction } from "@/lib/types/enums";
+import { selectItems } from "@/lib/ui/select-items";
 
 /**
  * "Add funds" / "Withdraw / correction" — log progress toward a goal without
@@ -33,6 +34,15 @@ const ACTION_LABEL: Record<ContributionAction, string> = {
   add: "Add funds",
   withdraw: "Withdraw / correction",
 };
+
+/**
+ * The same labels, as the `items` map Base UI's `<Select.Value>` reads —
+ * without it the trigger renders the wire label (`withdraw`) rather than the
+ * display one. See `lib/ui/select-items.ts`.
+ */
+const ACTION_ITEMS = selectItems(
+  CONTRIBUTION_ACTIONS.map((value) => ({ value, label: ACTION_LABEL[value] }))
+);
 
 export function ContributionForm({
   action,
@@ -80,6 +90,7 @@ export function ContributionForm({
         </label>
         <Select
           name="action"
+          items={ACTION_ITEMS}
           value={contributionAction}
           onValueChange={(value) => setContributionAction(value as ContributionAction)}
           disabled={pending}

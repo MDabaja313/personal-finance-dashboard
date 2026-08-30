@@ -7,6 +7,7 @@ import {
   ACCOUNT_TYPES,
   BILL_FREQUENCIES,
   BILL_OCCURRENCE_STATUSES,
+  BILL_PAYMENT_ORIGINS,
   CATEGORY_KINDS,
   MOVEMENT_KINDS,
   ORDINARY_TRANSACTION_KINDS,
@@ -91,6 +92,7 @@ describe("DB enum mirrors", () => {
     ["movement_kind", MOVEMENT_KINDS],
     ["bill_frequency", BILL_FREQUENCIES],
     ["bill_occurrence_status", BILL_OCCURRENCE_STATUSES],
+    ["bill_payment_origin", BILL_PAYMENT_ORIGINS],
   ])("%s matches the migrations exactly, in declaration order", (name, labels) => {
     expect([...labels]).toEqual(enumLabels(name));
   });
@@ -109,6 +111,17 @@ describe("DB enum mirrors", () => {
     expect(enumLabels("transaction_kind")).toContain("adjustment");
     expect(enumLabels("transaction_kind").at(-1)).toBe("adjustment");
     expect(allSql).toMatch(/alter type public\.transaction_kind\s+add value\s+'adjustment'/i);
+  });
+
+  it("has no writable subset for bill_payment_origin — the empty set is the point", () => {
+    // Every other enum here has a companion array naming the labels a person
+    // may write (`ORDINARY_TRANSACTION_KINDS`, `BILL_OCCURRENCE_OUTCOMES`).
+    // This one does not, and must not: `public.settle_bill_occurrence` chooses
+    // the value in SQL, and `guard_bill_occurrence_transition()` refuses
+    // 'generated' for any transaction that did not come into existence in the
+    // same database transaction. A writable-subset array would be the first
+    // step toward a form field for it.
+    expect([...BILL_PAYMENT_ORIGINS]).toEqual(["linked", "generated"]);
   });
 
   it("keeps movement kinds a strict subset of transaction kinds", () => {
