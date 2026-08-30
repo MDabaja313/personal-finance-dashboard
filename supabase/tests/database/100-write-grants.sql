@@ -86,8 +86,20 @@
 -- foreign rows, user_id reassignment, anon) is 110-write-rls.sql, and
 -- for movements it is 140-movement-writes.sql; the invariant triggers
 -- are 120/130 and the movement invariant is 020.
+--
+-- Phase 8 CP1 widens exactly one existing grant and adds no table:
+--
+--   * bill_occurrences.transaction_origin joins its three-column UPDATE grant.
+--     It has to: public.settle_bill_occurrence is SECURITY INVOKER and writes
+--     as the caller. What stops a hand-crafted request from claiming
+--     'generated' over a hand-written transaction is not the grant but
+--     guard_bill_occurrence_transition()'s provenance rule -- see
+--     200-bill-payment-ledger.sql, which proves it.
+--
+-- `amount_cents` and `due_date` are still absent from that grant, which is the
+-- part of CP7 that has not moved and must not.
 begin;
-select plan(102);
+select plan(104);
 
 -- Every user-financial table. The last assertion in this file proves
 -- this list is exactly `public`'s table set, so it cannot silently fall
@@ -137,7 +149,8 @@ insert into updatable_tables (name) values
 -- CP2 accounts/categories treatment (soft-delete via `archived_at`),
 -- never a DELETE grant.
 create temporary table deletable_tables (name text primary key) on commit drop;
-insert into deletable_tables (name) values ('transactions'), ('movements'), ('budgets');
+insert into deletable_tables (name) values
+  ('transactions'), ('movements'), ('budgets');
 
 -- The behavioral section below reads these lists while running *as*
 -- `authenticated`/`anon`, so those roles need to see them. Scoped to
@@ -465,12 +478,18 @@ select is(
   'authenticated may UPDATE exactly the 7 intended bills columns (id/user_id/created_at excluded)'
 );
 
--- bill_occurrences. The narrowest grant in this schema, and the only
--- UPDATE-without-INSERT one. `amount_cents` and `due_date` are absent
--- and that is the whole point: they are the historical facts
--- docs/database-schema.md 13 protects -- what this instance was due for,
--- and when -- and neither the owner nor the scheduler may rewrite them.
--- `string_agg` over an empty set is NULL, which is the INSERT assertion.
+-- bill_occurrences. Still the only UPDATE-without-INSERT grant in this
+-- schema. `amount_cents` and `due_date` are absent and that is the whole
+-- point: they are the historical facts docs/database-schema.md 13
+-- protects -- what this instance was due for, and when -- and neither the
+-- owner nor the scheduler may rewrite them. `string_agg` over an empty
+-- set is NULL, which is the INSERT assertion.
+--
+-- Phase 8 CP1 adds `transaction_origin` to the UPDATE list, and only
+-- that. It has to be there because public.settle_bill_occurrence is
+-- SECURITY INVOKER and therefore writes as the caller. Forgery is
+-- prevented by guard_bill_occurrence_transition(), not by withholding
+-- the column -- see 200-bill-payment-ledger.sql.
 select is(
   (select string_agg(a.attname::text, ',' order by a.attname)
    from pg_attribute a
@@ -486,8 +505,8 @@ select is(
    where a.attrelid = 'public.bill_occurrences'::regclass
      and a.attnum > 0 and not a.attisdropped
      and has_column_privilege('authenticated', a.attrelid, a.attnum, 'update')),
-  'paid_on,status,transaction_id',
-  'authenticated may UPDATE exactly the 3 state-machine columns of bill_occurrences'
+  'paid_on,status,transaction_id,transaction_origin',
+  'authenticated may UPDATE exactly the 4 state-machine columns of bill_occurrences'
 );
 
 -- ============================================================
@@ -792,7 +811,6 @@ select throws_ok(
   '42501', null,
   'authenticated cannot UPDATE bill_occurrences.created_at'
 );
-
 -- ============================================================
 -- Behavioral: anon cannot write either
 -- ============================================================
@@ -905,6 +923,21 @@ select throws_ok(
 select throws_ok(
   $$ select public.maintain_bill_schedule('18000000-0000-4000-8000-0000000000d9', true) $$,
   '42501', null, 'anon EXECUTE of maintain_bill_schedule is denied at the GRANT layer -- the one CP7 definer'
+);
+
+-- Phase 8 CP1's two new RPCs, for the same role. They are the first
+-- functions an anonymous caller reaching them could use to write the
+-- *ledger*, so their refusal at the privilege layer -- before a single
+-- argument is examined -- is worth stating.
+select throws_ok(
+  $$ select public.settle_bill_occurrence(
+       '18000000-0000-4000-8000-0000000000e1', '2026-01-01', null,
+       '18000000-0000-4000-8000-0000000000e2') $$,
+  '42501', null, 'anon EXECUTE of settle_bill_occurrence is denied at the GRANT layer'
+);
+select throws_ok(
+  $$ select public.unsettle_bill_occurrence('18000000-0000-4000-8000-0000000000e1') $$,
+  '42501', null, 'anon EXECUTE of unsettle_bill_occurrence is denied at the GRANT layer'
 );
 
 reset role;

@@ -10,6 +10,7 @@ import type {
   BillMutationActions,
   BillOccurrenceRow,
   BillReferenceOption,
+  GeneratedPaymentPreview,
   TransactionOption,
 } from "@/components/bills/types";
 import { Button } from "@/components/ui/button";
@@ -55,6 +56,7 @@ export function BillCardActions({
   categories,
   accounts,
   transactions,
+  generatedPayment,
   today,
   actions,
 }: {
@@ -66,6 +68,8 @@ export function BillCardActions({
   categories: readonly BillReferenceOption[];
   accounts: readonly BillReferenceOption[];
   transactions: readonly TransactionOption[];
+  /** What Mark paid will create when nothing is linked. Absent = status only. */
+  generatedPayment?: GeneratedPaymentPreview;
   today: CalendarDate;
   actions: BillMutationActions;
 }) {
@@ -97,6 +101,7 @@ export function BillCardActions({
           amountCents={nextOccurrence.amountCents}
           today={today}
           transactions={transactions}
+          generatedPayment={generatedPayment}
           onSuccess={close}
           onCancel={close}
         />

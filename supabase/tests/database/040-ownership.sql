@@ -103,8 +103,14 @@ set constraints all deferred;
 
 -- bill_occurrences(transaction_id, user_id) -> transactions
 savepoint s7;
-insert into public.bill_occurrences (id, user_id, bill_id, due_date, status, amount_cents, transaction_id, paid_on) values
-  ('12000000-0000-4000-8000-000000010007', '12000000-0000-4000-8000-000000000002', '12000000-0000-4000-8000-0000000000b2', '2026-01-01', 'paid', 100, '12000000-0000-4000-8000-000000000f01', '2026-01-01');
+-- `transaction_origin` is required alongside the reference as of Phase 8 CP1
+-- (`bill_occurrences_transaction_origin_ck` makes the two the same fact). It
+-- is supplied here purely so the row is *well-formed enough to reach the
+-- composite FK* -- the assertion below is still about ownership, and the row
+-- must fail on 23503 rather than on a CHECK, or it would pass for the wrong
+-- reason.
+insert into public.bill_occurrences (id, user_id, bill_id, due_date, status, amount_cents, transaction_id, transaction_origin, paid_on) values
+  ('12000000-0000-4000-8000-000000010007', '12000000-0000-4000-8000-000000000002', '12000000-0000-4000-8000-0000000000b2', '2026-01-01', 'paid', 100, '12000000-0000-4000-8000-000000000f01', 'linked', '2026-01-01');
 select throws_ok(
   $$ set constraints all immediate $$, '23503', null,
   'a bill occurrence referencing another user''s transaction is rejected'

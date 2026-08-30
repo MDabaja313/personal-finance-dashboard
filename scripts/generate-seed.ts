@@ -303,8 +303,14 @@ for (const bill of mockBills) {
     const occSlug = `${bill.id}-occ-${occ.dueDate}`;
     const txnId = occ.transactionSlug ? idLit(occ.transactionSlug) : "null";
     const paidOn = occ.paidOn ? dateLit(occ.paidOn) : "null";
+    // Every seeded link is 'linked' — a fixture payment is a transaction the
+    // person recorded themselves, which the seeded occurrence merely points
+    // at. 'generated' is reserved for a row `public.settle_bill_occurrence`
+    // wrote, and `bill_occurrences_transaction_origin_ck` requires the column
+    // to be non-null exactly when `transaction_id` is.
+    const origin = occ.transactionSlug ? str("linked") : "null";
     emit(
-      `insert into public.bill_occurrences (id, user_id, bill_id, due_date, status, amount_cents, transaction_id, paid_on) values (${idLit(occSlug)}, '${USER_ID}', ${idLit(bill.id)}, ${dateLit(occ.dueDate)}, ${str(occ.status)}, ${bill.amountCents}, ${nullable(txnId)}, ${nullable(paidOn)});`
+      `insert into public.bill_occurrences (id, user_id, bill_id, due_date, status, amount_cents, transaction_id, transaction_origin, paid_on) values (${idLit(occSlug)}, '${USER_ID}', ${idLit(bill.id)}, ${dateLit(occ.dueDate)}, ${str(occ.status)}, ${bill.amountCents}, ${nullable(txnId)}, ${nullable(origin)}, ${nullable(paidOn)});`
     );
   }
 }

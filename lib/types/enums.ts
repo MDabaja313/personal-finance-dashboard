@@ -35,6 +35,7 @@ import type {
   AccountType,
   BillFrequency,
   BillOccurrenceStatus,
+  BillPaymentOrigin,
   Category,
   Cents,
   TransactionKind,
@@ -319,6 +320,22 @@ export const BILL_OCCURRENCE_STATUSES: readonly BillOccurrenceStatus[] = [
 export type BillOccurrenceOutcome = Extract<BillOccurrenceStatus, "paid" | "skipped">;
 
 export const BILL_OCCURRENCE_OUTCOMES: readonly BillOccurrenceOutcome[] = ["paid", "skipped"];
+
+/**
+ * `public.bill_payment_origin`, in declaration order (Phase 8 CP1).
+ *
+ * The union lives in `lib/types/index.ts` beside the `BillOccurrence` DTO it
+ * belongs to; this is the label set `lib/data/mappers.ts` narrows database text
+ * against.
+ *
+ * Unlike every other list here, **no layer of this application ever writes one
+ * of these labels**. `public.settle_bill_occurrence` chooses the value in SQL,
+ * from a fact the caller cannot influence, and `guard_bill_occurrence_transition()`
+ * refuses `'generated'` for any transaction that did not come into existence in
+ * the same database transaction. So there is no writable-subset array to pair
+ * with this one: the writable subset is empty.
+ */
+export const BILL_PAYMENT_ORIGINS: readonly BillPaymentOrigin[] = ["linked", "generated"];
 
 /** `public.bill_frequency`. */
 export const BILL_FREQUENCIES: readonly BillFrequency[] = ["weekly", "biweekly", "monthly", "yearly"];

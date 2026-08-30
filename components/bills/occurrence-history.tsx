@@ -1,6 +1,6 @@
 "use client";
 
-import { useActionState, useId } from "react";
+import { useActionState, useId, useState } from "react";
 
 import { OccurrenceStatusBadge } from "@/components/bills/occurrence-status-badge";
 import type { BillOccurrenceRow } from "@/components/bills/types";
@@ -27,7 +27,21 @@ import { formatCalendarDate } from "@/lib/format/date";
  *
  * A paid row gets "Unmark paid"; a skipped row gets "Unskip". Both are the
  * same transition back to `scheduled`, and both clear the paid date and the
- * transaction link — the transaction itself is left exactly as it was.
+ * transaction reference.
+ *
+ * What that reference's removal *means* depends on where it came from, and the
+ * row says so rather than leaving it to be discovered:
+ *
+ * - a transaction the owner **linked** is left exactly as it was, and becomes
+ *   deletable again under its ordinary rules;
+ * - a transaction this application **generated** when the bill was marked paid
+ *   is removed alongside the status change.
+ *
+ * `paymentWasGenerated` comes from the occurrence's stored
+ * `transaction_origin`, resolved on the server. A control that may delete a
+ * ledger row must never be rendered from an assumption, so the two cases carry
+ * different words and the generated one gets a confirmation step — the same
+ * treatment every other destructive control in this application has.
  *
  * There is **no Delete control on any occurrence**, and there is no action
  * behind one either: `authenticated` holds no DELETE grant on
@@ -76,7 +90,8 @@ export function OccurrenceHistory({
               )}
               {occurrence.transactionLabel !== undefined && (
                 <p className="truncate text-xs text-muted-foreground">
-                  Linked to {occurrence.transactionLabel}
+                  {occurrence.paymentWasGenerated === true ? "Recorded as" : "Linked to"}{" "}
+                  {occurrence.transactionLabel}
                 </p>
               )}
             </div>
@@ -87,6 +102,7 @@ export function OccurrenceHistory({
                   action={restoreAction}
                   occurrenceId={occurrence.id}
                   label={occurrence.status === "paid" ? "Unmark paid" : "Unskip"}
+                  removesTransaction={occurrence.paymentWasGenerated === true}
                 />
               )}
             </div>
@@ -97,32 +113,71 @@ export function OccurrenceHistory({
   );
 }
 
+/**
+ * Unmark paid / Unskip.
+ *
+ * One submit when nothing but a status moves. Two steps when the payment was
+ * generated, because that submit also deletes a ledger row — the same two-step
+ * shape `TransactionRowActions`' Delete and `AccountCardActions`' reconcile
+ * removal use, and for the identical reason: a destructive effect gets an
+ * explicit second press, and the confirmation says what will be destroyed.
+ */
 function RestoreControl({
   action,
   occurrenceId,
   label,
+  removesTransaction,
 }: {
   action: FormAction;
   occurrenceId: string;
   label: string;
+  removesTransaction: boolean;
 }) {
   const [state, formAction, pending] = useActionState(action, INITIAL_STATE);
+  const [confirming, setConfirming] = useState(false);
   const errorId = useId();
+
+  if (removesTransaction && !confirming) {
+    return (
+      <Button type="button" variant="ghost" size="sm" onClick={() => setConfirming(true)}>
+        {label}
+      </Button>
+    );
+  }
 
   return (
     <>
+      {removesTransaction && (
+        <p className="basis-full text-xs text-muted-foreground">
+          This also removes the transaction recorded for this payment, and its effect on the
+          account balance and this month&rsquo;s spending.
+        </p>
+      )}
+
       <form action={formAction}>
         <input type="hidden" name="id" value={occurrenceId} />
         <Button
           type="submit"
-          variant="ghost"
+          variant={removesTransaction ? "destructive" : "ghost"}
           size="sm"
           disabled={pending}
           aria-describedby={state.formError ? errorId : undefined}
         >
-          {pending ? "Saving…" : label}
+          {pending ? "Saving…" : removesTransaction ? "Confirm" : label}
         </Button>
       </form>
+
+      {removesTransaction && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          onClick={() => setConfirming(false)}
+          disabled={pending}
+        >
+          Cancel
+        </Button>
+      )}
 
       {state.formError !== null && (
         <p id={errorId} role="alert" className="basis-full text-xs text-destructive">

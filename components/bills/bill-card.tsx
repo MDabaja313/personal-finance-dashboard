@@ -5,6 +5,7 @@ import type {
   BillMutationActions,
   BillOccurrenceRow,
   BillReferenceOption,
+  GeneratedPaymentPreview,
   TransactionOption,
 } from "@/components/bills/types";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -51,6 +52,7 @@ export function BillCard({
   categories,
   accounts,
   transactions,
+  generatedPayment,
   today,
   actions,
 }: {
@@ -65,6 +67,8 @@ export function BillCard({
   categories: readonly BillReferenceOption[];
   accounts: readonly BillReferenceOption[];
   transactions: readonly TransactionOption[];
+  /** What Mark paid will create when nothing is linked. Absent = status only. */
+  generatedPayment?: GeneratedPaymentPreview;
   today: CalendarDate;
   actions: BillMutationActions;
 }) {
@@ -92,6 +96,7 @@ export function BillCard({
           categories={categories}
           accounts={accounts}
           transactions={transactions}
+          generatedPayment={generatedPayment}
           today={today}
           actions={actions}
         />

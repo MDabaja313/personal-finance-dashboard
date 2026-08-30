@@ -5,6 +5,7 @@ import { BillCard } from "@/components/bills/bill-card";
 import type {
   BillOccurrenceRow,
   BillReferenceOption,
+  GeneratedPaymentPreview,
   TransactionOption,
 } from "@/components/bills/types";
 import { EmptyState } from "@/components/shared/empty-state";
@@ -47,6 +48,22 @@ import type { CalendarDate, Transaction } from "@/lib/types";
  * bills only, and still sees exactly the same shape. This page reads
  * `getBillsForManagement()` instead, which is the only thing that knows about
  * archived bills and full occurrence history.
+ *
+ * ## The generated-payment preview mirrors the database, and decides nothing
+ *
+ * Phase 8 CP1 lets marking a bill paid create a real expense. Which of the
+ * three outcomes a given Mark paid will produce is decided by
+ * `public.settle_bill_occurrence`, in SQL, from stored state — but a control
+ * that may write a ledger row has to say so *before* it is pressed, so the same
+ * two rules are evaluated here for display: the bill must name an account that
+ * is not archived, and its category is carried only when that category is an
+ * active **expense** category (a bill's category kind is deliberately
+ * unconstrained; an expense transaction's is not). `generatedPayment` is
+ * `undefined` when no row will be created.
+ *
+ * This is a description, never an authority. Nothing branches on it, and if it
+ * ever disagreed with the database the database would win — which is why it is
+ * computed from the same two facts rather than from a third source.
  */
 
 const GROUPS: { key: BillStatusKind; title: string }[] = [
@@ -110,6 +127,31 @@ export default async function BillsPage() {
     .map((account) => ({ id: account.id, name: account.name }))
     .sort((a, b) => a.name.localeCompare(b.name));
 
+  // The two lookups the settlement preview needs, built from the same
+  // predicates `public.settle_bill_occurrence` applies. An archived account
+  // means "no ledger row"; a category that is not an active expense category
+  // means "the row is created uncategorized".
+  const usableAccountName = new Map(
+    accounts.filter((account) => !account.isArchived).map((account) => [account.id, account.name])
+  );
+  const usableCategoryName = new Map(
+    categories
+      .filter((category) => !category.isArchived && category.kind === "expense")
+      .map((category) => [category.id, category.name])
+  );
+
+  /** What a Mark paid on this bill will create, or `undefined` for status only. */
+  const previewFor = (bill: BillManagement): GeneratedPaymentPreview | undefined => {
+    if (bill.accountId === undefined) return undefined;
+    const accountName = usableAccountName.get(bill.accountId);
+    if (accountName === undefined) return undefined;
+    return {
+      accountName,
+      categoryName:
+        bill.categoryId === undefined ? undefined : usableCategoryName.get(bill.categoryId),
+    };
+  };
+
   const actions = {
     update: updateBillAction,
     setArchived: setBillArchivedAction,
@@ -137,6 +179,10 @@ export default async function BillsPage() {
         occurrence.transactionId === undefined
           ? undefined
           : (transactionLabel.get(occurrence.transactionId) ?? "a recorded transaction"),
+      // Straight from the stored `transaction_origin`, never inferred from the
+      // transaction's shape: it is what decides whether Unmark paid also
+      // deletes a ledger row, and the history row must not guess at that.
+      paymentWasGenerated: occurrence.transactionOrigin === "generated",
     }));
 
     // The earliest scheduled occurrence — the one Mark paid and Skip act on.
@@ -165,6 +211,7 @@ export default async function BillsPage() {
       categories: categoryOptions,
       accounts: accountOptions,
       transactions: transactionOptions,
+      generatedPayment: previewFor(bill),
       today,
       actions,
     };

@@ -143,9 +143,16 @@ export async function getUpcomingBills(limit: number): Promise<Bill[]> {
 const BILL_MANAGEMENT_COLUMNS =
   "id, name, amount_cents, frequency, category_id, account_id, anchor_date, is_archived";
 
-/** The full occurrence projection — everything on the `BillOccurrence` DTO. */
+/**
+ * The full occurrence projection — everything on the `BillOccurrence` DTO.
+ *
+ * `transaction_origin` joined the list in Phase 8 CP1. It is not decoration:
+ * the management surface uses it to say whether unmarking a payment will also
+ * remove the transaction it created, and a control that deletes a ledger row
+ * must never be rendered from an assumption.
+ */
 const OCCURRENCE_DETAIL_COLUMNS =
-  "id, bill_id, due_date, status, amount_cents, transaction_id, paid_on";
+  "id, bill_id, due_date, status, amount_cents, transaction_id, transaction_origin, paid_on";
 
 /**
  * A recurring bill as the management surface needs it: the parent's own

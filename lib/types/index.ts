@@ -119,6 +119,34 @@ export interface Budget {
   limitCents: Cents;
 }
 
+/**
+ * One month's income *plan* — what the owner expects to earn, and nothing else.
+ *
+ * Deliberately not a `Budget`. A budget is a per-category spending limit that
+ * `budgetStatus()` compares against `spendingByCategory()`; this is a
+ * per-month income target that nothing compares against a category at all.
+ * Storing it as a budget row would need a sentinel category, would defeat
+ * `assert_budget_category_active_expense()`, and would put a permanently
+ * 0%-used meter on `/budgets`.
+ *
+ * **It is a target, never a figure.** Actual income is derived from
+ * `transactions` by `monthlyIncome()` and is never read from here; no account
+ * balance, no net worth, and no net-worth snapshot has any awareness of this
+ * type. `expectedIncomeCents` is a non-negative magnitude — there is no sign to
+ * get wrong, because an expectation has no direction.
+ *
+ * A month with no plan has no row and no default: `getMonthlyPlan()` returns
+ * `undefined`, which the summary renders as "not set" rather than as zero. The
+ * two are genuinely different — zero expected income makes every planned
+ * expense unallocated, while "not set" makes the question unanswered.
+ */
+export interface MonthlyPlan {
+  id: string;
+  period: MonthKey;
+  /** Non-negative. What the owner expects to earn this month. */
+  expectedIncomeCents: Cents;
+}
+
 export type BillFrequency = "weekly" | "biweekly" | "monthly" | "yearly";
 
 export interface Bill {
@@ -141,6 +169,33 @@ export interface Bill {
 export type BillOccurrenceStatus = "scheduled" | "paid" | "skipped";
 
 /**
+ * `public.bill_payment_origin` — how a paid occurrence came to reference a
+ * transaction, and the fact that decides whether unmarking it may remove that
+ * transaction.
+ *
+ * `linked` — the owner chose one of their own existing transactions. This
+ * application did not create it and must never delete it; unmarking clears the
+ * reference and leaves the row exactly where it was.
+ *
+ * `generated` — `public.settle_bill_occurrence` created it, in the same
+ * database transaction that marked the occurrence paid, from the bill's own
+ * account, the occurrence's own amount and the paid date. Unmarking removes it,
+ * because nothing else in the ledger has ever had a reason to point at it.
+ *
+ * Absent (`undefined`) on every occurrence that references no transaction at
+ * all — every scheduled and skipped one, and a paid one settled without a
+ * ledger row. `bill_occurrences_transaction_origin_ck` makes the presence of
+ * this value and the presence of `transactionId` the same fact.
+ *
+ * The distinction is not a client-supplied claim:
+ * `guard_bill_occurrence_transition()` accepts `generated` only when the
+ * referenced transaction's `created_at` equals the current transaction's
+ * timestamp, and `authenticated` holds no grant on `transactions.created_at`
+ * at all — so a pre-existing row can never be relabelled as generated.
+ */
+export type BillPaymentOrigin = "linked" | "generated";
+
+/**
  * One concrete due instance of a recurring bill — Phase 7 CP7's addition to
  * the domain. Deferred until now on purpose: nothing rendered an occurrence
  * before there was a way to mark one paid.
@@ -153,11 +208,16 @@ export type BillOccurrenceStatus = "scheduled" | "paid" | "skipped";
  * happened rather than a projection of what the bill costs today.
  *
  * `transactionId` is legitimately absent on a paid occurrence: a bill can be
- * marked paid from a payment that was never recorded as a transaction. When it
- * is present it names one of the owner's own transactions, and **nothing about
- * that transaction is altered by the link** — marking a bill paid is bookkeeping
- * about an obligation, not a ledger event. Neither a balance, a category, nor
- * an amount moves.
+ * marked paid from a payment that was never recorded as a transaction, and a
+ * bill that names no usable account has no ledger row to create. When it *is*
+ * present, `transactionOrigin` says where that row came from — and that is the
+ * only thing that differs between a payment this application generated and one
+ * the owner wrote themselves.
+ *
+ * **A linked transaction is never altered by the link.** Not recategorised, not
+ * re-dated, not re-amounted, not replaced, and not deleted when the occurrence
+ * is unmarked. A *generated* one is created by the settlement and removed by
+ * its reversal, which is the whole of the difference.
  *
  * `paidOn` is present if and only if `status` is `paid`
  * (`bill_occurrences_status_consistency_ck`).
@@ -169,8 +229,10 @@ export interface BillOccurrence {
   status: BillOccurrenceStatus;
   /** Fixed at generation time — never the parent bill's current amount. */
   amountCents: Cents;
-  /** Present only when the payment was linked to an existing transaction. */
+  /** Present only when the payment references a transaction. */
   transactionId?: string;
+  /** Present if and only if `transactionId` is. */
+  transactionOrigin?: BillPaymentOrigin;
   /** Present if and only if `status` is `paid`. */
   paidOn?: CalendarDate;
 }

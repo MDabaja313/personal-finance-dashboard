@@ -490,25 +490,29 @@ describe("CP7 write surface is exactly accounts + categories + transactions + mo
     expect(offenders).toEqual([]);
   });
 
-  it("keeps bill tracking free of ledger writes", () => {
-    // The load-bearing CP7 property, as a source fact: creating, editing,
-    // archiving a bill, and marking an occurrence paid or skipped write no
-    // transaction, no movement, no account and no budget — so no balance, no
-    // economic total and no net-worth figure can move. The integration half is
-    // tests/mutations/bill-occurrences.test.ts, which reads every one of those
-    // figures back before and after.
-    const billModules = filesWithCode.filter(
+  it("keeps bill *definition* writes free of any ledger effect", () => {
+    // CP7's version of this test asserted that the whole bill domain wrote no
+    // ledger activity at all. Phase 8 CP1 narrows that deliberately — settling
+    // an occurrence may now create an expense — so the assertion narrows with
+    // it rather than being deleted, and it narrows to the half that must stay
+    // absolutely true:
+    //
+    //   creating, editing, archiving or unarchiving a BILL, and topping up its
+    //   rolling schedule, write no transaction, no movement, no account, no
+    //   budget and no snapshot.
+    //
+    // A bill is a description of an obligation. Nothing about defining one is
+    // an economic event, and a regression that started posting a row when a
+    // bill was created or repriced would silently invent spending nobody did.
+    // The occurrence module is covered separately, below.
+    const definitionModules = filesWithCode.filter(
       ({ repoPath }) =>
         repoPath === "lib/data/mutations/bills.ts" ||
-        repoPath === "lib/data/mutations/bill-occurrences.ts" ||
         repoPath === "lib/data/mutations/bill-schedule.ts"
     );
-    expect(billModules).toHaveLength(3);
+    expect(definitionModules).toHaveLength(2);
 
-    for (const { repoPath, code } of billModules) {
-      // No write verb against any relation but the two bill relations. The
-      // occurrence module *reads* `transactions` to validate a link, which is
-      // why this checks the write verbs rather than the relation name.
+    for (const { repoPath, code } of definitionModules) {
       for (const relation of ["transactions", "movements", "accounts", "budgets", "goals"]) {
         expect(
           new RegExp(`\\.from\\(\\s*["'\`]${relation}["'\`]\\)[\\s\\S]{0,200}?\\.(insert|update|upsert|delete)\\s*\\(`).test(
@@ -518,10 +522,95 @@ describe("CP7 write surface is exactly accounts + categories + transactions + mo
         ).toBe(false);
       }
 
-      // And no snapshot refresh: bill tracking changes no figure a snapshot
-      // records, so calling the bridge would be a write with nothing to write.
       expect(code, `${repoPath} must not refresh the net-worth snapshot`).not.toMatch(
         /net_worth_snapshot|refreshCurrentSnapshot/
+      );
+
+      // And neither may reach the settlement RPCs. A bill write is not a
+      // payment, and the only thing that could make it one is a call to these.
+      expect(code, `${repoPath} must not settle an occurrence`).not.toMatch(
+        /settle_bill_occurrence/
+      );
+    }
+  });
+
+  it("keeps the occurrence module's ledger reach to the two settlement RPCs", () => {
+    // The Phase 8 CP1 replacement for the blanket rule above, and the property
+    // that makes the new behavior safe: settling and reversing a payment write
+    // a transaction *only* inside `public.settle_bill_occurrence` and
+    // `public.unsettle_bill_occurrence`, in SQL, in one transaction with the
+    // status change.
+    //
+    // So this module must issue no PostgREST write against `transactions` at
+    // all. If it ever did, the occurrence and the ledger row would be two
+    // requests and therefore two transactions — exactly the half-finished
+    // state the RPCs exist to make impossible. It reads `transactions` to
+    // validate a link, which is why the verbs are checked rather than the
+    // relation name.
+    const occurrenceModule = filesWithCode.find(
+      ({ repoPath }) => repoPath === "lib/data/mutations/bill-occurrences.ts"
+    );
+    expect(occurrenceModule).toBeDefined();
+
+    for (const relation of ["transactions", "movements", "accounts", "budgets", "goals"]) {
+      expect(
+        new RegExp(
+          `\\.from\\(\\s*["'\`]${relation}["'\`]\\)[\\s\\S]{0,200}?\\.(insert|update|upsert|delete)\\s*\\(`
+        ).test(occurrenceModule!.code),
+        `the occurrence module must not write ${relation} directly`
+      ).toBe(false);
+    }
+
+    // Both RPCs are named, and no third one is invented here.
+    const invoked = [...occurrenceModule!.code.matchAll(/^const [A-Z_]+ = "([a-z_]+)";$/gm)].map(
+      (match) => match[1]
+    );
+    expect(invoked.sort()).toEqual(["settle_bill_occurrence", "unsettle_bill_occurrence"]);
+
+    // The snapshot refresh is now legitimate here — a generated expense moves
+    // a balance — but it must stay behind the ledger-changed flag rather than
+    // firing on every status change.
+    expect(occurrenceModule!.code).toMatch(/refreshCurrentSnapshotAfter/);
+    expect(occurrenceModule!.code).toMatch(/if \(ledgerChanged\)/);
+  });
+
+  it("lets no caller name a transaction origin — provenance is the database's", () => {
+    // `'generated'` is what decides whether unmarking deletes a ledger row, so
+    // it must never be a value any layer of this application can assign. It is
+    // chosen inside `public.settle_bill_occurrence`, and
+    // `guard_bill_occurrence_transition()` refuses it for any transaction that
+    // did not come into existence in the same database transaction.
+    //
+    // The scan is over the three layers a request can pass through. A *read*
+    // comparison (`=== "generated"`, in the mapper and on /bills) is a
+    // different thing and is deliberately not caught: this looks for an
+    // assignment into a write payload or an RPC argument.
+    const assignsOrigin = /transaction_origin\s*:\s*(?!\s*null\s*[,}])/;
+
+    const offenders = filesWithCode
+      .filter(
+        ({ repoPath }) =>
+          repoPath.startsWith("lib/data/mutations/") ||
+          repoPath.startsWith("lib/actions/") ||
+          repoPath.startsWith("lib/validation/")
+      )
+      .filter(({ code }) => assignsOrigin.test(code))
+      .map(({ repoPath }) => repoPath);
+
+    expect(offenders).toEqual([]);
+
+    // Positive control: the probe catches the mistake it is looking for.
+    expect(assignsOrigin.test(`transaction_origin: "generated",`)).toBe(true);
+    expect(assignsOrigin.test("transaction_origin: origin,")).toBe(true);
+    expect(assignsOrigin.test("transaction_origin: null,")).toBe(false);
+
+    // And no validation schema accepts one from a form.
+    const validation = filesWithCode.filter(({ repoPath }) =>
+      repoPath.startsWith("lib/validation/")
+    );
+    for (const { repoPath, code } of validation) {
+      expect(code, `${repoPath} must not parse a transaction origin`).not.toMatch(
+        /transactionOrigin/
       );
     }
   });
@@ -636,6 +725,7 @@ describe("CP7 write surface is exactly accounts + categories + transactions + mo
       .sort();
 
     expect(callers).toEqual([
+      "lib/data/mutations/bill-occurrences.ts",
       "lib/data/mutations/bill-schedule.ts",
       "lib/data/mutations/bills.ts",
       "lib/data/mutations/movements.ts",
@@ -644,27 +734,29 @@ describe("CP7 write surface is exactly accounts + categories + transactions + mo
     ]);
   });
 
-  it("names exactly the eight RPCs authenticated may execute", () => {
+  it("names exactly the ten RPCs authenticated may execute", () => {
     // Enumerated rather than bounded, for the same reason the relation list
     // below is: a function is a privilege surface, and `authenticated` holds
-    // EXECUTE on exactly these eight. 090-privileges.sql asserts the database
+    // EXECUTE on exactly these ten. 090-privileges.sql asserts the database
     // half of the same claim, as a sorted list of every function in `public`
     // that role can execute.
     //
-    // Two shapes are scanned because the two *bridge* modules name their RPC
-    // through a module constant (`.rpc(REFRESH_RPC)`, `.rpc(MAINTAIN_RPC)`),
-    // deliberately: each exists to have exactly one name in it, and a literal
-    // at the call site would put the same string in two places.
-    const BRIDGE_MODULES = new Set([
+    // Two shapes are scanned because three modules name their RPCs through a
+    // module constant (`.rpc(REFRESH_RPC)`, `.rpc(MAINTAIN_RPC)`,
+    // `.rpc(SETTLE_RPC)`), deliberately: a module that talks to exactly one or
+    // two functions should have each name written once, not repeated at every
+    // call site.
+    const CONSTANT_NAMED_MODULES = new Set([
       "lib/data/mutations/snapshots.ts",
       "lib/data/mutations/bill-schedule.ts",
+      "lib/data/mutations/bill-occurrences.ts",
     ]);
 
     const invoked = new Set<string>();
 
     for (const { repoPath, code } of filesWithCode) {
       for (const match of code.matchAll(/\.rpc\(\s*["'`]([a-z_]+)["'`]/g)) invoked.add(match[1]);
-      if (!BRIDGE_MODULES.has(repoPath)) continue;
+      if (!CONSTANT_NAMED_MODULES.has(repoPath)) continue;
       for (const match of code.matchAll(/^const [A-Z_]+ = "([a-z_]+)";$/gm)) invoked.add(match[1]);
     }
 
@@ -677,6 +769,8 @@ describe("CP7 write surface is exactly accounts + categories + transactions + mo
       "replace_bill",
       "replace_movement",
       "set_bill_archived",
+      "settle_bill_occurrence",
+      "unsettle_bill_occurrence",
     ]);
   });
 
@@ -787,6 +881,17 @@ describe("CP7 write surface is exactly accounts + categories + transactions + mo
       "lib/data/mutations/reconciliation.ts",
       "lib/data/mutations/transactions.ts",
     ]);
+
+    // Phase 8 CP1's delete is deliberately absent from this list, and its
+    // absence is the assertion: unmarking a *generated* payment removes a
+    // transaction, but it does so inside `public.unsettle_bill_occurrence`, in
+    // the same database transaction as the status change. A `.delete(` in the
+    // occurrence module would mean the two had become separable.
+    const occurrenceModule = filesWithCode.find(
+      ({ repoPath }) => repoPath === "lib/data/mutations/bill-occurrences.ts"
+    );
+    expect(occurrenceModule).toBeDefined();
+    expect(occurrenceModule!.code).not.toMatch(/\.delete\s*\(/);
   });
 
   it("writes to no table other than accounts, categories, transactions, movements, budgets, and goals", () => {

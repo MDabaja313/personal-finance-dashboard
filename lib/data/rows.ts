@@ -174,8 +174,25 @@ export interface BillOccurrenceDetailRow {
   amount_cents: BigIntColumn;
   /** Null on a scheduled or skipped row, and legally null on a paid one. */
   transaction_id: string | null;
+  /**
+   * `public.bill_payment_origin` — non-null exactly when `transaction_id` is
+   * (`bill_occurrences_transaction_origin_ck`). Phase 8 CP1.
+   */
+  transaction_origin: string | null;
   /** DATE or null — non-null if and only if `status` is 'paid'. */
   paid_on: string | null;
+}
+
+/**
+ * `public.monthly_plans` (Phase 8 CP2). One row per owner per month, and the
+ * read is keyed by `(user_id, period)` — `user_id` is filtered on but never
+ * selected, like everywhere else here. The table has no `created_at`.
+ */
+export interface MonthlyPlanRow {
+  id: string;
+  /** 'YYYY-MM'. */
+  period: string;
+  expected_income_cents: BigIntColumn;
 }
 
 /**
