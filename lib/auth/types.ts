@@ -24,3 +24,32 @@ export interface SignInState {
 
 /** The `signIn` Server Action's signature, as `useActionState` sees it. */
 export type SignInAction = (state: SignInState, formData: FormData) => Promise<SignInState>;
+
+/**
+ * `useActionState` state for the "forgot password" request form. Tri-state
+ * rather than `SignInState`'s error-or-redirect shape, because this action
+ * never redirects on success — it shows a message on the same page instead
+ * (`idle` is the pre-submission state, distinct from a `success` with
+ * nothing new to say).
+ */
+export interface RequestPasswordResetState {
+  status: "idle" | "success" | "error";
+  message: string | null;
+}
+
+/** The `requestPasswordReset` Server Action's signature. */
+export type RequestPasswordResetAction = (
+  state: RequestPasswordResetState,
+  formData: FormData
+) => Promise<RequestPasswordResetState>;
+
+/** `useActionState` state for the "set new password" form. Redirects to `/login` on success. */
+export interface UpdatePasswordState {
+  error: string | null;
+}
+
+/** The `updatePassword` Server Action's signature. */
+export type UpdatePasswordAction = (
+  state: UpdatePasswordState,
+  formData: FormData
+) => Promise<UpdatePasswordState>;
