@@ -79,7 +79,7 @@ reconciliation limitation (§18) is recorded as a *future* prerequisite, not a t
 | Enum | Values | Note |
 |---|---|---|
 | `account_type` | `checking`, `savings`, `cash`, `credit`, `investment`, `loan` | Matches `AccountType` in `lib/types/index.ts` |
-| `transaction_kind` | `income`, `expense`, `refund`, `transfer`, `credit_card_payment` | Matches `TransactionKind` |
+| `transaction_kind` | `income`, `expense`, `refund`, `transfer`, `credit_card_payment`, `adjustment` | Matches `TransactionKind`. `adjustment` was appended by Phase 7 CP3 (`20260828120001_transaction_kind_adjustment.sql`) as its own migration — a label added by `ALTER TYPE … ADD VALUE` is unusable in the transaction that adds it, so the constraints and policies that reference it had to land in a second file. It is **readable but not writable**: the ordinary entry form offers `income`/`expense`/`refund` only, and the UPDATE policy refuses both to target an adjustment and to produce one (§6). Reconciliation, which is what will actually create them, is CP5 (§18) |
 | `movement_kind` | `transfer`, `credit_card_payment` | **Deliberately narrower** than `transaction_kind` — makes "a movement can only be one of the two paired kinds" a type-level fact, not a runtime check |
 | `bill_frequency` | `weekly`, `biweekly`, `monthly`, `yearly` | Matches `BillFrequency` |
 | `category_kind` | `income`, `expense` | Matches `Category.kind` |
@@ -182,7 +182,7 @@ No amounts or dates live here — those belong to the two `transactions` legs (�
 | `date` | `DATE` | NOT NULL | Calendar value — see §10 |
 | `merchant` | `TEXT` | NOT NULL | |
 | `kind` | `transaction_kind` | NOT NULL | |
-| `category_id` | `UUID` | **nullable** | Composite FK → `categories(id, user_id)`. Null on movement legs *and* legally on some ordinary rows — see `txn-094`, §17 |
+| `category_id` | `UUID` | **nullable** | Composite FK → `categories(id, user_id)`. Null on movement legs, null on `adjustment` rows, *and* legally null on some ordinary rows — see `txn-094`, §17 |
 | `movement_id` | `UUID` | **nullable** | Composite FK → `movements(id, user_id)`. Non-null iff `kind` is a movement kind (§6) |
 | `amount_cents` | `BIGINT` | NOT NULL | Signed. Zero is legal for ordinary rows, illegal for movement legs (§6) |
 | `created_at` | `TIMESTAMPTZ` | NOT NULL, default `now()` | **Phase 3 amendment.** Query-ordering only — never surfaced on the `Transaction` DTO. Added specifically because deterministic same-day transaction ordering required an entry-recency tie-break: without it, `ORDER BY date DESC, id ASC` alone would order tied rows by UUID, which carries no meaning a user could read. Exists so `ORDER BY date DESC, created_at DESC, id ASC` has a real entry-recency tie-break instead (§8, §17). |
@@ -306,8 +306,17 @@ transaction row is deleted.
 ### Single-row `CHECK` constraints
 
 - `transactions`: `kind IN ('income','refund') → amount_cents >= 0`;
-  `kind = 'expense' → amount_cents <= 0`. **Non-strict** — a legal fixture row has
-  `amount_cents = 0` on an `expense` (§17).
+  `kind = 'expense' → amount_cents <= 0`; `kind = 'adjustment'` — **unconstrained in sign**.
+  **Non-strict** — a legal fixture row has `amount_cents = 0` on an `expense` (§17). The
+  adjustment branch was added by Phase 7 CP3, which dropped and re-created the constraint with
+  every existing branch preserved verbatim (no Phase 4 migration was edited). An adjustment is
+  whatever signed delta reconciles a derived balance to a real one, so a rule guessing its
+  direction now would be a rule the reconciliation work has to fight; its integrity comes from
+  being uncreatable and uneditable through the ordinary surface instead (§18).
+- `transactions`: `kind = 'adjustment' → category_id IS NULL` (Phase 7 CP3). An adjustment
+  corrects an account's *balance* rather than recording consumption, so a category on one would
+  put a reconciliation difference into `spendingByCategory`, budget utilisation, and the
+  income/expense split. One-directional, like the movement rule below.
 - `transactions`: **`kind IN ('transfer','credit_card_payment') → amount_cents <> 0`.** Combined
   with "exactly two legs" and "legs sum to zero" (§7), this makes **opposite-signed legs a
   database guarantee**, not just a convention.
@@ -338,6 +347,113 @@ transaction row is deleted.
 eligibility depends on the row's `status` at delete time, which is a delete-operation guard, not
 a same-row insert/update invariant. Specified in full in §13; noted here so the constraint list
 and the trigger list aren't confused for one another.
+
+### Write-guard triggers (Phase 7 CP2) — also not `CHECK`s
+
+Two `BEFORE UPDATE` triggers were added when `authenticated` first gained write privileges on
+`accounts` and `categories`
+(`supabase/migrations/20260827120001_account_category_writes.sql`). Both express rules a `CHECK`
+cannot: each compares `NEW` against `OLD`, and two of the three consult other tables.
+
+- **`accounts_guard_update()`** — (1) `type` is immutable once the account exists; (2)
+  `opening_balance_cents` may change only while the account has **zero** transactions, since it is
+  the only stored balance figure and editing it retroactively restates every balance that account
+  has ever reported (§11), including ones already written into `net_worth_snapshots`; (3) the
+  `is_archived` `false → true` transition requires a **derived** balance of exactly zero
+  (`opening_balance_cents + SUM(that account's transactions)`), because an archived account is
+  excluded from net worth and from the asset/liability totals. Unarchiving is unconditional — it
+  can only restore a figure to the totals, never hide one.
+- **`guard_category_kind_change()`** — `kind` may change only while the category is referenced by
+  no row in `transactions.category_id`, `budgets.category_id`, or `bills.category_id`. `kind` is
+  what separates income from spending in every rollup, so changing it on a category with history
+  silently reclassifies settled figures. Rename and archive stay available to referenced
+  categories: the rule is scoped to the one column.
+
+Both are `SECURITY INVOKER` with `search_path = ''`, have `EXECUTE` revoked from `PUBLIC`/`anon`/
+`authenticated`, and fire on `UPDATE` only — so neither affects the whole-user teardown cascade
+(§5). Tests: `supabase/tests/database/120-account-guard.sql`, `130-category-guard.sql`.
+
+### `assert_transaction_refs()` (Phase 7 CP3) — `BEFORE INSERT OR UPDATE` on `transactions`
+
+Added when `authenticated` gained `INSERT`/`UPDATE`/`DELETE` on `transactions`
+(`supabase/migrations/20260828120002_transaction_writes.sql`). It carries the four cross-row rules
+no `GRANT`, `CHECK`, or policy can express. It applies to **every** row, movement legs included:
+CP4 will insert transfer and card-payment legs through this same table, and a leg dated tomorrow
+or landing in an archived account corrupts exactly the same figures as an ordinary row doing it.
+
+1. **`date` may not be later than the owner's current calendar day**, computed as
+   `(now() AT TIME ZONE <the owner's profiles.timezone>)::date` — the same source
+   `lib/data/clock.ts` reads for `getToday()`, so the form's message and the database's refusal
+   can never disagree. **There is no server-UTC shortcut**, and that is the point: for an owner at
+   UTC+13 a UTC ceiling would reject a transaction they are entering right now on the date their
+   own calendar shows, and for an owner at UTC−8 it would accept one dated tomorrow for several
+   hours each night. `135-posted-ledger.sql` contains cases built specifically to fail if this is
+   ever rewritten against a UTC date. This table is the ledger of what *has happened*; a
+   future-dated row is an intention, and this schema already has a place for those (§13).
+2. **The account may not be archived.** Archiving requires a derived balance of exactly zero
+   (`accounts_guard_update()`, above) and an archived account is excluded from net worth and from
+   the asset/liability totals — so posting into one would create money that exists in the ledger
+   and in no summary. "Unarchive it first" is the rule.
+3. **A category, when present, must be active and kind-compatible** — `income` requires an
+   `income` category; `expense` and `refund` require an `expense` one (a refund reduces the spend
+   of the category it refunds; it is not income). Uncategorized ordinary rows stay legal.
+4. **An adjustment carries no category**, and neither does a movement leg — both also `CHECK`s,
+   so the same SQLSTATE arrives whichever layer fires first.
+
+Cross-*owner* references are deliberately **not** this trigger's business: the composite FKs
+(§6) already make a foreign account or category structurally impossible, so each lookup is scoped
+to `(id, user_id)` and raises nothing when it finds no row, letting the deferred FK produce its
+own `23503`. Taking those cases over would change the error code of situations
+`040-ownership.sql` already pins, without refusing anything they do not already refuse. A profile
+this statement cannot see is treated the same way, and the argument that this is safe is spelled
+out in full in the migration: under RLS the only invisible profile belongs to a row the
+`INSERT`/`UPDATE` policy is already refusing, and `transactions.user_id → profiles.id` is
+`NOT DEFERRABLE` regardless.
+
+`SECURITY INVOKER` with `search_path = ''`, `EXECUTE` revoked from `PUBLIC`/`anon`/
+`authenticated`, and `INSERT`/`UPDATE` only — never `DELETE` — so the whole-user teardown cascade
+(§5) is unaffected. Tests: `supabase/tests/database/135-posted-ledger.sql`.
+
+### `reconcile_account()` (Phase 7 CP5) — the only path that writes an `adjustment`
+
+`public.reconcile_account(p_account_id, p_as_of, p_desired_balance_cents)`
+(`20260829120001_reconciliation.sql`) takes a *desired internal signed balance*, derives the
+account's current balance in SQL as `opening_balance_cents + SUM(transactions.amount_cents)` —
+the same expression `account_balances` computes (§11), including movement legs and earlier
+adjustments — and inserts one row for the difference:
+
+```
+kind        = 'adjustment'
+amount_cents= desired - derived        (either sign; see the CHECK below)
+date        = p_as_of
+merchant    = 'Balance adjustment'     (a fixed literal, never caller text)
+category_id = null                     (transactions_adjustment_no_category_ck)
+movement_id = null                     (transactions_movement_biconditional_ck)
+```
+
+A zero difference writes **no row** and reports success, which is also what makes reconciliation
+idempotent with no idempotency key: a resubmission computes its delta against a balance the first
+submission already corrected. **Reconciliation never rewrites history** — no existing transaction
+is touched, and `opening_balance_cents` is deliberately *not* the mechanism (editing it would
+restate every balance the account ever reported, which is why `accounts_guard_update()` freezes
+it once the account has any transaction at all).
+
+The sign is unconstrained because `transactions_sign_by_kind_ck`'s `adjustment` branch is
+unconstrained — a correction's direction is whatever the correction requires. The row moves the
+account's derived balance and net worth while appearing in **no** economic total:
+`countsAsSpending`/`countsAsIncome` (`lib/finance/transactions.ts`) are allowlists, so an
+adjustment is excluded *by kind*, not by its sign and not by lacking a category.
+
+`SECURITY INVOKER` with `search_path = ''`, the owner from `auth.uid()` and never a parameter,
+`EXECUTE` revoked from `PUBLIC`/`anon` and granted to `authenticated`. It deliberately re-checks
+nothing that already has an owner: the posted-date ceiling and the archived-account refusal are
+`assert_transaction_refs()`'s, above. Tests:
+`supabase/tests/database/150-reconciliation.sql`.
+
+An adjustment is **never editable** (`transactions_update_own_ordinary` carries
+`kind <> 'adjustment'` in both `USING` and `WITH CHECK`) and **always deletable by its owner**
+(`transactions_delete_own_non_movement` carries only `movement_id IS NULL`). That asymmetry is
+the correction path: remove the adjustment and reconcile again.
 
 ### Deliberately absent constraints
 
@@ -409,6 +525,30 @@ intentional, and a check that doesn't skip it would falsely reject a legitimate 
 precisely what distinguishes the legitimate cascade case from the two illegitimate direct-
 deletion cases above: in both of those, the parent is still present, so the leg-count check still
 fires and still fails.
+
+**Phase 7 CP4 — what this invariant turned out to imply for writes.** The rules above were
+written as validation. Taken together with `transactions_movement_fk` being **`ON DELETE CASCADE`
+but not `DEFERRABLE`**, they also decide the *only shape a movement write can take*, and that
+consequence was not obvious until CP4 tried to build one:
+
+- A parent inserted alone cannot commit (zero legs).
+- A leg naming a movement that does not exist yet fails immediately, at the statement (23503).
+- A parent with one leg cannot commit.
+
+PostgREST issues one statement per request, each in its own transaction, so **no sequence of
+PostgREST calls can produce a movement.** Creating and editing one therefore had to become
+`SECURITY INVOKER` functions — `public.create_movement` and `public.replace_movement`
+([rls-policies.md §3](rls-policies.md)) — and that is not a layering preference, it is the only
+reachable path. Editing is delete-and-recreate under the movement's *original* id rather than an
+`UPDATE`, because an edit can change the amount, the date, the kind and either account, and every
+one of those has to land on both legs at once: two sequential updates would pass through a state
+where the pair does not sum to zero, and there is no statement that could rewrite one leg anyway
+(the ordinary `UPDATE` policy makes legs invisible). Since the delete and the re-creation are one
+transaction, a refused replacement leg aborts everything and leaves the original pair byte-for-
+byte intact.
+
+Deleting stays exactly the cascade case above: one statement on the parent, which is the sole
+supported deletion path and now also the only one `authenticated` can express.
 
 Document the intended failure message and require that it never include transaction amounts —
 see the error taxonomy in [DEVELOPMENT_PLAN.md](../DEVELOPMENT_PLAN.md) (Phase 3, decision A).
@@ -683,20 +823,90 @@ an arbitrary column's value:
 
 `authenticated` holds no DELETE grant on this table under any circumstance regardless
 (`rls-policies.md`), so this trigger is defense-in-depth against a privileged or direct-SQL
-deletion path, not the application's primary guard. **Document required trigger behavior only —
-no trigger SQL is written in this phase**, consistent with the movement trigger (§7) and
-timezone-validation trigger (§10).
+deletion path, not the application's primary guard. Implemented in Phase 4 as
+`guard_bill_occurrence_delete()`.
 
-### Phase 7 — what a later bill edit is and isn't allowed to do
+**Phase 7 CP7 put a second layer in front of it.** The schedule rebuild needs to remove the
+scheduled rows it replaces, so `finance_snapshot_writer` gained a `DELETE` grant — behind a
+policy reading `status = 'scheduled' AND user_id = private.request_owner_id()`. A paid or skipped
+occurrence is therefore invisible to that `DELETE` at the *policy* layer, before the trigger is
+consulted at all, and a session carrying no JWT claim can delete nothing whatsoever. The trigger
+still fires and still refuses, for every role; `180-bill-writes.sql` proves both layers
+independently.
 
-Not implemented now; recorded so the eventual mutation logic has a stated rule to follow rather
-than inventing one under time pressure:
+### Status transitions — Phase 7 CP7
 
-- If a recurring bill's default amount, frequency, or anchor date changes, **future `scheduled`
-  occurrences may be regenerated or updated** to reflect the new terms — that's a legitimate use
-  of the fact that they haven't happened yet.
-- **`paid` and `skipped` occurrences must never be silently rewritten** by a change to the parent
-  bill. Their `amount_cents` was fixed at generation time specifically so this couldn't happen.
+`guard_bill_occurrence_transition()` (`BEFORE UPDATE`) is the state machine. Supported, and
+nothing else:
+
+| From | To | Meaning |
+|---|---|---|
+| `scheduled` | `paid` | The obligation was met |
+| `scheduled` | `skipped` | It did not apply this cycle |
+| `paid` | `scheduled` | Correction — unmark; clears `paid_on` and `transaction_id` |
+| `skipped` | `scheduled` | Correction — unskip |
+
+A no-op status (`old.status = new.status`) is allowed unconditionally, which is what makes a
+resubmitted mark-paid idempotent rather than an error. A direct `paid ↔ skipped` conversion is
+**refused**: the two are different claims about what happened, and converting one to the other in
+a single statement would clear or set payment fields as a side effect of a status change nobody
+asked for. The correction goes back through `scheduled`, where it is visible as the two steps it
+is.
+
+The trigger also enforces `paid_on <= (now() AT TIME ZONE profiles.timezone)::date` — the owner's
+own calendar day, the same expression `assert_transaction_refs()`, `assert_goal_contribution_refs()`
+and `getToday()` use, never `current_date` and never server UTC. `due_date` gets no such ceiling
+and never will: a bill is an obligation, and every useful one is in the future.
+
+Finally it restates, at row level and for **every** role, that `id`, `user_id`, `bill_id`,
+`due_date`, `amount_cents` and `created_at` may not move. The column-scoped grant already makes
+them unreachable for `authenticated`; this is what makes it true of the scheduler as well, whose
+whole contract is that it may add a scheduled occurrence or remove one, and may never rewrite
+one.
+
+### Phase 7 CP7 — what a bill edit does, and what it may never touch
+
+Implemented in `supabase/migrations/20260831120001_bill_writes.sql`. The rule this section
+recorded in advance held exactly as written, and is now enforced in SQL:
+
+- If a recurring bill's **amount, frequency, or anchor date** changes, `public.replace_bill`
+  rebuilds its future schedule inside the same transaction as the `UPDATE` — so a refused
+  regeneration rolls the edit back with it, and the old bill *and* its old schedule survive byte
+  for byte. A change to `name`, `category_id` or `account_id` rebuilds nothing: those decide none
+  of the schedule, and a needless rewrite would give every future row a new id and `created_at`.
+- **`paid` and `skipped` occurrences are never rewritten by anything.** The rebuild's `DELETE`
+  names `status = 'scheduled'`, the writer's own `DELETE` policy names it again, Phase 4's
+  `guard_bill_occurrence_delete()` refuses one for any role, and
+  `guard_bill_occurrence_transition()` refuses to move `amount_cents` or `due_date` on any row.
+- **Already-overdue `scheduled` occurrences are preserved too.** The rebuild's cutoff is the
+  owner's own calendar day (`(now() AT TIME ZONE profiles.timezone)::date`), not server UTC: an
+  obligation that already fell due is a fact about the past even though nobody has acted on it
+  yet.
+- **No rebuild manufactures a past-dated obligation.** Generation starts at the bill's anchor
+  **only when the bill has no occurrence at all** — true exactly once, at creation, which is what
+  lets someone track a bill whose first due date has already passed. Every later call starts at
+  the owner's today.
+
+### Phase 7 CP7 — the rolling horizon
+
+`private.generate_bill_occurrences` (Phase 4) takes a horizon as a parameter and was never
+scheduled. CP7 fixes one, in `public.maintain_bill_schedule` and nowhere else: **one year from
+the owner's own calendar day, widened to the bill's `anchor_date` when that anchor lies further
+out.** It is a constant in the function body — no caller can supply, widen or narrow it.
+
+One year is the conservative choice for the three things the schedule has to support: a `yearly`
+bill always has a next occurrence (the frequency that would break first under a shorter window);
+`getBills()` and the dashboard projection always find one for every active bill; and a `weekly`
+bill needs its ~52 rows once rather than on every page load. The anchor widening is not a
+rounding detail — a bill whose first tracked due date is deliberately more than a year out (an
+annual premium set up early, a lease starting next autumn) would otherwise generate *nothing*, be
+omitted by `getBills()`, and read exactly like the create having failed.
+
+**Generation is mutation-time maintenance, never a render-time side effect.** No read path calls
+the scheduler. It runs inside `create_bill`/`replace_bill`/`set_bill_archived`, and — best-effort,
+after the write has already committed — after an occurrence status change, which is the moment an
+owner naturally revisits a bill as time passes. An archived bill generates nothing and loses
+nothing.
 
 ### Recurrence semantics — deterministic, documented now, not implemented
 
@@ -722,8 +932,19 @@ Each value is `anchor day-of-month = 31` clamped independently against that mont
 computed from the previous row.
 
 Occurrences are generated forward through a rolling horizon, idempotent via
-`UNIQUE (bill_id, due_date)` so re-running the generator never duplicates. **The generator itself
-is not built in this phase** — it arrives with the snapshot writer in Phase 4.
+`UNIQUE (bill_id, due_date)` so re-running the generator never duplicates. The generator arrived
+with the snapshot writer in Phase 4 (`private.next_bill_occurrence_date`,
+`private.generate_bill_occurrences`); Phase 7 CP7 adds
+`private.generate_bill_occurrences_for_bill`, which reuses that same pure date arithmetic and
+adds only a per-bill window around it. **The month-end and leap-year rules have exactly one
+implementation, and CP7 did not copy it.**
+
+CP7's generator differs from Phase 4's in two ways, and neither is stylistic: it walks **one
+bill** (an edit rebuilds one bill's future, not every bill's), and it walks from **the anchor**
+rather than from `max(due_date)`. The second matters after an anchor or frequency change:
+`next_bill_occurrence_date(anchor, freq, after)` advances in whole periods from the *anchor's* own
+month, so handing it a due date from the old series can skip the first occurrence of the new one
+outright. Walking the new series from its own anchor is the only formulation that cannot drift.
 
 ### DTO projection — how the existing `Bill` shape survived Phase 6 unchanged
 
@@ -741,8 +962,23 @@ then their `scheduled` `bill_occurrences`) reduced to one occurrence per bill in
 PostgREST's embedded-resource `order`/`limit` applies to the flattened join rather than per parent
 row. **Decided in Phase 4, shipped in Phase 6: this projection is a DAL query, not a third
 view** — `20260822150005_views.sql` creates exactly the two views in §1 (`account_balances`,
-`goal_balances`). `BillOccurrence` does not enter the UI, and no component changes, until Phase 7
-actually needs occurrence history or a mark-as-paid action.
+`goal_balances`).
+
+**Phase 7 CP7 is the point at which occurrence history did enter the UI, and `getBills()`'s
+contract is unchanged by it.** It still returns *active* bills projected onto their earliest
+`scheduled` occurrence, and `/dashboard` still depends on exactly that. CP7 adds a second, wider
+read alongside it — `getBillsForManagement()` (`lib/data/bills.ts`), returning every owned bill
+(archived included) with its recurrence terms, its archive state, its full occurrence history and
+the derived `nextDueDate`. Two queries whatever the bill count, never N+1, for the same reason
+`getBills()` uses two: PostgREST's embedded-resource `order`/`limit` applies to the flattened
+join rather than per parent row.
+
+The two shapes are deliberately not one. `Bill.dueDate` is required, and a bill whose occurrences
+are all paid or skipped has no honest value for it — which is precisely the case a management view
+must still be able to show and fix, so `BillManagement.nextDueDate` is optional. The
+`BillOccurrence` DTO (`lib/types/index.ts`) carries each occurrence's **own** `amountCents`, never
+the parent's current amount; a display layer that fell back to the bill's headline figure would
+silently undo this section's whole guarantee in the one place a person goes to check it.
 
 ---
 
@@ -849,6 +1085,98 @@ repeated invocation.
 `authenticated` never writes this table directly under any circumstance — see
 [rls-policies.md](rls-policies.md).
 
+### Phase 7 CP5 — the current month, and only the current month
+
+`pg_cron` is still not scheduled, and the fallback above is now real:
+`public.refresh_current_net_worth_snapshot()` (`20260829120002_current_snapshot.sql`) is a
+zero-parameter `SECURITY DEFINER` bridge, owned by `finance_snapshot_writer`, that
+`authenticated` may `EXECUTE`. It derives the caller from the request's own JWT claim, reads
+that owner's `profiles.timezone`, takes `to_char((now() at time zone <that zone>)::date,
+'YYYY-MM')`, and calls the **unchanged** Phase 4 `private.write_net_worth_snapshot` with both.
+Neither the owner nor the month is a parameter, so the bridge cannot become a general
+snapshot-writing API; `private.write_net_worth_snapshots_for_range` keeps its Phase 4 posture
+with no wrapper of any kind, and backfill remains an operator action. Full privilege rationale
+in [rls-policies.md §3](rls-policies.md), *What Phase 7 CP5 added*.
+
+### Phase 7 CP8A — `pg_cron` is finally scheduled, and it is the writer this section always intended
+
+The "intended writer" from Phase 2/4 — an unattended, `pg_cron`-scheduled pass that iterates
+over every owner rather than one request's own owner — is implemented in
+`20260901120001_scheduled_maintenance.sql` as `private.refresh_all_current_net_worth_snapshots()`,
+run daily. It is a *second*, separate function from CP5's `refresh_current_net_worth_snapshot()`
+bridge, not a replacement for it: the two serve different callers (a live authenticated request
+vs. an unattended daily pass with no JWT at all) and CP8A does not touch CP5's bridge, its grant,
+or its RLS policy in any way. Both ultimately call the same unchanged Phase 4
+`private.write_net_worth_snapshot(p_user_id, p_month)` — no snapshot arithmetic is duplicated a
+third time.
+
+pg_cron records the scheduling session's `current_user` as a job's `username` and executes the
+job with that role's permissions; running a job *as a different* role requires the scheduling
+role to be an actual database superuser (verified directly against the local image). These two
+jobs are scheduled by the migration as `postgres` — itself `NOSUPERUSER`, so it never requests
+that override — and so both execute as `postgres`. Because of that, the cron command is a single
+call to a `SECURITY DEFINER` function owned by `finance_snapshot_writer`, so execution
+immediately narrows from `postgres` down to that role's `NOLOGIN`/`NOBYPASSRLS` privileges. This
+is the same mechanism CP5's and CP7's bridges use, applied in the opposite direction: those
+narrow `authenticated`'s insufficient privilege *up* to what the writer needs; this one narrows
+`postgres`'s `BYPASSRLS`-carrying privilege *down* to the writer's own RLS-bound, already-audited
+reach.
+
+Owner enumeration never widens CP5's narrow `profiles_select_writer` policy (`id =
+private.request_owner_id()`, matching zero rows with no JWT claim set — the exact case a cron
+job's own connection is). Instead, the daily function discovers candidate owners from `accounts`
+(`finance_snapshot_writer` has held unconditional `SELECT` there since Phase 4), then, for each
+owner in turn, calls `set_config('request.jwt.claim.sub', <that owner's id>, true)` before
+touching `profiles` — the same GUC `private.request_owner_id()` already reads, impersonating one
+owner's request context at a time rather than reading every profile in one unscoped query. See
+the migration file for the full rationale and `090-privileges.sql` /
+`190-scheduled-maintenance.sql` for the assertions that this policy is unchanged.
+
+A companion function, `private.maintain_all_active_bill_schedules()`, runs on the same daily
+schedule and closes CP7's own documented gap
+([DEVELOPMENT_PLAN.md](../DEVELOPMENT_PLAN.md#cp7--bills--bill-occurrences-), *Deliberate
+limitation*: a bill nobody ever touches again eventually runs out of scheduled occurrences) the
+same way — a non-destructive top-up, per bill, reusing `private.generate_bill_occurrences_for_bill`
+unmodified, never a rebuild.
+
+`lib/data/mutations/snapshots.ts` is the only module in the application that names it, and every
+balance-affecting mutation calls it **after** its own write has committed, best-effort: the
+refresh is a separate PostgREST request and therefore a separate transaction, so it can fail on
+its own, and reporting an already-committed ledger write as failed because a derived aggregate
+did not refresh would be a lie that invites a duplicate entry. Live derived balances are
+authoritative; the snapshot series is a secondary trend, and the next balance-affecting write
+brings it current because the writer recomputes the whole month from current state rather than
+applying a delta.
+
+**What CP5 deliberately does not do**, and the limitations that follow are accepted rather than
+worked around: no `opened_on` column, no archived-at lifecycle reconstruction, no prior-month
+rebuild control, and no repair of an old monthly snapshot after a backdated edit. A backdated
+transaction moves the *current* month's snapshot (the as-of window ends at this month's last
+day, so it includes every earlier row) but leaves the month it was dated into as it was.
+
+**Two further limitations, inherited from Phase 4 and worth stating explicitly.**
+`private.write_net_worth_snapshot` carries two sign guards and *raises* `data_exception`
+(SQLSTATE 22000) **before writing anything** rather than storing either magnitude negative — the
+`assets_cents >= 0 AND liabilities_cents >= 0` `CHECK` above is the same rule at the column level.
+Both states are now reachable through ordinary supported writes:
+
+- **`v_assets_cents < 0`** — the sum of every active non-`credit`/`loan` account is negative.
+  Reachable by opening an account at a negative balance (`opening_balance_cents` is a plain signed
+  `BIGINT` with no per-type sign constraint, and the validation layer accepts a signed figure for
+  every type), by overdrawing one with an ordinary expense, by transferring out of one, or by
+  reconciling one to a negative observed balance — which the reconcile form invites explicitly for
+  asset accounts. The aggregate only goes negative when the owner's whole asset position does, so
+  the realistic case is one overdrawn current account and no savings.
+- **`v_liabilities_cents < 0`** — the aggregate `credit`/`loan` balance is *positive*: an overpaid
+  card with no other debt offsetting it.
+
+In both cases the ledger write still commits and the current-month snapshot goes **stale rather
+than wrong** — the raise happens before the `INSERT … ON CONFLICT`, so an existing row is left
+byte for byte — and the next balance-affecting write that returns the aggregate to a valid sign
+recomputes the whole month. The underlying behavior is Phase 4's and CP5 does not alter it;
+`supabase/tests/database/160-current-snapshot.sql` characterizes both guards at the database
+layer and `tests/mutations/snapshots.test.ts` does the same at the action layer.
+
 ---
 
 ## 15. DTO mapping
@@ -872,6 +1200,18 @@ column on the `transactions` row itself (§4) — no Phase 6 query joins to `mov
 table's Phase 4 posture (no `authenticated` grant, no RLS policy — §1, `rls-policies.md`) is
 unchanged by the DAL swap. A transfer/credit-card-payment pair's two legs remain independently
 visible wherever their own `account_id` puts them, through the ordinary `getTransactions()` path.
+
+**Phase 7 CP4 changed that, for the edit surface only.** `lib/data/movements.ts` adds
+`getMovements(ids)` and a `Movement` DTO — kind, date, source account, destination account, both
+leg ids, and one **positive magnitude**. Which leg is the source is derived here, once, from the
+legs' signs, rather than re-derived by each consumer; the signed amounts are not on the DTO at
+all. The reason it reads by *movement id* rather than by pairing two rendered rows is the
+`/transactions` reveal window: a movement's two legs routinely straddle its edge, so a form
+reconstructed from the rows on screen would work by accident and would offer no edit control on
+exactly the pairs that are hardest to find by hand. Ordering is `id ASC` — a technical order
+only, since the caller looks these up by id and never renders them as a list. Anything that is
+not a well-formed pair is `data_integrity`: `validate_movement()` guarantees the shape, so a
+violation means the database contradicted its own invariant.
 
 **Ten of the eleven existing DTOs are unchanged.** That's the direct payoff of deriving values
 into the same shape rather than exposing normalized rows to the UI — and it's why
@@ -998,3 +1338,23 @@ an auditable account-balance adjustment/reconciliation mechanism** — recorded 
 
 **Not designed or implemented in this phase.** No table for it exists in §1's table list — adding
 one is explicitly out of scope until bank-sync or investment work is actually planned.
+
+### Phase 7 CP3 — the enum label, and nothing else
+
+CP3 added the `adjustment` label to `transaction_kind` (§2) and the two constraints that go with
+it, and **stopped there deliberately**. What exists now is the *shape* an adjustment will have —
+a signed amount on an account, no category, excluded from `countsAsSpending`/`countsAsIncome` by
+`lib/finance/transactions.ts` — so the read path, the DTO union, the `/transactions` filter, and
+the badge all handle one safely before one can exist.
+
+What does **not** exist, and is CP5's work: any way to create an adjustment. The ordinary entry
+form offers `income`/`expense`/`refund` only, `lib/data/mutations/transactions.ts` types its kind
+as `OrdinaryTransactionKind` so `adjustment` cannot be spelled there at all, and
+`transactions_update_own_ordinary` refuses both to target an existing adjustment and to turn an
+ordinary row into one. Adjustment **`DELETE` is deliberately left possible**: reconciliation is
+delete-and-rewrite, and a superseded adjustment has to be removable or re-reconciling an account
+would stack them forever.
+
+The four requirements listed above are unchanged and still unmet as a whole — in particular,
+nothing yet decides *when* an adjustment is written or how a reconciliation is recorded and
+audited.

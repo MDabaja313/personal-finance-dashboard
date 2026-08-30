@@ -24,10 +24,13 @@
  * - **Enum columns are typed `string`.** The wire gives text; narrowing to the
  *   DTO union is a runtime validation step in the mapper, not an assertion.
  *
- * Only relations Phase 6 actually reads appear here. In particular there is no
- * `MovementRow`: `authenticated` has no SELECT grant on `movements` and needs
- * none — `Transaction.movementId` is a plain `transactions.movement_id`
- * column and nothing joins to the parent.
+ * Phase 7 CP4 added `MovementRow` and `MovementLegRow`. Through Phase 6 there
+ * was deliberately no such shape — `authenticated` held no SELECT grant on
+ * `movements` and needed none, since `Transaction.movementId` is a plain
+ * `transactions.movement_id` column and nothing joined to the parent. The
+ * movement *edit* surface is the first thing that has to read the pair as one
+ * object rather than as two independently listed legs, so the grant and the
+ * row shape arrive together with it.
  */
 
 /** A `BIGINT` column as it arrives over the wire — see the note above. */
@@ -64,16 +67,20 @@ export interface AccountBalanceRow {
 }
 
 /**
- * `public.categories`. `is_archived` exists on the table but is not selected:
- * the `Category` DTO has no archived field, and this list resolves category
- * *names* for historical transactions — filtering archived rows out would
- * blank the labels on old rows.
+ * `public.categories`.
+ *
+ * `is_archived` is selected as of Phase 7 CP2. Archived rows are still
+ * *returned* — this list resolves category names for historical transactions,
+ * and filtering them out would blank the labels on old rows — but the DTO now
+ * carries the flag, so a management surface can show archive state and a
+ * future new-entry picker can hide archived options.
  */
 export interface CategoryRow {
   id: string;
   name: string;
   /** `public.category_kind` — 'income' | 'expense'. */
   kind: string;
+  is_archived: boolean;
 }
 
 /**
@@ -133,6 +140,45 @@ export interface BillOccurrenceRow {
 }
 
 /**
+ * `public.bills`, widened with the columns the Phase 7 CP7 management read
+ * needs and the Phase 6 projection deliberately never did.
+ *
+ * `anchor_date` and `is_archived` were always queried but never selected —
+ * they drove `getBills()`'s filter rather than its result. The management
+ * surface has to *edit* the recurrence terms and *unarchive* a bill, so both
+ * become part of the row rather than staying query-only. `getBills()` keeps
+ * the narrower `BillRow` above, unchanged.
+ */
+export interface BillManagementRow extends BillRow {
+  /** DATE, 'YYYY-MM-DD'. The recurrence anchor — never a stored due date. */
+  anchor_date: string;
+  is_archived: boolean;
+}
+
+/**
+ * `public.bill_occurrences`, the full projection behind the `BillOccurrence`
+ * DTO (Phase 7 CP7). Wider than `BillOccurrenceRow` above, which exists only
+ * to resolve a bill's next scheduled due date.
+ *
+ * `created_at` is an ordering key only, like `TransactionRow`'s and
+ * `GoalContributionRow`'s — PostgREST can order by a column that is not
+ * selected, and it must never appear on the DTO.
+ */
+export interface BillOccurrenceDetailRow {
+  id: string;
+  bill_id: string;
+  /** DATE, 'YYYY-MM-DD'. */
+  due_date: string;
+  /** `public.bill_occurrence_status`. */
+  status: string;
+  amount_cents: BigIntColumn;
+  /** Null on a scheduled or skipped row, and legally null on a paid one. */
+  transaction_id: string | null;
+  /** DATE or null — non-null if and only if `status` is 'paid'. */
+  paid_on: string | null;
+}
+
+/**
  * `public.goal_balances` — the `security_invoker` view. `saved_cents` is
  * derived from `goal_contributions` and exists only here. `archived_at` is on
  * the view and drives the `IS NULL` filter, but is not on the `Goal` DTO.
@@ -156,4 +202,61 @@ export interface NetWorthSnapshotRow {
   assets_cents: BigIntColumn;
   liabilities_cents: BigIntColumn;
   net_worth_cents: BigIntColumn;
+}
+
+/**
+ * `public.goal_balances`, widened with `archived_at` for the Phase 7 CP6
+ * management read (`getGoalsForManagement()`) — the ordinary `getGoals()`
+ * read stays on the narrower `GoalBalanceRow` above, since it deliberately
+ * never needs to know archive state.
+ */
+export interface GoalBalanceManagementRow extends GoalBalanceRow {
+  archived_at: string | null;
+}
+
+/**
+ * `public.goal_contributions`, projected for history display (Phase 7
+ * CP6). `created_at` is an ordering key only, like `TransactionRow`'s —
+ * PostgREST can order by a column that isn't selected, and it must never
+ * appear on the DTO.
+ */
+export interface GoalContributionRow {
+  id: string;
+  goal_id: string;
+  amount_cents: BigIntColumn;
+  /** DATE, 'YYYY-MM-DD'. */
+  occurred_on: string;
+  note: string | null;
+}
+
+/**
+ * `public.movements` — the parent of exactly two transaction legs (Phase 7
+ * CP4). `user_id` is filtered on but never selected, and `created_at` is not
+ * read at all: a movement's date lives on its legs, not here.
+ */
+export interface MovementRow {
+  id: string;
+  /** `public.movement_kind` — narrower than `transaction_kind` by design. */
+  kind: string;
+}
+
+/**
+ * One leg of a movement, projected for reconstructing the pair.
+ *
+ * A narrower selection than `TransactionRow` on purpose: `merchant` is derived
+ * by `public.create_movement` from the movement's kind and the other account's
+ * name, so it is never read back into an edit form, and `kind`/`category_id`
+ * are fixed by the movement (`validate_movement()` assert 3, and
+ * `transactions_movement_no_category_ck`) rather than being per-leg facts.
+ *
+ * `movement_id` is typed nullable to match the column, even though the query
+ * that produces these rows filters it to a non-null set.
+ */
+export interface MovementLegRow {
+  id: string;
+  movement_id: string | null;
+  account_id: string;
+  /** DATE, 'YYYY-MM-DD'. */
+  date: string;
+  amount_cents: BigIntColumn;
 }

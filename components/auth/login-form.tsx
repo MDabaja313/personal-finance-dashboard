@@ -1,6 +1,7 @@
 "use client";
 
 import { useActionState, useId } from "react";
+import Link from "next/link";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -9,10 +10,13 @@ import type { SignInAction, SignInState } from "@/lib/auth/types";
 const INITIAL_STATE: SignInState = { error: null };
 
 /**
- * Email + password, and nothing else. No signup link, no OAuth buttons, no
- * magic-link fallback, no password reset — the single owner is provisioned
+ * Email + password, plus a "Forgot password?" link. No signup link, no
+ * OAuth buttons, no magic-link fallback — the single owner is provisioned
  * by hand and public signup is disabled at the project level
- * (docs/auth-design.md §1).
+ * (docs/auth-design.md §1). Password recovery is a CP8B addition
+ * (`/forgot-password`), not a relaxation of that: it goes through
+ * `resetPasswordForEmail` on an existing, already-provisioned account, never
+ * account creation.
  *
  * The action arrives as a prop rather than an import so this stays a plain
  * UI component with no reach into `lib/**` beyond a type.
@@ -46,9 +50,17 @@ export function LoginForm({ signInAction }: { signInAction: SignInAction }) {
       </div>
 
       <div className="flex flex-col gap-1.5">
-        <label htmlFor={passwordId} className="text-sm font-medium text-foreground">
-          Password
-        </label>
+        <div className="flex items-baseline justify-between">
+          <label htmlFor={passwordId} className="text-sm font-medium text-foreground">
+            Password
+          </label>
+          <Link
+            href="/forgot-password"
+            className="text-xs text-muted-foreground underline underline-offset-4"
+          >
+            Forgot password?
+          </Link>
+        </div>
         <Input
           id={passwordId}
           name="password"

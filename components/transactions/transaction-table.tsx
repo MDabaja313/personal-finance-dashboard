@@ -1,12 +1,50 @@
+import type {
+  MovementAccountOption,
+  MovementMutationActions,
+} from "@/components/movements/types";
 import { KindBadge } from "@/components/transactions/kind-badge";
-import type { TransactionRow } from "@/components/transactions/types";
+import { TransactionRowActions } from "@/components/transactions/transaction-row-actions";
+import type {
+  AccountOption,
+  AdjustmentMutationActions,
+  CategoryOption,
+  TransactionMutationActions,
+  TransactionRow,
+} from "@/components/transactions/types";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { formatCentsSigned } from "@/lib/format/currency";
 import { formatCalendarDate } from "@/lib/format/date";
+import type { CalendarDate } from "@/lib/types";
+import { isMovementKind } from "@/lib/types/enums";
 import { cn } from "@/lib/utils";
 
-/** Desktop view. Hidden below md — see TransactionList for the mobile equivalent. */
-export function TransactionTable({ rows }: { rows: TransactionRow[] }) {
+/**
+ * Desktop view. Hidden below md — see TransactionList for the mobile
+ * equivalent.
+ *
+ * Still a Server Component: only the per-row controls are interactive, and they
+ * are their own client island. The rows themselves, including movement legs and
+ * adjustments, render exactly as they always have.
+ */
+export function TransactionTable({
+  rows,
+  actions,
+  movementActions,
+  adjustmentActions,
+  accounts,
+  movementAccounts,
+  categories,
+  today,
+}: {
+  rows: TransactionRow[];
+  actions: TransactionMutationActions;
+  movementActions: MovementMutationActions;
+  adjustmentActions: AdjustmentMutationActions;
+  accounts: readonly AccountOption[];
+  movementAccounts: readonly MovementAccountOption[];
+  categories: readonly CategoryOption[];
+  today: CalendarDate;
+}) {
   return (
     <div className="hidden rounded-lg border border-border md:block">
       <Table>
@@ -18,17 +56,20 @@ export function TransactionTable({ rows }: { rows: TransactionRow[] }) {
             <TableHead>Account</TableHead>
             <TableHead>Type</TableHead>
             <TableHead className="text-right">Amount</TableHead>
+            <TableHead className="text-right">
+              <span className="sr-only">Actions</span>
+            </TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
           {rows.map((row) => {
-            const isMovement = row.kind === "transfer" || row.kind === "credit_card_payment";
+            const isNonEconomic = isMovementKind(row.kind) || row.kind === "adjustment";
             return (
               <TableRow key={row.id}>
                 <TableCell className="whitespace-nowrap text-muted-foreground">
                   {formatCalendarDate(row.date)}
                 </TableCell>
-                <TableCell className={cn("font-medium", isMovement && "text-muted-foreground")}>
+                <TableCell className={cn("font-medium", isNonEconomic && "text-muted-foreground")}>
                   {row.merchant}
                 </TableCell>
                 <TableCell className="text-muted-foreground">{row.categoryName ?? "—"}</TableCell>
@@ -39,7 +80,7 @@ export function TransactionTable({ rows }: { rows: TransactionRow[] }) {
                 <TableCell
                   className={cn(
                     "text-right font-medium whitespace-nowrap",
-                    isMovement
+                    isNonEconomic
                       ? "text-muted-foreground"
                       : row.amountCents < 0
                         ? "text-destructive"
@@ -47,6 +88,18 @@ export function TransactionTable({ rows }: { rows: TransactionRow[] }) {
                   )}
                 >
                   {formatCentsSigned(row.amountCents)}
+                </TableCell>
+                <TableCell className="text-right">
+                  <TransactionRowActions
+                    row={row}
+                    actions={actions}
+                    movementActions={movementActions}
+                    adjustmentActions={adjustmentActions}
+                    accounts={accounts}
+                    movementAccounts={movementAccounts}
+                    categories={categories}
+                    today={today}
+                  />
                 </TableCell>
               </TableRow>
             );

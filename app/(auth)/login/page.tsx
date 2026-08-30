@@ -10,10 +10,16 @@ export const metadata: Metadata = {
   title: "Sign in",
 };
 
-export default async function LoginPage() {
+interface LoginPageProps {
+  searchParams: Promise<{ reset?: string }>;
+}
+
+export default async function LoginPage({ searchParams }: LoginPageProps) {
   // Verified claims, not a cookie-backed session (docs/auth-design.md §5).
   // Someone already signed in has no business on the login form.
   if (await getVerifiedClaims()) redirect("/dashboard");
+
+  const { reset } = await searchParams;
 
   return (
     <Card>
@@ -21,7 +27,12 @@ export default async function LoginPage() {
         <CardTitle>Sign in</CardTitle>
         <CardDescription>Personal Finance Dashboard</CardDescription>
       </CardHeader>
-      <CardContent>
+      <CardContent className="flex flex-col gap-4">
+        {reset === "success" ? (
+          <p role="status" className="text-sm text-muted-foreground">
+            Your password has been updated. Sign in with your new password.
+          </p>
+        ) : null}
         <LoginForm signInAction={signIn} />
       </CardContent>
     </Card>

@@ -1,6 +1,7 @@
 import { AccountCard } from "@/components/accounts/account-card";
+import type { AccountMutationActions } from "@/components/accounts/types";
 import { formatCents } from "@/lib/format/currency";
-import type { Account, Cents } from "@/lib/types";
+import type { Account, CalendarDate, Cents } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 interface AccountGroupProps {
@@ -8,9 +9,20 @@ interface AccountGroupProps {
   accounts: Account[];
   subtotal?: Cents;
   subtotalTone?: "default" | "negative";
+  /** Passed straight through to each card; omit for a read-only group. */
+  actions?: AccountMutationActions;
+  /** The owner's calendar day, needed only where `actions` are rendered. */
+  today?: CalendarDate;
 }
 
-export function AccountGroup({ title, accounts, subtotal, subtotalTone = "default" }: AccountGroupProps) {
+export function AccountGroup({
+  title,
+  accounts,
+  subtotal,
+  subtotalTone = "default",
+  actions,
+  today,
+}: AccountGroupProps) {
   if (accounts.length === 0) return null;
 
   return (
@@ -30,7 +42,7 @@ export function AccountGroup({ title, accounts, subtotal, subtotalTone = "defaul
       </div>
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
         {accounts.map((account) => (
-          <AccountCard key={account.id} account={account} />
+          <AccountCard key={account.id} account={account} actions={actions} today={today} />
         ))}
       </div>
     </section>

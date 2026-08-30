@@ -85,25 +85,382 @@ naming precisely, since "leaks every row" and "returns zero rows" call for very 
 
 ---
 
-## 3. Least-privilege grants, Phases 4–6
+## 3. Least-privilege grants
 
 | Role | Table/view access | INSERT | UPDATE | DELETE |
 |---|---|---|---|---|
 | `anon` | **None** on any user-financial table or view. | ❌ | ❌ | ❌ |
-| `authenticated` | `SELECT` only, on the tables/views the application actually reads. | ❌ | ❌ | ❌ |
+| `authenticated` | `SELECT` on every table (`movements` included as of CP4), plus **column-scoped** `INSERT` on `accounts`, `categories`, `transactions`, `movements`, `budgets`, `goals`, `goal_contributions` and `bills`; `UPDATE` on all of those except `movements` and `goal_contributions`, plus `bill_occurrences`; and `DELETE` on `transactions`, `movements` and `budgets` only. | accounts, categories, transactions, movements, budgets, goals, goal_contributions, bills | accounts, categories, transactions, budgets, goals, bills, **bill_occurrences** | **transactions, movements, budgets** |
 
-This holds for the entire read-only period of the roadmap — Phases 4, 5, and 6. There is no
-mutation UI, no Server Action, and no application code path that writes to the database before
-Phase 7, so there is no reason for `authenticated` to hold `INSERT`/`UPDATE`/`DELETE` grants on
-anything before then. Granting them "in case" would hand a compromised or misused browser session
-write access years before the application uses it.
+Through Phases 4, 5, and 6 this was `SELECT` only, without exception: there was no mutation UI, no
+Server Action, and no application code path that wrote to the database, so there was no reason for
+`authenticated` to hold write grants on anything. Granting them "in case" would have handed a
+compromised or misused browser session write access years before the application used it.
 
 **Phase 7 adds object grants and operation-specific RLS policies together, per mutation, as each
-one is actually implemented** — never in advance of the corresponding feature. See §4's matrix
-for which operation lands with which future feature.
+one is actually implemented** — never in advance of the corresponding feature. See §4's matrix for
+which operation lands with which feature.
+
+### What Phase 7 CP2 actually granted
+
+`supabase/migrations/20260827120001_account_category_writes.sql`, and nothing else so far. Every
+grant is column-scoped (see §4 for why that is a `GRANT` concern and not an RLS one):
+
+| Table | `INSERT` columns | `UPDATE` columns |
+|---|---|---|
+| `accounts` | `user_id`, `name`, `institution`, `type`, `opening_balance_cents`, `credit_limit_cents`, `interest_rate_bps` | `name`, `institution`, `credit_limit_cents`, `interest_rate_bps`, `opening_balance_cents`, `is_archived` |
+| `categories` | `user_id`, `name`, `kind` | `name`, `kind`, `is_archived` |
+
+The exclusions carry the design:
+
+- **`id` and `created_at` are in neither list.** Both have defaults, and a column absent from a
+  column-scoped `INSERT` grant simply takes its default rather than failing — so omitting them
+  costs nothing and removes any way to choose a row's id or backdate it.
+- **`user_id` is `INSERT`-only.** The ownership predicate needs it assignable for a row to be
+  insertable at all; leaving it out of `UPDATE` is what makes re-homing a row unreachable rather
+  than merely policy-checked.
+- **`accounts.type` is `INSERT`-only** — it decides asset/liability classification, which optional
+  columns are even legal, and how every historical snapshot already classified the account.
+  `categories.kind` *is* updatable, but only while the category is unreferenced
+  (`guard_category_kind_change()`; see database-schema.md §6).
+- **`is_archived` is `UPDATE`-only on both.** Neither may be *created* already archived.
+- **No `DELETE` grant on either table**, matching §4's "prefer archive" row.
+
+`anon` is not named in a single GRANT or policy in that migration. The complete privilege matrix
+is asserted table by table and column by column in
+`supabase/tests/database/100-write-grants.sql`, which also proves its own table list is complete.
+
+### What Phase 7 CP3 added
+
+`supabase/migrations/20260828120002_transaction_writes.sql` — one table, and the first `DELETE`
+grant in this schema:
+
+| Table | `INSERT` columns | `UPDATE` columns | `DELETE` |
+|---|---|---|---|
+| `transactions` | `id`, `user_id`, `account_id`, `date`, `merchant`, `kind`, `category_id`, `movement_id`, `amount_cents` | `account_id`, `date`, `merchant`, `kind`, `category_id`, `amount_cents` | ✅ table-level, narrowed by policy |
+
+Four things about that row carry the design:
+
+- **`id` is grantable on `INSERT` here and nowhere else.** Ordinary transaction creation is the
+  first operation in this application where a double submit produces a *real* duplicate — two
+  coffees, same amount, same day, both plausible — so nothing about the row's contents could
+  distinguish a retry from a second purchase. The create form therefore generates one
+  client-side UUID per logical submission and posts it as the row's id, so a retry collides with
+  itself on the primary key instead of inserting a second row.
+  `lib/data/mutations/transactions.ts` turns that `23505` into either "this is my own identical
+  row, the first attempt won" or a refusal — never a blind success. There is no idempotency
+  table and no middleware: the primary key already enforces uniqueness, transactionally.
+- **`movement_id` is `INSERT`-only and confers nothing yet.** The biconditional `CHECK` means an
+  `INSERT` grant omitting it could not express a movement leg at all, so it is granted for CP4 —
+  but `authenticated` has no `INSERT` on `public.movements`, so there is no parent to point at,
+  and `validate_movement()` rejects any movement not ending the transaction with exactly two
+  balanced legs.
+- **`created_at` is in neither list.** It is the `date DESC, created_at DESC, id ASC` ordering's
+  entry-recency tie-break; a backdatable one would silently reorder same-day history.
+- **`DELETE` is table-level because PostgreSQL has no column-level `DELETE`.** The narrowing is
+  entirely in the policy's `USING` predicate (§4). Transactions are deleted rather than archived
+  because, unlike accounts/categories/bills/goals, a transaction is not a *label* historical rows
+  resolve through — it *is* the history, a mistyped one has no correct archived state, and a
+  "voided" flag would mean every balance, budget, KPI and chart growing a clause to exclude it.
+
+### What Phase 7 CP4 added
+
+`supabase/migrations/20260828120003_movement_writes.sql` — one table, `movements`, and the
+first two functions `authenticated` may `EXECUTE` anywhere in this schema:
+
+| Table | `SELECT` | `INSERT` columns | `UPDATE` | `DELETE` |
+|---|---|---|---|---|
+| `movements` | ✅ **CP4** | `id`, `user_id`, `kind` | ❌ **never** | ✅ table-level, narrowed by policy |
+
+- **`SELECT` arrives now because the *edit* surface is the first thing that needs the parent.**
+  Through Phase 6 there was deliberately no grant at all: `Transaction.movementId` is a plain
+  column on the leg and nothing joined to `movements`. An edit form has to show the movement —
+  a kind, a date, two accounts, one magnitude — rather than a leg, and it has to work when the
+  two legs straddle the `/transactions` reveal window, so it reads the pair **by movement id**
+  rather than by pairing two rendered rows. `SELECT` is also what lets `replace_movement`'s
+  ownership check see a row at all, since a `SECURITY INVOKER` function has exactly the
+  caller's visibility.
+- **`id` is grantable on `INSERT`, for two reasons.** Movement creation is idempotent by a
+  client-generated UUID, exactly as ordinary transaction creation is — and additionally,
+  `replace_movement` re-creates the movement under its *original* id, so a movement id is
+  stable for the movement's whole life and an edit never re-identifies the thing being edited.
+- **There is no `UPDATE` grant and no `UPDATE` policy — permanently.** A `movements` row is
+  `(id, user_id, kind)` and nothing else. `id` is its identity, `user_id` its owner, and `kind`
+  is what every leg's own kind must equal (`validate_movement()` assert 3), so changing `kind`
+  in place would either fail that assert or require rewriting both legs in the same breath.
+  That is exactly what `replace_movement` does, by delete-and-recreate. Leaving `UPDATE`
+  ungranted means there is no second, partial way to do it.
+- **`DELETE` is the second and last `DELETE` grant in this schema**, and it is the *only*
+  correct way to remove a transfer or card payment: `transactions_delete_own_non_movement`
+  carries `movement_id IS NULL`, so a leg is invisible to `DELETE` outright, and deleting the
+  parent cascades both legs through `transactions_movement_fk`.
+
+**Why CP4 needs functions at all — and why they are not a convenience layer.** A movement is a
+parent plus exactly two legs, and the database refuses every partial form of it: a childless
+movement fails `movements_validate_movement` at `COMMIT`, and a leg naming a movement that does
+not exist yet fails the **non-deferrable** composite FK immediately. PostgREST issues one
+statement per request, each in its own transaction, so **no sequence of PostgREST calls can
+produce a movement at all.** `public.create_movement` and `public.replace_movement` are
+therefore the only reachable creation path, which is what makes the checks inside them a real
+boundary rather than an application-layer suggestion. `140-movement-writes.sql` proves each half
+of that claim directly.
+
+Both are `SECURITY INVOKER` (§11), take **no owner parameter** — the owner comes from
+`auth.uid()` inside the body — use `set search_path = ''` with every object schema-qualified,
+have `EXECUTE` revoked from `PUBLIC` and `anon`, and are granted to `authenticated` alone.
+`replace_movement` composes `create_movement` rather than sharing a helper in `private`,
+because a `SECURITY INVOKER` body runs with the *caller's* privileges and `authenticated` has no
+`USAGE` on `private` — a fact 090-privileges.sql now asserts for exactly this reason.
+
+Deleting deliberately gets **no** function: it is genuinely one statement, and wrapping it would
+add a privilege surface and no guarantee.
+
+One account-type rule lives inside the RPCs, and it is no broader than the repository already
+commits to: **a credit-card payment's destination must be a `credit` account**
+(`lib/types/index.ts` states the convention — "source (checking) leg negative, destination (card)
+leg positive" — and `lib/finance/accounts.ts` classifies `credit` as a liability stored
+negative, so a payment is the movement that raises that balance toward zero). Nothing is
+enforced about the *source*'s type: paying a card from cash, savings, or another card are all
+things a person may legitimately record.
 
 Functions/RPCs (the snapshot writer, the timezone-validation trigger function) get `EXECUTE`
 revoked from `PUBLIC` by default — see §11.
+
+---
+
+### What Phase 7 CP5 added
+
+`supabase/migrations/20260829120001_reconciliation.sql` and
+`supabase/migrations/20260829120002_current_snapshot.sql` — and the headline is what they
+*don't* contain: **no new table grant for `authenticated`, and no widening of an existing one.**
+The table matrix above is byte-for-byte what CP4 left, and
+`supabase/tests/database/100-write-grants.sql` still asserts it column by column.
+
+Reconciliation is a new *operation over CP3's existing privileges*. CP3 already granted a
+column-scoped `INSERT` covering `kind`, already made `adjustment` a legal stored kind
+(`transactions_sign_by_kind_ck`'s unconstrained adjustment branch), and already left `DELETE`
+possible on an adjustment — `transactions_delete_own_non_movement` carries only
+`movement_id IS NULL` and says nothing about kind, which was deliberate so CP5 could reconcile
+by remove-and-rewrite. What CP3 withheld was a *path* to writing one. CP5 adds exactly that
+path, and it is a function.
+
+| Function | Security | Parameters | `EXECUTE` |
+|---|---|---|---|
+| `public.reconcile_account(uuid, date, bigint)` | `INVOKER` | account, as-of date, desired internal balance | `authenticated` only |
+| `public.refresh_current_net_worth_snapshot()` | **`DEFINER`**, owned by `finance_snapshot_writer` | **none** | `authenticated` only |
+| `private.request_owner_id()` | `INVOKER` | none | `finance_snapshot_writer` only |
+
+#### `reconcile_account` — why a function, given the `INSERT` grant already exists
+
+A reconciliation is not "insert an adjustment". It is
+
+```
+delta := desired_internal_balance - (opening_balance_cents + SUM(transactions.amount_cents))
+```
+
+and *then* an insert of exactly `delta`, or of nothing at all when `delta` is zero. Computing
+the current balance in the client and posting the difference would mean the number written to
+the ledger was chosen from a balance read at some earlier moment, so a transaction entered in
+another tab in between would leave the account reconciled to the wrong figure — with an
+adjustment row that looks perfectly well-formed and simply is not. Deriving the delta inside
+the database, in the same statement that writes the row, removes that window.
+
+It is `SECURITY INVOKER` and needs nothing more: the caller already holds `SELECT` on accounts
+and transactions and `INSERT` on transactions, and under FORCE RLS the invoker sees exactly its
+own rows. The owner comes from `auth.uid()` and is never a parameter. `set search_path = ''`,
+every name qualified, `EXECUTE` revoked from `PUBLIC` and `anon`.
+
+Three rules are deliberately **left to the database rather than restated** inside it: the
+posted-date ceiling in the owner's own timezone, the archived-account refusal (both
+`assert_transaction_refs()`, CP3), and "an adjustment carries no category"
+(`transactions_adjustment_no_category_ck`). Re-deriving the date ceiling here would mean two
+expressions that must agree forever, and the trigger's is the one that also covers every other
+write path.
+
+**Liability input is normalized above the database, not inside it.** The parameter has exactly
+one meaning — the desired *internal signed* balance — because a parameter whose interpretation
+flipped based on a row it looked up would be a parameter no caller could reason about, and an
+overpaid credit card (a legitimately positive balance on a `credit` account) is a real state
+such a rule would make unreachable. Turning the UI's non-negative "amount currently owed" into
+`-magnitude` happens in `lib/data/mutations/reconciliation.ts`, from the account's *stored*
+type, never from anything the client sent.
+
+**Idempotent without an idempotency key.** CP3 and CP4 both needed a client-minted UUID because
+two identical coffees on the same day are a legitimate pair of rows. Reconciliation does not:
+the second submission computes its delta against a balance the first already corrected, so the
+delta is zero and no row is written.
+
+#### `refresh_current_net_worth_snapshot` — the one `SECURITY DEFINER` this phase adds
+
+Everything else in CP2–CP5 is `SECURITY INVOKER` because the caller already held what the body
+used. This one cannot be: `private.write_net_worth_snapshot` is owned by
+`finance_snapshot_writer`, `authenticated` has no `USAGE` on `private` at all, and
+`net_worth_snapshots` has no `INSERT`/`UPDATE` grant for `authenticated` and never will. So the
+bridge takes the writer's identity — and is kept as narrow as a bridge can be:
+
+- **Zero parameters.** The caller can address neither another owner nor another month, not
+  because a check rejects those arguments but because there are none. `pronargs = 0` is asserted
+  in `090-privileges.sql`, so a defaulted parameter added later fails a test rather than
+  quietly accepting a value.
+- **Owned by `finance_snapshot_writer`**, never `postgres` — whose `BYPASSRLS` attribute would
+  turn a browser-reachable function into an RLS bypass. The role keeps its Phase 4 attributes:
+  `NOLOGIN`, `NOSUPERUSER`, `NOBYPASSRLS`, no application role a member.
+- **`ALTER FUNCTION … OWNER TO` requires the incoming owner to hold `CREATE` on the schema**, so
+  the migration grants `CREATE ON SCHEMA public` to the writer for that one statement and
+  revokes it immediately. The ownership is permanent; the privilege is not, and
+  `090-privileges.sql` asserts the role ends with no `CREATE` on `public`.
+- **One new table privilege, column-scoped:** `SELECT (id, timezone)` on `profiles`, plus
+  `profiles_select_writer` — narrower than the writer's other policies (`using (true)`), because
+  here a tighter predicate is available for free: `using (id = private.request_owner_id())`. The
+  writer sees the calling request's own profile row and no other, and a session with no claim
+  (a cron job, a psql shell) sees none.
+- **The month comes from that profile's timezone**, via
+  `to_char((now() at time zone <the owner's zone>)::date, 'YYYY-MM')` — the same expression
+  `assert_transaction_refs()` uses for its date ceiling and the same calendar day
+  `lib/data/clock.ts` derives. Never server UTC.
+
+**Why the owner is read from the JWT GUC rather than from `auth.uid()`.** Inside a
+`SECURITY DEFINER` body the current role is the *owner*, so every function the body calls runs
+as `finance_snapshot_writer` — including `auth.uid()`. That role has no `USAGE` on schema
+`auth` (`set role finance_snapshot_writer; select auth.uid();` → *permission denied for schema
+auth*), and the grant cannot be made from a migration either: schema `auth` is owned by
+`supabase_auth_admin`, and the migration role does not hold `USAGE … WITH GRANT OPTION`, so
+`grant usage on schema auth to finance_snapshot_writer` reports *"no privileges were granted"*
+and changes nothing. Both facts were verified directly against the local Postgres 17.6 image.
+The claim itself is not privileged — it is a GUC, readable through `pg_catalog` by any role — so
+`private.request_owner_id()` reads it exactly as `auth.uid()` does.
+`160-current-snapshot.sql` asserts the two agree, for a set claim, for an empty one, and for the
+JSON `request.jwt.claims` form PostgREST actually uses, so the duplication cannot drift
+silently.
+
+**There is no historical rebuild surface.** `private.write_net_worth_snapshots_for_range` keeps
+its Phase 4 posture — unreachable by `authenticated`, with no public wrapper of any kind — and
+`160-current-snapshot.sql` asserts that `public` exposes exactly one function whose name
+mentions a snapshot, and that it is the zero-argument bridge. Backfill stays an operator action.
+
+### What Phase 7 CP6 added
+
+`supabase/migrations/20260830120001_budget_goal_writes.sql` opened three more tables, each with
+a deliberately different shape: `budgets` got ordinary column-scoped `INSERT`/`UPDATE`/`DELETE`
+(planning metadata, not ledger history — `category_id` and `period` are `INSERT`-only, so a
+wrong one is deleted and recreated); `goals` got the CP2 accounts/categories treatment
+(soft-delete via `archived_at`, no `DELETE` grant at all); and `goal_contributions` got `INSERT`
+only, permanently, because append-only is the entire point of that table. Two `BEFORE INSERT`
+guard triggers came with them — `assert_budget_category_active_expense()` and
+`assert_goal_contribution_refs()`.
+
+### What Phase 7 CP7 added
+
+`supabase/migrations/20260831120001_bill_writes.sql` — the last two relations, and the one
+checkpoint whose *write shape differs per relation for a structural reason*:
+
+| Table | `INSERT` columns | `UPDATE` columns | `DELETE` |
+|---|---|---|---|
+| `bills` | `id`, `user_id`, `name`, `amount_cents`, `frequency`, `anchor_date`, `category_id`, `account_id` | `name`, `amount_cents`, `frequency`, `anchor_date`, `category_id`, `account_id`, `is_archived` | ❌ ever |
+| `bill_occurrences` | ❌ ever | `status`, `transaction_id`, `paid_on` | ❌ ever |
+
+`bill_occurrences` is the only relation in this schema `authenticated` may `UPDATE` without
+being able to `INSERT`, and both halves of that are deliberate:
+
+- **No `INSERT`.** An occurrence is a system-derived fact ("this obligation falls due on this
+  date, for this amount"), not something a person types. A direct grant would let a hand-crafted
+  request invent one on any date for any amount, for a bill whose terms say otherwise — and the
+  amount is precisely the value [database-schema.md §13](database-schema.md) protects by copying
+  it at generation time.
+- **No `DELETE`.** Removing a `scheduled` row is safe; removing a `paid` or `skipped` one
+  destroys payment history. PostgreSQL has no column- or predicate-scoped `DELETE`, so a
+  table-level grant could not tell the two apart. Only a policy can — and a policy on a role that
+  never holds the grant is unreachable.
+- **The three columns that *are* granted are exactly the state machine.** `amount_cents` and
+  `due_date` are absent, which is the whole point: neither the owner nor the scheduler may
+  rewrite what an instance was due for or when.
+
+`bills` gets no `DELETE` either, matching §4's "prefer archive" row — and
+`bill_occurrences_bill_fk` is `NO ACTION DEFERRABLE` rather than `CASCADE`, so a hard delete of a
+bill with any occurrence would fail at `COMMIT` regardless.
+
+Two new guard triggers. `assert_bill_refs()` (`BEFORE INSERT OR UPDATE`) requires that a named
+category not be archived and a named account not be archived, and **each half runs only when its
+own column actually changes** — so a bill whose category was archived later can still be renamed,
+repriced and unarchived.
+
+**A bill's category `kind` is deliberately unconstrained**, at every layer: the trigger, the
+validation schema, the mutation preflight and the form's picker all accept an income category.
+No approved pre-CP7 requirement makes a bill's category an expense category — `bills.category_id`
+is a plain nullable composite FK with no `CHECK`, and neither this document nor
+[database-schema.md](database-schema.md) §4/§13 states a kind rule for it. CP6's budgets rule is
+not transferable: for a budget, `expense` is what the row *means*, whereas for a bill the category
+is a label on a recurring obligation. And `guard_category_kind_change()` (CP2) naming `bills`
+proves only that a *referenced* category's kind becomes immutable, not that the kind must be
+`expense`. `180-bill-writes.sql` asserts the acceptance positively, so a later checkpoint cannot
+introduce the narrower rule quietly.
+
+`guard_bill_occurrence_transition()` (`BEFORE UPDATE`) is the
+four supported transitions, the owner-timezone `paid_on` ceiling, and the row-level restatement
+that nothing outside the state machine may move, for *every* role rather than only the one the
+grant constrains).
+
+#### The scheduler bridge — one `SECURITY DEFINER`, and how narrow it is
+
+Generating and rebuilding occurrences needs privileges `authenticated` deliberately does not
+have, and the recurrence machinery lives in `private`, which `authenticated` has no `USAGE` on
+and must never get (§9, and CP4's invoker RPCs depend on it). So CP7 adds exactly one bridge,
+built to CP5's rules:
+
+| Function | Security | Parameters | `EXECUTE` |
+|---|---|---|---|
+| `public.create_bill(uuid, text, bigint, bill_frequency, date, uuid, uuid)` | `INVOKER` | bill id, name, amount, frequency, anchor, category, account | `authenticated` only |
+| `public.replace_bill(...)` | `INVOKER` | same | `authenticated` only |
+| `public.set_bill_archived(uuid, boolean)` | `INVOKER` | bill id, archive flag | `authenticated` only |
+| `public.maintain_bill_schedule(uuid, boolean)` | **`DEFINER`**, owned by `finance_snapshot_writer` | owned bill id, rebuild flag | `authenticated` only |
+| `private.generate_bill_occurrences_for_bill(uuid, uuid, date, date)` | `INVOKER` | — | `finance_snapshot_writer` only |
+
+The three bill RPCs are `SECURITY INVOKER` for CP4's reason: the caller already holds every
+privilege their bodies use. They exist because a bill and its schedule must commit *together* —
+a created bill with no occurrence has no projected due date and is invisible on `/bills`, and an
+edited bill whose future schedule failed to rebuild would disagree with its own terms
+permanently. PostgREST issues one statement per request in its own transaction, so neither is
+expressible as a sequence of PostgREST calls.
+
+`maintain_bill_schedule` is the definer, and it is narrow by construction:
+
+- **No owner parameter.** The owner is read from the request's own JWT claim via
+  `private.request_owner_id()`, exactly as CP5's snapshot bridge does, and the bill is then
+  scoped `where id = p_bill_id and user_id = <that owner>`.
+- **No horizon, no date range, no month.** The rolling horizon — **one year from the owner's own
+  calendar day**, widened to the bill's anchor when that anchor is further out — is a constant
+  inside the function body that no client can reach. `090-privileges.sql` asserts the argument
+  list is exactly `(uuid, boolean)`, the same way it asserts the snapshot bridge takes zero
+  arguments: the guarantee is a property of the signature, not of a check inside the body.
+- **Owned by the existing `finance_snapshot_writer`** — `NOLOGIN`, `NOSUPERUSER`, `NOBYPASSRLS`,
+  no application member — never `postgres`, whose `BYPASSRLS` would make a browser-reachable
+  function into an RLS bypass. `search_path = ''`, every name qualified. `CREATE ON SCHEMA public`
+  is granted for the one `ALTER FUNCTION … OWNER TO` statement and revoked immediately.
+- **One new privilege for the role: `DELETE` on `bill_occurrences`**, behind a policy narrower
+  than any other writer policy in this schema — `status = 'scheduled' AND user_id =
+  private.request_owner_id()`. Paid and skipped history is unreachable at the *policy* layer,
+  before Phase 4's `guard_bill_occurrence_delete()` trigger is even consulted, and a session with
+  no JWT claim (a psql shell, a cron job) can delete nothing at all.
+- **It gains nothing else.** No `UPDATE` on `bill_occurrences` ever — the scheduler may add a
+  scheduled occurrence or remove a scheduled occurrence, and may never rewrite one.
+
+**Bill tracking creates no ledger activity.** No function or action in CP7 writes a transaction,
+a movement, an account or a budget, and none refreshes the net-worth snapshot — there is no
+figure for it to recompute. Marking a bill paid may optionally *reference* one of the owner's
+existing transactions, and that reference alters nothing about it;
+`bill_occurrences_transaction_fk` (`NO ACTION DEFERRABLE`) then protects the transaction from
+deletion until the occurrence is unmarked.
+
+**Deliberate limitation, recorded rather than implied:** Phase 4's
+`private.write_net_worth_snapshot` carries **two** sign guards — `v_assets_cents < 0` and
+`v_liabilities_cents < 0` — and raises `data_exception` (SQLSTATE 22000) before writing anything
+rather than storing either magnitude negative. CP4 and CP5 together make both states reachable
+through ordinary supported writes: an owner whose whole *asset* position is negative (one
+overdrawn account and no savings), and an owner with an overpaid card and no other debt. In both
+cases the application degrades correctly — the refresh is best-effort, so the ledger write still
+commits, the action reports success, one sanitized classification is logged, and the existing
+snapshot row is left untouched — and CP5 does not alter the Phase 4 writer. See
+[database-schema.md §14](database-schema.md) for the full statement.
 
 ---
 
@@ -121,10 +478,10 @@ Combined with §3's grants, this table is the intended eventual policy matrix �
 | Table | SELECT | INSERT | UPDATE | DELETE |
 |---|---|---|---|---|
 | `profiles` | own row | ❌ never — provisioning/admin creates it, not the application | Phase 7, **column-scoped to `timezone` only** (see below) | ❌ never |
-| `accounts` | own rows | Phase 7 | Phase 7 | ❌ prefer archive (`is_archived`) over delete |
-| `categories` | own rows | Phase 7 | Phase 7, including archive | ❌ no routine hard delete while referenced |
-| `transactions` | own rows | Phase 7 | Phase 7 | Phase 7, non-movement rows only |
-| `movements` | own rows | Phase 7 | ❌ never | Phase 7 — cascades both legs |
+| `accounts` | own rows | ✅ **CP2** (`accounts_insert_own`) | ✅ **CP2**, incl. archive (`accounts_update_own`) | ❌ prefer archive (`is_archived`) over delete |
+| `categories` | own rows | ✅ **CP2** (`categories_insert_own`) | ✅ **CP2**, including archive (`categories_update_own`) | ❌ no routine hard delete while referenced |
+| `transactions` | own rows | ✅ **CP3** (`transactions_insert_own`) | ✅ **CP3**, own **ordinary non-adjustment** rows only (`transactions_update_own_ordinary`) | ✅ **CP3**, own **non-movement** rows only (`transactions_delete_own_non_movement`) |
+| `movements` | ✅ **CP4** (`movements_select_own`) | ✅ **CP4** (`movements_insert_own`) | ❌ **never** — no grant and no policy; an edit rewrites the pair through `replace_movement` | ✅ **CP4** (`movements_delete_own`) — cascades both legs |
 | `budgets` | own rows | Phase 7 | Phase 7 | Phase 7, only if deliberately needed |
 | `bills` | own rows | Phase 7 | Phase 7, including archive | ❌ prefer archive |
 | `bill_occurrences` | own rows | ❌ — system-generated only | Phase 7, **narrowly scoped to `status`/payment fields only** | ❌ no unrestricted authenticated delete |
@@ -149,6 +506,46 @@ row, including ones the application never intends to expose. The column restrict
 `GRANT UPDATE (timezone) ON profiles TO authenticated`-style column-level grant, applied when
 Phase 7 builds that feature. Documenting this now so it isn't mistaken for something the RLS
 policy alone will cover.
+
+### CP3: a policy predicate doing more than ownership
+
+`transactions` is the first table where the write policies filter on something other than the
+owner, and each extra clause replaces a capability the application must not have:
+
+- **`movement_id IS NULL`**, in the `UPDATE` policy's `USING` *and* `WITH CHECK`, and in the
+  `DELETE` policy's `USING`. It is the entire mechanism by which a transfer or card-payment leg
+  is unreachable from the ordinary transaction surface: a leg is invisible to both statements, so
+  neither can half-rewrite a movement or remove one leg and strand the other. Deleting a movement
+  stays a CP4 operation on the *parent* row, which cascades both legs
+  (`transactions_movement_fk` is `ON DELETE CASCADE`). It is deliberately absent from the
+  `INSERT` policy — a leg has to be insertable for CP4 to exist, and every other guarantee about
+  legs is `validate_movement()`'s deferred job.
+- **`kind <> 'adjustment'`**, in the `UPDATE` policy's `USING` *and* `WITH CHECK`, refusing two
+  different things. `USING` stops an existing adjustment being targeted: it records a
+  reconciliation decision, and editing it would restate the balance that decision produced
+  without the reconciliation that justified it. `WITH CHECK` stops an ordinary row being *turned
+  into* one — without it, the entry surface would be a two-step path (create an expense, retype
+  it) to writing the CP5-only row CP3 is not supposed to ship. Adjustment `DELETE` is left
+  possible on purpose: reconciliation is delete-and-rewrite.
+
+The `UPDATE`-with-no-error failure mode described below matters most here. An `UPDATE` whose
+target fails `USING` raises *nothing* — it simply matches zero rows — so
+`supabase/tests/database/110-write-rls.sql` proves each of these by re-reading the row afterwards
+rather than by trusting the absence of a throw.
+
+Phase 7 CP2 is the first place column-scoping actually landed — see §3's column tables for
+`accounts` and `categories`. Two consequences worth recording, both learned by building it:
+
+- The `UPDATE` policies take **both** `USING` and `WITH CHECK`. `USING` decides which existing
+  rows the statement may touch; `WITH CHECK` decides what they may look like afterwards. With
+  `USING` alone, an owned row could be updated into a shape no longer satisfying the predicate.
+  `user_id` is not in the `UPDATE` grant, so that is already unreachable — but a policy that
+  depends on a grant's column list for its own correctness is one edit away from being wrong.
+- `has_table_privilege(role, table, 'insert')` is **false** for a role holding only column
+  privileges, so a posture test written with it would report "zero write grants" on a
+  demonstrably writable table. `has_any_column_privilege()` is the right function, except for
+  `DELETE`, which has no column-level form at all and raises "unrecognized privilege type" if
+  asked. `supabase/tests/database/100-write-grants.sql` uses each accordingly.
 
 ---
 
@@ -283,6 +680,19 @@ which role is chosen:**
   this document states requirements; it does not assume Supabase's managed `pg_cron` offering
   behaves identically to vanilla Postgres, and that gap must be checked before relying on it.
 
+**Resolved in Phase 7 CP8A.** The role is `finance_snapshot_writer` (decided in Phase 4, unchanged
+since), and `pg_cron` is now actually scheduled — two daily jobs, each a single call to a
+`SECURITY DEFINER` function owned by that role, satisfying every requirement above: fixed
+`search_path`, qualified references, `EXECUTE` revoked from `PUBLIC`/`anon`/`authenticated`,
+explicit per-owner iteration (never an unscoped cross-user write), and no reliance on `auth.uid()`
+— the functions use `private.request_owner_id()`'s own GUC, impersonated one owner at a time via
+`set_config`, exactly as CP5's request-scoped bridge already does for a live request. Full design
+in [database-schema.md](database-schema.md#phase-7-cp8a--pg_cron-is-finally-scheduled-and-it-is-the-writer-this-section-always-intended).
+Verified against the real local Postgres/pg_cron image, not assumed — `postgres` is `NOSUPERUSER`
+here exactly as this document already notes, which is why the scheduled command is a `SECURITY
+DEFINER` call rather than pg_cron running the job directly as `finance_snapshot_writer` (that path
+requires an actual superuser to schedule).
+
 ---
 
 ## 10. `security_invoker` views
@@ -313,8 +723,10 @@ Every function/RPC in this schema — the timezone-validation trigger function
 ([database-schema.md §10](database-schema.md#10-date-and-timezone-rules)), the movement
 constraint-trigger function ([database-schema.md §7](database-schema.md#7-the-movement-invariant-in-detail)),
 the bill-occurrence deletion-guard trigger function
-([database-schema.md §13](database-schema.md#13-recurring-bill--occurrence-model)), and the
-snapshot writer (§9) — follows the same rule:
+([database-schema.md §13](database-schema.md#13-recurring-bill--occurrence-model)), the Phase 7
+write guards (`accounts_guard_update()`, `guard_category_kind_change()`,
+`assert_transaction_refs()` — [database-schema.md §6](database-schema.md#6-constraints-and-cross-row-invariants)),
+and the snapshot writer (§9) — follows the same rule:
 
 **`EXECUTE` is revoked from `PUBLIC` by default. A function is callable by `anon` or
 `authenticated` only when that access is intentional and explicitly granted for a stated
@@ -342,6 +754,17 @@ PostgreSQL trigger execution works, and the claim is retracted:**
   fully-qualified references where appropriate, minimal privileges, and no unnecessary direct
   `EXECUTE` exposure.
 
+**How it actually turned out: every trigger function in this schema is `SECURITY INVOKER`,
+including the three Phase 7 write guards.** That is not an oversight and it is asserted, not
+assumed — `supabase/tests/database/000-objects.sql` checks `prosecdef = false` on each of them.
+The reasoning is the same in every case and is worth stating once: each guard reads rows the
+triggering role already has `SELECT` on, and under `FORCE ROW LEVEL SECURITY` the invoker sees
+exactly its own — which is precisely the scope the check wants. `assert_transaction_refs()` is
+the sharpest example: it looks up the owner's profile, the account, and the category, and every
+one of those lookups *should* be limited to the caller's own rows. Taking a definer's privileges
+would hand a browser-reachable write path capabilities it has no use for, in exchange for
+nothing.
+
 **The correct reason `EXECUTE` on these trigger functions doesn't need a direct grant to
 `authenticated`** is unrelated to execution context: PostgreSQL invokes a trigger function
 automatically as part of the triggering DML statement — there is no separate `EXECUTE`-privilege
@@ -354,6 +777,48 @@ The snapshot writer needs no `authenticated` or `anon` `EXECUTE` grant under the
 design; if the documented on-demand fallback (`database-schema.md §14`) is ever exposed as a
 callable RPC instead, that is a **separate, deliberate grant decision** to make explicitly at
 that time — not a default extension of the cron writer's existing privilege.
+
+### The eight RPCs — the only `EXECUTE` grants to an application role
+
+`public.create_movement` and `public.replace_movement` (CP4); `public.reconcile_account` and
+`public.refresh_current_net_worth_snapshot` (CP5); and `public.create_bill`,
+`public.replace_bill`, `public.set_bill_archived` and `public.maintain_bill_schedule` (CP7) are
+the only functions `authenticated` may call directly. That is the "intentional and explicitly granted for
+a stated application reason" case the rule above anticipates, and the reason is structural
+rather than ergonomic: a valid movement cannot be assembled by any sequence of PostgREST
+statements (§3), so a function is the only thing that can write one.
+
+Three properties make that grant narrow rather than a widening:
+
+- **`SECURITY INVOKER`, despite doing an atomic multi-table write.** That is the shape people
+  normally reach for `SECURITY DEFINER` to implement, and it is not needed here: the caller
+  already holds every privilege the bodies use (`SELECT` on `accounts` and `movements`, the
+  column-scoped `INSERT`s, `DELETE` on `movements`), and under `FORCE ROW LEVEL SECURITY` the
+  invoker sees exactly its own accounts and movements — which is precisely the scope every
+  lookup wants. A definer's context would not add a check; it would remove the RLS backing
+  every statement inside. `090-privileges.sql` asserts `prosecdef = false` on both.
+- **No owner parameter.** Neither function takes a `user_id`. A caller-supplied owner is an
+  authorization decision made by untrusted input, and no amount of policy work downstream
+  repairs it. `auth.uid()` is read inside each body, and a null one raises.
+- **`EXECUTE` revoked from `PUBLIC` and `anon`, granted to `authenticated` alone.** An
+  unauthenticated request is `anon`, so "an anonymous request cannot create a movement" is a
+  privilege-layer fact rather than something the function body has to notice —
+  `100-write-grants.sql` proves it by actually calling both as `anon` and asserting 42501.
+  `090-privileges.sql` additionally asserts that these are the *entire* set of `public`-schema
+  functions `authenticated` may execute, as a sorted list rather than a count.
+
+Six of the eight are `SECURITY INVOKER`, for the reasons above.
+`refresh_current_net_worth_snapshot` (CP5) and `maintain_bill_schedule` (CP7) are the only two
+`SECURITY DEFINER` exceptions in the whole application, and in both cases the reason is a hard
+boundary rather than a preference: the machinery each one reaches lives in `private`, is owned by
+`finance_snapshot_writer`, and writes a relation `authenticated` holds no write grant on. See §3,
+*What Phase 7 CP5 added* and *What Phase 7 CP7 added*, for why an invoker wrapper could reach
+nothing either one needs, and for the properties that keep both definers' identity narrow: a
+`NOLOGIN`/`NOBYPASSRLS` owner, no owner parameter (both read the request's own JWT claim), no
+addressable month/horizon/range, no standing `CREATE` on `public`, and — for the scheduler — a
+`DELETE` policy restricted to `status = 'scheduled'` and the calling request's own rows.
+`090-privileges.sql` pins each one's argument list exactly: zero parameters for the snapshot
+bridge, `(uuid, boolean)` for the scheduler.
 
 ---
 

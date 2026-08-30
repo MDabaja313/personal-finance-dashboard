@@ -6,6 +6,7 @@ import { IncomeExpenseChart } from "@/components/analytics/income-expense-chart"
 import { NetWorthChart } from "@/components/analytics/net-worth-chart";
 import { SavingsRateChart } from "@/components/analytics/savings-rate-chart";
 import { PageHeader } from "@/components/shared/page-header";
+import { SnapshotStaleNotice } from "@/components/shared/snapshot-stale-notice";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { getAccounts } from "@/lib/data/accounts";
 import { getCategories } from "@/lib/data/categories";
@@ -14,7 +15,7 @@ import { getNetWorthHistory } from "@/lib/data/net-worth";
 import { getTransactions } from "@/lib/data/transactions";
 import { accountKind } from "@/lib/finance/accounts";
 import { addMonths, monthEnd, monthKey, monthStart } from "@/lib/finance/dates";
-import { monthlyTotals } from "@/lib/finance/trends";
+import { monthlyTotals, snapshotHealth } from "@/lib/finance/trends";
 import { spendingByCategory } from "@/lib/finance/transactions";
 import { formatCents } from "@/lib/format/currency";
 import { monthLabel } from "@/lib/format/date";
@@ -35,6 +36,7 @@ export default async function AnalyticsPage() {
 
   const totals = monthlyTotals(transactions, months);
   const netWorthByMonth = new Map(netWorthHistory.map((s) => [s.month, s.netWorthCents]));
+  const isSnapshotStale = snapshotHealth(accounts, netWorthHistory, currentMonth).status === "stale";
 
   const trendData = totals.map((t) => ({
     month: t.month,
@@ -71,6 +73,7 @@ export default async function AnalyticsPage() {
             <CardTitle>Net Worth Trend</CardTitle>
           </CardHeader>
           <CardContent>
+            {isSnapshotStale && <SnapshotStaleNotice />}
             <div aria-hidden="true">
               <NetWorthChart data={trendData} />
             </div>

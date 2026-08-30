@@ -1,7 +1,10 @@
--- Row Level Security: ownership isolation on the 10 grant-bearing
--- tables, movements' deliberate GRANT-layer exclusion, anon's total
--- exclusion, write-denial for authenticated, and both security_invoker
--- views. All fixture setup runs as the migration owner (postgres has
+-- Row Level Security: ownership isolation on the grant-bearing tables,
+-- movements' CP4 read grant (and its still-absent UPDATE), anon's total
+-- exclusion, write-denial for authenticated on every table Phase 7 has
+-- NOT opened (accounts, categories, transactions and movements are
+-- covered by 100/110/120/130/140 instead), and both security_invoker
+-- views. All fixture setup runs as
+-- the migration owner (postgres has
 -- BYPASSRLS, so it bypasses FORCE ROW LEVEL SECURITY entirely -- the
 -- same reason 020/030/040/050 could seed rows directly). Role/claim
 -- switches use the verified local auth.uid() form:
@@ -16,7 +19,7 @@
 -- 42501 before RLS is ever consulted; a granted-but-unmatched SELECT
 -- returns zero rows, not an error.
 begin;
-select plan(41);
+select plan(47);
 
 -- ============================================================
 -- Fixture: two users, one row in each of the 10 grant-bearing tables,
@@ -109,14 +112,40 @@ select is(
   'A explicitly sees zero account rows filtered to B''s user_id'
 );
 
--- movements: no GRANT exists for authenticated at all -- fails at the
--- privilege layer (42501), before RLS (which has no policy on this
--- table either) is ever consulted.
-select throws_ok(
+-- movements: readable as of Phase 7 CP4, and own-rows-only like every
+-- other table. Through Phase 6 this assertion was the opposite -- no
+-- GRANT existed at all and the query failed at the privilege layer --
+-- because nothing read the parent (`Transaction.movementId` is a plain
+-- column on the leg). The movement *edit* surface is the first thing
+-- that has to read the pair as one object, so the grant and the policy
+-- arrived with it.
+--
+-- Asserted by row count rather than by "no error": a granted table with
+-- a missing policy returns zero rows silently, so a bare success check
+-- could not tell a working policy from an absent one. A's fixture below
+-- has no movement, and B's is invisible, so the count is 0 -- which is
+-- why the *positive* half is proved in 140-movement-writes.sql against
+-- a movement the caller actually owns.
+select lives_ok(
   $$ select count(*) from public.movements $$,
+  'authenticated may now SELECT movements (Phase 7 CP4 grant + movements_select_own)'
+);
+select is(
+  (select count(*)::int from public.movements),
+  0,
+  'and sees none of B''s movements -- movements_select_own filters to the caller'
+);
+
+-- The one operation that stayed shut: there is no UPDATE grant on
+-- movements and no UPDATE policy, so this fails at the privilege layer.
+-- A movements row is (id, user_id, kind); changing `kind` in place would
+-- contradict every leg's own kind (validate_movement() assert 3), and
+-- rewriting the pair together is what replace_movement() is for.
+select throws_ok(
+  $$ update public.movements set kind = 'transfer' where false $$,
   '42501',
   null,
-  'authenticated querying movements fails with permission denied (GRANT layer, not RLS)'
+  'authenticated still cannot UPDATE movements -- no grant, no policy'
 );
 
 -- Both security_invoker views respect ownership: A sees only A's own
@@ -138,20 +167,57 @@ select is(
 -- operation and a representative spread of tables -- no write GRANT
 -- exists on any table through Phase 6, so every attempt fails 42501
 -- regardless of ownership.
+-- Phase 7 CP2 gave `authenticated` column-scoped INSERT/UPDATE on
+-- accounts and categories; CP3 added transactions (INSERT/UPDATE/
+-- DELETE); CP4 added movements (SELECT/INSERT/DELETE, never UPDATE);
+-- CP6 added budgets (INSERT/UPDATE/DELETE) and goals (INSERT/UPDATE,
+-- never DELETE) -- goal_contributions stays INSERT-only; CP7 added
+-- bills (INSERT/UPDATE, never DELETE) and a three-column UPDATE on
+-- bill_occurrences. So this file no longer asserts blanket
+-- write-denial on those eight -- their full grant, RLS, trigger and
+-- RPC behavior is 100/110/120/130/135/140/170/180.
+--
+-- What remains read-only for this role after CP7 is exactly two
+-- tables, and they are the two that must stay that way: profiles (the
+-- owner's own settings row, written only by provisioning) and
+-- net_worth_snapshots (a derived artifact, written only by the Phase 4
+-- writer). They stand in here for the tables these assertions used to
+-- name. bill_occurrences keeps its INSERT and DELETE denials below,
+-- since CP7 granted neither.
 select throws_ok(
-  $$ insert into public.accounts (id, user_id, name, institution, type, opening_balance_cents) values ('14000000-0000-4000-8000-0000000000a3', '14000000-0000-4000-8000-000000000001', 'X', 'Bank', 'checking', 0) $$,
+  $$ insert into public.net_worth_snapshots (user_id, month, assets_cents, liabilities_cents, net_worth_cents) values ('14000000-0000-4000-8000-000000000001', '2026-02', 100, 0, 100) $$,
   '42501', null,
-  'authenticated INSERT on accounts (even own row) is denied at the GRANT layer'
+  'authenticated INSERT on net_worth_snapshots (even own row) is denied at the GRANT layer'
 );
 select throws_ok(
-  $$ update public.transactions set merchant = 'changed' where id = '14000000-0000-4000-8000-000000000101' $$,
+  $$ update public.net_worth_snapshots set assets_cents = 1 where user_id = '14000000-0000-4000-8000-000000000001' $$,
   '42501', null,
-  'authenticated UPDATE on transactions (even own row) is denied at the GRANT layer'
+  'authenticated UPDATE on net_worth_snapshots (even own row) is denied at the GRANT layer'
+);
+select throws_ok(
+  $$ delete from public.bill_occurrences where id = '14000000-0000-4000-8000-000000000301' $$,
+  '42501', null,
+  'authenticated DELETE on bill_occurrences (even own row) is denied at the GRANT layer -- CP7 granted UPDATE only'
 );
 select throws_ok(
   $$ delete from public.goals where id = '14000000-0000-4000-8000-000000000401' $$,
   '42501', null,
-  'authenticated DELETE on goals (even own row) is denied at the GRANT layer'
+  'authenticated DELETE on goals (even own row) is denied at the GRANT layer -- CP6 gave goals no DELETE grant'
+);
+select throws_ok(
+  $$ update public.goal_contributions set note = 'changed' where id = '14000000-0000-4000-8000-000000000501' $$,
+  '42501', null,
+  'authenticated UPDATE on goal_contributions is denied at the GRANT layer -- append-only, permanently'
+);
+select throws_ok(
+  $$ delete from public.goal_contributions where id = '14000000-0000-4000-8000-000000000501' $$,
+  '42501', null,
+  'authenticated DELETE on goal_contributions is denied at the GRANT layer -- append-only, permanently'
+);
+select throws_ok(
+  $$ insert into public.bill_occurrences (id, user_id, bill_id, due_date, status, amount_cents) values ('14000000-0000-4000-8000-000000000303', '14000000-0000-4000-8000-000000000001', '14000000-0000-4000-8000-000000000201', '2026-02-01', 'scheduled', 100) $$,
+  '42501', null,
+  'authenticated INSERT on bill_occurrences (even own row) is denied at the GRANT layer -- system-generated only'
 );
 select throws_ok(
   $$ update public.profiles set timezone = 'America/New_York' where id = '14000000-0000-4000-8000-000000000001' $$,

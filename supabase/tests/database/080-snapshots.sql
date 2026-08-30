@@ -20,13 +20,20 @@ insert into public.profiles (id) values ('16000000-0000-4000-8000-000000000001')
 -- both liability types (credit, loan), plus one archived account whose
 -- large opening balance would visibly change every total below if it
 -- were wrongly included.
-insert into public.accounts (id, user_id, name, institution, type, opening_balance_cents) values
-  ('16000000-0000-4000-8000-0000000000a1', '16000000-0000-4000-8000-000000000001', 'Checking', 'Bank', 'checking', 100000),
-  ('16000000-0000-4000-8000-0000000000a2', '16000000-0000-4000-8000-000000000001', 'Savings', 'Bank', 'savings', 5000),
-  ('16000000-0000-4000-8000-0000000000a3', '16000000-0000-4000-8000-000000000001', 'Credit Card', 'Bank', 'credit', -20000),
-  ('16000000-0000-4000-8000-0000000000a4', '16000000-0000-4000-8000-000000000001', 'Loan', 'Bank', 'loan', -50000),
-  ('16000000-0000-4000-8000-0000000000a5', '16000000-0000-4000-8000-000000000001', 'Archived Checking', 'Bank', 'checking', 99999999);
-update public.accounts set is_archived = true where id = '16000000-0000-4000-8000-0000000000a5';
+-- a5 is inserted already archived rather than archived by a follow-up
+-- UPDATE. Phase 7 CP2's accounts_guard_update() refuses the false ->
+-- true transition unless the account's derived balance is exactly zero,
+-- and a5's whole purpose here is to hold a balance large enough that
+-- wrongly including it would be unmissable. Inserting the flag directly
+-- keeps this fixture stating the same fact -- "an archived account with
+-- a large balance exists" -- without exercising an archive transition
+-- this file is not about; the guard's own behavior is 120-account-guard.sql.
+insert into public.accounts (id, user_id, name, institution, type, opening_balance_cents, is_archived) values
+  ('16000000-0000-4000-8000-0000000000a1', '16000000-0000-4000-8000-000000000001', 'Checking', 'Bank', 'checking', 100000, false),
+  ('16000000-0000-4000-8000-0000000000a2', '16000000-0000-4000-8000-000000000001', 'Savings', 'Bank', 'savings', 5000, false),
+  ('16000000-0000-4000-8000-0000000000a3', '16000000-0000-4000-8000-000000000001', 'Credit Card', 'Bank', 'credit', -20000, false),
+  ('16000000-0000-4000-8000-0000000000a4', '16000000-0000-4000-8000-000000000001', 'Loan', 'Bank', 'loan', -50000, false),
+  ('16000000-0000-4000-8000-0000000000a5', '16000000-0000-4000-8000-000000000001', 'Archived Checking', 'Bank', 'checking', 99999999, true);
 
 -- Transactions straddling the January/February boundary on every live
 -- account. The 01-31 rows land exactly on the target month-end

@@ -1,0 +1,43 @@
+name: CI
+
+# Offline checks only — CP8A. No local Supabase, no hosted Supabase, no
+# secrets: `npm test` mocks lib/data/supabase.ts, and `next build` never
+# executes a Server Component at build time (every app/(app)/** route is
+# dynamic, gated by requireUser()), so the two NEXT_PUBLIC_* values only need
+# to be *present* for lib/supabase/env.ts's presence check — the fake values
+# below are browser-safe placeholders, not real project credentials, and are
+# never used to reach an actual Supabase project. Deliberately excluded:
+# npm run test:parity, npm run test:mutations, npm run db:test, and
+# npm run auth:verify — every one of those requires a running local Supabase
+# instance and a provisioned owner, which this workflow does not set up. See
+# docs/operations.md for what still has to run locally before a release.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  offline-checks:
+    runs-on: ubuntu-latest
+    env:
+      NEXT_PUBLIC_SUPABASE_URL: "https://ci-placeholder.supabase.co"
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: "ci-placeholder-publishable-key"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run lint
+
+      - run: npx next typegen
+
+      - run: npm run typecheck
+
+      - run: npm test
+
+      - run: npm run build

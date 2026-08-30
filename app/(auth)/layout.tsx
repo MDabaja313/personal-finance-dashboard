@@ -4,7 +4,10 @@
  * Checkpoint A3 onward — no identity guard, since a signed-out visitor is
  * exactly who these routes are for.
  *
- * `/login` is the only route in this group. There is no signup route.
+ * `/login` and `/forgot-password` are the only routes in this group — both
+ * for a signed-out visitor. There is no signup route. `/reset-password`
+ * (the opposite case: requires a verified session) is deliberately *not*
+ * in this group — see app/reset-password/page.tsx.
  */
 export default function AuthLayout({ children }: { children: React.ReactNode }) {
   return (

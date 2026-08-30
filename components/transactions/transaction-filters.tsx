@@ -14,12 +14,20 @@ import type { Account, Category } from "@/lib/types";
 
 const ALL = "all";
 
+/**
+ * Every kind a stored row can carry, including the ones the entry form cannot
+ * create. Filtering and creating are different questions: a transfer leg or a
+ * reconciliation adjustment is exactly the sort of row a person wants to
+ * isolate, and offering no way to filter for it would make it unfindable in a
+ * long history.
+ */
 const KIND_OPTIONS = [
   { value: "income", label: "Income" },
   { value: "expense", label: "Expense" },
   { value: "refund", label: "Refund" },
   { value: "transfer", label: "Transfer" },
   { value: "credit_card_payment", label: "Card Payment" },
+  { value: "adjustment", label: "Adjustment" },
 ];
 
 interface TransactionFiltersProps {

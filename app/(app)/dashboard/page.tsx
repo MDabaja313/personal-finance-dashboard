@@ -7,7 +7,7 @@ import { RecentTransactions } from "@/components/dashboard/recent-transactions";
 import { SpendingByCategory } from "@/components/dashboard/spending-by-category";
 import { UpcomingBills } from "@/components/dashboard/upcoming-bills";
 import { PageHeader } from "@/components/shared/page-header";
-import type { TransactionRow } from "@/components/transactions/types";
+import type { TransactionDisplayRow } from "@/components/transactions/types";
 import { getAccounts } from "@/lib/data/accounts";
 import { getUpcomingBills } from "@/lib/data/bills";
 import { getBudgets } from "@/lib/data/budgets";
@@ -28,6 +28,7 @@ import {
   savingsRate,
   spendingByCategory,
 } from "@/lib/finance/transactions";
+import { snapshotHealth } from "@/lib/finance/trends";
 import { monthLabel } from "@/lib/format/date";
 
 export default async function DashboardPage() {
@@ -49,7 +50,7 @@ export default async function DashboardPage() {
   const accountName = new Map(accounts.map((a) => [a.id, a.name]));
   const categoryName = new Map(categories.map((c) => [c.id, c.name]));
 
-  const recentRows: TransactionRow[] = recentTransactionsRaw.map((t) => ({
+  const recentRows: TransactionDisplayRow[] = recentTransactionsRaw.map((t) => ({
     id: t.id,
     date: t.date,
     merchant: t.merchant,
@@ -90,6 +91,7 @@ export default async function DashboardPage() {
   const months = Array.from({ length: 6 }, (_, i) => addMonths(currentMonth, i - 5));
   const netWorthByMonth = new Map(netWorthHistory.map((s) => [s.month, s.netWorthCents]));
   const trendData = months.map((m) => ({ label: monthLabel(m), netWorthCents: netWorthByMonth.get(m) ?? 0 }));
+  const isSnapshotStale = snapshotHealth(accounts, netWorthHistory, currentMonth).status === "stale";
 
   return (
     <div className="flex flex-col gap-6">
@@ -106,7 +108,7 @@ export default async function DashboardPage() {
       />
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        <NetWorthTrend data={trendData} />
+        <NetWorthTrend data={trendData} stale={isSnapshotStale} />
         <SpendingByCategory rows={categorySpend} />
         <AccountSummary accounts={accounts.filter((a) => !a.isArchived)} />
         <RecentTransactions rows={recentRows} />

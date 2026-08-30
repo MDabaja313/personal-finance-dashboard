@@ -14,7 +14,6 @@ import {
   toGoal,
   toNetWorthSnapshot,
   toTransaction,
-  ACCOUNT_TYPES,
 } from "@/lib/data/mappers";
 import type {
   AccountBalanceRow,
@@ -26,6 +25,7 @@ import type {
   TransactionRow,
 } from "@/lib/data/rows";
 import { AppError, isAppError } from "@/lib/errors";
+import { ACCOUNT_TYPES } from "@/lib/types/enums";
 
 // A value that survives JSON but not the safe-integer invariant, chosen so a
 // leak into a user-facing message is unmistakable in an assertion.
@@ -60,6 +60,7 @@ const categoryRow: CategoryRow = {
   id: "22222222-2222-4222-8222-222222222222",
   name: "Groceries",
   kind: "expense",
+  is_archived: false,
 };
 
 const transactionRow: TransactionRow = {
@@ -303,12 +304,20 @@ describe("toAccount", () => {
 });
 
 describe("toCategory", () => {
-  it("maps a row to the Category DTO and drops is_archived", () => {
+  it("maps a row to the Category DTO, archive state included", () => {
     expect(toCategory(categoryRow)).toEqual({
       id: categoryRow.id,
       name: "Groceries",
       kind: "expense",
+      isArchived: false,
     });
+  });
+
+  it("carries an archived row through rather than dropping it", () => {
+    // Archived categories are still returned by getCategories() — they are
+    // what resolves the label on a historical transaction. Exposing the flag
+    // must not turn into filtering by it.
+    expect(toCategory({ ...categoryRow, is_archived: true }).isArchived).toBe(true);
   });
 
   it("rejects an unrecognized category kind", () => {

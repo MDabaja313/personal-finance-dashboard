@@ -117,3 +117,71 @@ describe("spendingByCategory", () => {
     expect(spendingByCategory(transactions, month)).toEqual([]);
   });
 });
+
+describe("adjustment — a balance correction, never an economic event", () => {
+  const month = "2026-08";
+
+  /**
+   * The kind CP5's reconciliation writes. Every assertion here is the pure
+   * counterpart of a rule the database also enforces: an adjustment carries no
+   * category (`transactions_adjustment_no_category_ck`), carries no movement
+   * (`transactions_movement_biconditional_ck`), and may be signed either way
+   * (`transactions_sign_by_kind_ck`'s unconstrained adjustment branch) because
+   * a correction's direction is whatever the correction requires.
+   */
+  it("is neither spending nor income, in either direction", () => {
+    for (const amountCents of [toCents(-5_000), toCents(0), toCents(5_000)]) {
+      const row = txn({ kind: "adjustment", categoryId: undefined, amountCents });
+      expect(countsAsSpending(row)).toBe(false);
+      expect(countsAsIncome(row)).toBe(false);
+    }
+  });
+
+  it("leaves income, spending and cash flow exactly as they were", () => {
+    const ordinary: Transaction[] = [
+      txn({ id: "salary", kind: "income", amountCents: toCents(300_000) }),
+      txn({ id: "rent", kind: "expense", categoryId: "cat-housing", amountCents: toCents(-150_000) }),
+    ];
+
+    const withAdjustments: Transaction[] = [
+      ...ordinary,
+      // A downward reconciliation on a checking account…
+      txn({ id: "adj-down", kind: "adjustment", categoryId: undefined, amountCents: toCents(-5_000) }),
+      // …and an upward one on a credit card. Both move balances; neither is an
+      // economic event, so no figure below may notice either of them.
+      txn({
+        id: "adj-up",
+        accountId: "acc-credit",
+        kind: "adjustment",
+        categoryId: undefined,
+        amountCents: toCents(15_000),
+      }),
+    ];
+
+    expect(monthlyIncome(withAdjustments, month)).toBe(monthlyIncome(ordinary, month));
+    expect(monthlySpending(withAdjustments, month)).toBe(monthlySpending(ordinary, month));
+    expect(monthlyCashFlow(withAdjustments, month)).toBe(monthlyCashFlow(ordinary, month));
+    expect(savingsRate(withAdjustments, month)).toBe(savingsRate(ordinary, month));
+
+    // And the absolute figures, so a bug that changed *both* sides identically
+    // could not pass the comparisons above.
+    expect(monthlyIncome(withAdjustments, month)).toBe(300_000);
+    expect(monthlySpending(withAdjustments, month)).toBe(150_000);
+    expect(monthlyCashFlow(withAdjustments, month)).toBe(150_000);
+  });
+
+  it("is excluded from category spending even if one somehow carried a categoryId", () => {
+    // The database refuses this row twice over, so it can only exist as a
+    // hypothetical — which is exactly why the exclusion is asserted here: it
+    // must hold on `kind` alone, not on the absence of a category.
+    const transactions: Transaction[] = [
+      txn({ id: "adj", kind: "adjustment", categoryId: "cat-shopping", amountCents: toCents(-9_000) }),
+      txn({ id: "e1", kind: "expense", categoryId: "cat-shopping", amountCents: toCents(-1_000) }),
+    ];
+
+    expect(spendingByCategory(transactions, month)).toEqual([
+      { categoryId: "cat-shopping", amountCents: 1_000 },
+    ]);
+    expect(monthlySpending(transactions, month)).toBe(1_000);
+  });
+});

@@ -32,6 +32,7 @@ verified-identity rule this document describes for `lib/auth/session.ts` (§5), 
 11. [No `service_role` in application code](#11-no-service_role-in-application-code)
 12. [Environment-variable ownership](#12-environment-variable-ownership)
 13. [Trusted `SECURITY DEFINER` principles for system jobs](#13-trusted-security-definer-principles-for-system-jobs)
+14. [Password recovery (CP8B)](#14-password-recovery-cp8b)
 
 ---
 
@@ -309,3 +310,87 @@ fully-qualified references, minimal `EXECUTE`, explicit in-function user scoping
 [docs/rls-policies.md §9](rls-policies.md#9-security-definer-bypassrls-and-the-snapshot-writer).
 The exact database role/identity that owns it is an explicit **Phase 4 provisioning decision**,
 not settled here.
+
+**Resolved in Phase 7 CP8A.** `pg_cron` is now scheduled — see
+[database-schema.md](database-schema.md#phase-7-cp8a--pg_cron-is-finally-scheduled-and-it-is-the-writer-this-section-always-intended)
+and [rls-policies.md §9](rls-policies.md#9-security-definer-bypassrls-and-the-snapshot-writer).
+The identity is `finance_snapshot_writer`, unchanged from Phase 4; this document's principle that
+such a job "runs without an authenticated user context" holds exactly as written, and the CP8A
+functions never call `auth.uid()` — they read `private.request_owner_id()`'s own GUC, one owner at
+a time.
+
+---
+
+## 14. Password recovery (CP8B)
+
+**Not part of §1's original provider model — a gap discovered, not designed, during CP8B's hosted
+manual smoke test.** Through CP8A, `lib/auth/actions.ts` exported only `signIn`/`signOut`, and
+`login-form.tsx`'s own comment documented "no password reset" as a deliberate exclusion. A real
+recovery email during hosted testing was found linking back to `localhost`, exposing that no
+recovery path existed at all. This section is added rather than folded into §1 because the
+mechanism is genuinely new surface, not a refinement of the existing one.
+
+**Constraint that shaped the design:** the hosted project is on Supabase's Free tier, which does
+not allow editing Auth email templates unless custom SMTP is configured. Custom SMTP was
+deliberately not added just to unlock template editing — the requirement was to make recovery work
+against Supabase's **default, unmodified** template.
+
+**Three routes, one new `lib/auth/**` module:**
+
+- `/forgot-password` (in the `(auth)` route group, alongside `/login` — a signed-out visitor is
+  exactly who both are for) — a form posting to `requestPasswordReset`.
+- `app/auth/callback/route.ts` (public, outside every route group) — a Route Handler.
+- `/reset-password` — gated by the same `requireUser()` every other protected surface uses,
+  deliberately outside `app/(app)/**` since it is a one-off page, not part of the authenticated app
+  shell.
+- `lib/auth/recovery.ts` — the one crossing point into `lib/supabase/**` the callback route needs,
+  matching the existing `lib/auth/**` allowlist rather than widening it.
+
+**Why the default template works without a token-hash rewrite.** `@supabase/ssr` v0.12.4 hardcodes
+`flowType: "pkce"` on *both* its browser and server clients — verified directly against
+`node_modules/@supabase/ssr/dist/module/create{Browser,Server}Client.js`, not assumed from general
+Supabase documentation, which mostly discusses this in an OAuth context. Because
+`requestPasswordReset` calls `resetPasswordForEmail` from the *server* client (already PKCE by that
+hardcoding), and Supabase's default recovery template already routes through GoTrue's own verify
+step before landing on `redirectTo` with a plain `?code=` query parameter, no custom
+`{{ .TokenHash }}` template edit is needed at all — the default `{{ .ConfirmationURL }}` already
+produces a link this app's own server can complete. `app/auth/callback/route.ts` reads that `code`
+and calls `exchangeCodeForSession(code)` — never `verifyOtp`, which is the right call only for a
+`token_hash`-style link, not a PKCE `code` one. A successful exchange writes real session cookies
+before any redirect, which is what lets `/reset-password` keep using a plain, unconditional
+`requireUser()` — no client-side URL-fragment parsing, no browser-only session bootstrapping, fully
+consistent with this app's Server-Component-first posture (§4). `exchangeCodeForSession`'s result
+carries `data.redirectType`, sourced from the PKCE verifier's own storage entry
+(`@supabase/auth-js`'s `GoTrueClient.js`) — `"recovery"` for this flow specifically, checked as
+defense-in-depth even though this app has no other PKCE-code-generating flow (no OAuth, no magic
+link, no signup) that could produce a different value.
+
+**Redirect derivation, not hardcoding.** `requestPasswordReset` builds `redirectTo` from the
+request's own `Origin` header (`headers().get("origin")`), never a literal `localhost` or
+production URL — the same code path is correct in local development and production, and a missing
+header fails safely rather than guessing a host. This was the actual root cause of the CP8B bug: an
+unset hosted Auth **Site URL** (a Supabase Dashboard field, not application code) had been sending
+every recovery link to `localhost` regardless of what the application requested.
+
+**No open redirect.** `app/auth/callback/route.ts` accepts no `next`/redirect-target parameter from
+the query string at all — the one legitimate destination (`/reset-password` on success,
+`/forgot-password?expired=1` on failure) is hardcoded in `lib/auth/recovery.ts`, so a captured or
+replayed link can't be redirected anywhere else.
+
+**Everything else about the existing posture is unchanged.** `requestPasswordReset` returns the
+same generic message whether or not the address is registered — the account-enumeration concern §1
+already states for `signIn` applies identically here, and more sharply, given there is exactly one
+real account. `updatePassword` calls `requireUser()` first, because a Server Action is an
+independently reachable endpoint (§10) and must not assume the caller ever rendered
+`/reset-password`; it signs the session out and redirects to `/login` after a successful change, so
+the new password is what has to be used next. No raw Supabase error ever reaches a form — every
+failure path returns one of a small fixed set of generic messages, the same discipline §5's
+`INVALID_CREDENTIALS` already established for `signIn`. No `service_role`, no signup, no change to
+`getClaims()`-based authorization anywhere in the existing surface.
+
+**One known, accepted limitation of PKCE email links, not specific to this app:** the recovery link
+must be opened in the same browser that submitted the "forgot password" form, since the PKCE
+code-verifier is stored as a cookie tied to that browser. Requesting a reset on one device and
+completing it from another (e.g., desktop browser, phone's mail app) will fail with the same
+"expired or already used" message a genuinely expired link produces — indistinguishable by design,
+since telling the two apart would leak information about *why* the link failed.
